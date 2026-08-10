@@ -183,12 +183,18 @@ impl App {
 
     fn max_scroll_y(&self) -> usize {
         let (h, _) = self.content_dims();
-        h.saturating_sub(self.pane_height.max(1))
+        // The bordered diff pane's inner area is pane_height - 2 rows;
+        // the sticky marker row occupies one of them in normal view,
+        // leaving pane_height - 3 content rows visible. Clamp against
+        // that window so the bottom rows of a tall diff are reachable.
+        h.saturating_sub(self.pane_height.saturating_sub(3))
     }
 
     fn max_scroll_x(&self) -> usize {
         let (_, w) = self.content_dims();
-        w.saturating_sub(self.pane_width.max(1))
+        // The horizontal window is the bordered inner width:
+        // pane_width - 2 columns.
+        w.saturating_sub(self.pane_width.saturating_sub(2))
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>) {
@@ -610,5 +616,49 @@ mod tests {
         let buf = backend.buffer();
         let row: String = (0..80).map(|x| buf[(x, 11)].symbol().to_string()).collect();
         assert!(row.contains("no changes"), "expected placeholder text, got {row:?}");
+    }
+
+    #[test]
+    fn max_scroll_y_reaches_bottom_content_rows() {
+        // 30 content rows in the 80x24 pane: the bordered diff pane has
+        // inner height 21 and the sticky marker row occupies one of
+        // those, so 20 content rows are visible and the last line only
+        // becomes reachable at scroll_y = 10 (h - inner.height + 1).
+        // The old formula (h - pane_height = 7) left rows 28-30
+        // permanently unviewable.
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 1..=29 {
+            old.push_str(&format!("L{i:02}\n"));
+            new.push_str(&format!("L{i:02}\n"));
+        }
+        old.push_str("L30\n");
+        new.push_str("X30\n"); // only line 30 differs (col 0: 'L' vs 'X')
+        let (mut app, a, b) = files_app(&old, &new);
+        let _ = draw(&mut app); // sets pane_height from the real rect (23)
+        assert_eq!(app.max_scroll_y(), 10);
+        app.scroll_y = 10;
+        let backend = draw(&mut app);
+        let buf = backend.buffer();
+        // Last content row "L|X|3|0" (line 30, old side 'L' / new side 'X')
+        // sits at the bottom row of the pane: y = 21.
+        assert_eq!(buf[(1, 21)].symbol(), "L");
+        assert_eq!(buf[(3, 21)].symbol(), "X");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn max_scroll_x_reaches_last_columns() {
+        // One 100-char row: the bordered pane's inner width is 78
+        // (pane_width - 2), so the row scrolls to 22. The old formula
+        // (w - pane_width = 20) left the last 2 columns unviewable.
+        let old = "a".repeat(100);
+        let new = "a".repeat(100); // identical single-line files: width 100
+        let (mut app, a, b) = files_app(&old, &new);
+        let _ = draw(&mut app); // sets pane_width from the real rect (80)
+        assert_eq!(app.max_scroll_x(), 22);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 }
