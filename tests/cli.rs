@@ -71,6 +71,25 @@ fn files_mode_missing_file_fails() {
 }
 
 #[test]
+fn bare_vdiff_shows_usage_hint() {
+    // Piped stdout → run_plain → files mode with empty paths: a usage
+    // hint instead of the cryptic "No such file or directory".
+    let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage: vdiff <FILE1> <FILE2>"));
+
+    // One missing file gets the same hint.
+    let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
+        .arg("a.txt")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage: vdiff <FILE1> <FILE2>"));
+}
+
+#[test]
 fn git_mode_clean_worktree_is_silent() {
     let (repo, _) = make_repo();
     let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))

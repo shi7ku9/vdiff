@@ -16,6 +16,12 @@ pub fn run(cli: &cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
 fn run_plain(cli: &cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
         cli::Command::Files { file1, file2 } => {
+            // Bare `vdiff` or a single positional fall through to files
+            // mode with empty paths — say what the user should have
+            // typed instead of the cryptic "No such file or directory".
+            if file1.as_os_str().is_empty() || file2.as_os_str().is_empty() {
+                return Err("usage: vdiff <FILE1> <FILE2> | vdiff git [--cached] [REVS...]".into());
+            }
             let a = std::fs::read_to_string(file1)?;
             let b = std::fs::read_to_string(file2)?;
             let grid = diff::compute(&a, &b);
@@ -28,7 +34,8 @@ fn run_plain(cli: &cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Err(Box::new(git::GitError::NotARepo));
             }
             let spec = git::resolve(&g, *cached, revs)?;
-            for file in git::changed_files(&g, &spec) {
+            let files = git::changed_files(&g, &spec)?;
+            for file in files {
                 println!("=== {} ===", file.new_path);
                 match git::load_content(&g, &spec, &file) {
                     Some((old, new)) => {

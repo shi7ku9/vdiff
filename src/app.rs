@@ -74,7 +74,7 @@ impl DiffSource {
                     return Err(git::GitError::NotARepo);
                 }
                 let spec = git::resolve(&*g, *cached, revs)?;
-                let files = git::changed_files(&*g, &spec);
+                let files = git::changed_files(&*g, &spec)?;
                 Ok(DiffSource::Git { spec, files, git: g })
             }
         }
@@ -103,12 +103,19 @@ impl App {
             DiffSource::Files { old, new } => (old.display().to_string(), new.display().to_string()),
             DiffSource::Git { spec, .. } => (spec.old_label(), spec.new_label()),
         };
+        // Files mode has no sidebar (entries() is empty), so List focus
+        // would make j/k/Tab/BackTab dead keys on the primary path —
+        // start in Diff focus there; git mode starts in the sidebar.
+        let focus = match &source {
+            DiffSource::Git { .. } => Focus::List,
+            DiffSource::Files { .. } => Focus::Diff,
+        };
         let mut app = App {
             source,
             selection: 0,
             show_sidebar: true,
             transposed: false,
-            focus: Focus::List,
+            focus,
             scroll_y: 0,
             scroll_x: 0,
             grid: None,
@@ -390,8 +397,9 @@ impl App {
                 self.scroll_x = 0;
             }
             KeyCode::Char('e') if self.has_sidebar() => self.show_sidebar = !self.show_sidebar,
-            KeyCode::Char('g') => self.scroll_y = self.max_scroll_y(),
-            KeyCode::Char('G') => self.scroll_y = 0,
+            // vim convention: g = top, G = bottom.
+            KeyCode::Char('g') => self.scroll_y = 0,
+            KeyCode::Char('G') => self.scroll_y = self.max_scroll_y(),
             KeyCode::Char('n') => self.jump_group(1),
             KeyCode::Char('p') => self.jump_group(-1),
             KeyCode::Char('h') => self.scroll_x = self.scroll_x.saturating_sub(1),
@@ -678,14 +686,16 @@ mod tests {
 
     /// A git-mode app whose diff content is faked through a seeded
     /// FakeGit (the same instance must be inside the App, since
-    /// App::new → reload → load_content fetches through it).
+    /// App::new → reload → load_content fetches through it). The spec
+    /// diffs HEAD~1 (old side) against HEAD (new side), so the seeds
+    /// are truthful: HEAD~1 holds the "old" content, HEAD the "new".
     fn git_app(contents: Vec<(&str, &str)>) -> App {
         let mut f = FakeGit::default();
         let mut files = Vec::new();
         for (i, (old, new)) in contents.into_iter().enumerate() {
             let path = format!("f{i}.txt");
-            f.set(&["cat-file", "-p", &format!("HEAD:{path}")], Some(old.to_string()));
-            f.set(&["cat-file", "-p", &format!("HEAD~1:{path}")], Some(new.to_string()));
+            f.set(&["cat-file", "-p", &format!("HEAD~1:{path}")], Some(old.to_string()));
+            f.set(&["cat-file", "-p", &format!("HEAD:{path}")], Some(new.to_string()));
             files.push(ChangedFile { status: Status::Modified, old_path: path.clone(), new_path: path });
         }
         let spec = RevSpec { old: Source::Rev("HEAD~1".into()), new: Source::Rev("HEAD".into()), diff_args: vec![] };
@@ -850,12 +860,24 @@ mod tests {
         assert_eq!(app.scroll_x, 1);
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.scroll_x, 0);
+        // vim convention: g = top, G = bottom.
+        app.scroll_y = 3;
         app.handle_key(key(KeyCode::Char('g')));
-        assert_eq!(app.scroll_y, app.max_scroll_y());
-        app.handle_key(key(KeyCode::Char('G')));
         assert_eq!(app.scroll_y, 0);
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.scroll_y, app.max_scroll_y());
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn focus_defaults_to_diff_in_files_mode_and_list_in_git_mode() {
+        let (app, a, b) = files_app("a\n", "b\n");
+        assert_eq!(app.focus, Focus::Diff, "files mode has no sidebar: must start in diff focus");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+        let app = git_app(vec![("a\n", "b\n")]);
+        assert_eq!(app.focus, Focus::List, "git mode has a sidebar: must start in list focus");
     }
 
     #[test]

@@ -165,7 +165,7 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
                 Ok(RevSpec { old: Source::Rev(r.clone()), new: Source::Worktree, diff_args: vec![r.clone()] })
             }
         }
-        _ => {
+        2 => {
             let first = revs[0].clone();
             let second = &revs[1];
             if let Some((kind, a, b)) = split_range(second) {
@@ -186,6 +186,10 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
                 })
             }
         }
+        _ => Err(GitError::InvalidRevSpec(format!(
+            "expected at most two revisions, got {}",
+            revs.len()
+        ))),
     }
 }
 
@@ -265,16 +269,18 @@ fn status_of(letter: char) -> Status {
 }
 
 /// The list of changed files for a rev spec, via
-/// `git diff <diff_args> --name-status -z`. Git failure → empty list.
-pub fn changed_files(g: &dyn GitShell, spec: &RevSpec) -> Vec<ChangedFile> {
+/// `git diff <diff_args> --name-status -z`. `None` from git means the
+/// command FAILED (non-zero exit, e.g. bad rev or `--cached` without a
+/// HEAD) → `Err`; `Some("")` is a genuinely clean tree → `Ok(vec![])`.
+pub fn changed_files(g: &dyn GitShell, spec: &RevSpec) -> Result<Vec<ChangedFile>, GitError> {
     let mut args: Vec<String> = vec!["diff".to_string()];
     args.extend(spec.diff_args.iter().cloned());
     args.push("--name-status".to_string());
     args.push("-z".to_string());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     match g.output(&arg_refs) {
-        Some(out) => parse_name_status_z(&out),
-        None => Vec::new(),
+        Some(out) => Ok(parse_name_status_z(&out)),
+        None => Err(GitError::GitFailed("git diff failed".into())),
     }
 }
 
@@ -388,6 +394,14 @@ mod tests {
     }
 
     #[test]
+    fn resolve_more_than_two_revs_fails() {
+        assert!(matches!(
+            resolve(&g(), false, &["a".to_string(), "b".to_string(), "c".to_string()]),
+            Err(GitError::InvalidRevSpec(_))
+        ));
+    }
+
+    #[test]
     fn resolve_range_in_second_arg() {
         let mut f = g();
         f.set(&["merge-base", "b", "c"], Some("base5".to_string()));
@@ -462,14 +476,24 @@ mod tests {
         let mut f = FakeGit::default();
         f.set(&["diff", "--cached", "--name-status", "-z"], Some("M\ta.txt\0".to_string()));
         let spec = RevSpec { old: Source::Rev("HEAD".into()), new: Source::Index, diff_args: vec!["--cached".into()] };
-        assert_eq!(changed_files(&f, &spec).len(), 1);
+        assert_eq!(changed_files(&f, &spec).unwrap().len(), 1);
     }
 
     #[test]
-    fn changed_files_git_failure_is_empty() {
+    fn changed_files_git_failure_is_error() {
+        // An unseeded FakeGit returns None, which now means git FAILED
+        // (non-zero exit, bad rev, ...), not "no changes".
         let f = FakeGit::default();
         let spec = RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] };
-        assert!(changed_files(&f, &spec).is_empty());
+        assert!(matches!(changed_files(&f, &spec), Err(GitError::GitFailed(_))));
+    }
+
+    #[test]
+    fn changed_files_empty_output_is_clean_tree() {
+        let mut f = FakeGit::default();
+        f.set(&["diff", "--name-status", "-z"], Some(String::new()));
+        let spec = RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] };
+        assert_eq!(changed_files(&f, &spec).unwrap(), vec![]);
     }
 
     #[test]

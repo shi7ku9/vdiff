@@ -68,8 +68,8 @@ impl From<RawCli> for Cli {
                 command: Command::Git { cached, revs },
             },
             // Bare `vdiff` (no args) falls through to files mode with
-            // empty paths, which fails with the standard io error in
-            // `run_plain` ("vdiff: No such file or directory").
+            // empty paths; `run_plain` then prints a usage hint
+            // ("usage: vdiff <FILE1> <FILE2> | vdiff git ...").
             None => Cli {
                 command: Command::Files {
                     file1: raw.file1.unwrap_or_default(),
