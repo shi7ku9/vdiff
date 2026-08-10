@@ -105,10 +105,9 @@ enum RangeKind {
 fn split_range(r: &str) -> Option<(RangeKind, String, String)> {
     let (kind, pos) = if let Some(pos) = r.find("...") {
         (RangeKind::MergeBase, pos)
-    } else if let Some(pos) = r.find("..") {
-        (RangeKind::Plain, pos)
     } else {
-        return None;
+        let pos = r.find("..")?;
+        (RangeKind::Plain, pos)
     };
     let (left, rest) = r.split_at(pos);
     let right = &rest[kind_len(kind)..];
