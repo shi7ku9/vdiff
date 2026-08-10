@@ -5,7 +5,16 @@
 //! `slice_by_width` implements width-aware horizontal scrolling so
 //! wide characters (CJK) are never split in half.
 
-use crate::diff::{DiffGrid, StepKind};
+use crate::diff::{self, DiffGrid, StepKind};
+use crate::git::{self, ChangedFile, GitShell, RevSpec, Status};
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::{Frame, Terminal};
+use std::io;
+use std::path::PathBuf;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Display rows for the TUI: rows[0] is the marker row (one char per
@@ -41,9 +50,371 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     out
 }
 
-/// Placeholder — the real TUI arrives in Task 8.
-pub fn run_tui(_cli: &crate::cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
-    Err("TUI not implemented yet".into())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    List,
+    Diff,
+}
+
+pub enum DiffSource {
+    Files { old: PathBuf, new: PathBuf },
+    Git { spec: RevSpec, files: Vec<ChangedFile>, git: Box<dyn GitShell> },
+}
+
+impl DiffSource {
+    pub fn from_cli(cli: &crate::cli::Cli) -> Result<Self, git::GitError> {
+        match &cli.command {
+            crate::cli::Command::Files { file1, file2 } => Ok(DiffSource::Files {
+                old: file1.clone(),
+                new: file2.clone(),
+            }),
+            crate::cli::Command::Git { cached, revs } => {
+                let g: Box<dyn GitShell> = Box::new(git::RealGit);
+                if !git::in_repo(&*g) {
+                    return Err(git::GitError::NotARepo);
+                }
+                let spec = git::resolve(&*g, *cached, revs)?;
+                let files = git::changed_files(&*g, &spec);
+                Ok(DiffSource::Git { spec, files, git: g })
+            }
+        }
+    }
+}
+
+pub struct App {
+    pub source: DiffSource,
+    pub selection: usize,
+    pub show_sidebar: bool,
+    pub transposed: bool,
+    pub focus: Focus,
+    pub scroll_y: usize,
+    pub scroll_x: usize,
+    pub grid: Option<DiffGrid>,
+    pub message: Option<String>,
+    pub degraded: bool,
+    pub labels: (String, String),
+    pane_width: usize,
+    pane_height: usize,
+}
+
+impl App {
+    pub fn new(source: DiffSource) -> App {
+        let labels = match &source {
+            DiffSource::Files { old, new } => (old.display().to_string(), new.display().to_string()),
+            DiffSource::Git { spec, .. } => (spec.old_label(), spec.new_label()),
+        };
+        let mut app = App {
+            source,
+            selection: 0,
+            show_sidebar: true,
+            transposed: false,
+            focus: Focus::List,
+            scroll_y: 0,
+            scroll_x: 0,
+            grid: None,
+            message: None,
+            degraded: false,
+            labels,
+            pane_width: 80,
+            pane_height: 24,
+        };
+        app.reload();
+        app
+    }
+
+    pub fn has_sidebar(&self) -> bool {
+        matches!(self.source, DiffSource::Git { .. })
+    }
+
+    fn entries(&self) -> Vec<ChangedFile> {
+        match &self.source {
+            DiffSource::Git { files, .. } => files.clone(),
+            DiffSource::Files { .. } => Vec::new(),
+        }
+    }
+
+    fn reload(&mut self) {
+        let contents = match &self.source {
+            DiffSource::Files { old, new } => {
+                match (std::fs::read_to_string(old), std::fs::read_to_string(new)) {
+                    (Ok(a), Ok(b)) => Some((a, b)),
+                    _ => None,
+                }
+            }
+            DiffSource::Git { files, .. } if files.is_empty() => None,
+            DiffSource::Git { files, git, spec } => {
+                let idx = self.selection.min(files.len().saturating_sub(1));
+                git::load_content(&**git, spec, &files[idx])
+            }
+        };
+        self.scroll_y = 0;
+        self.scroll_x = 0;
+        match contents {
+            Some((old, new)) => {
+                let grid = diff::compute(&old, &new);
+                self.degraded = grid.degraded;
+                self.grid = Some(grid);
+                self.message = None;
+            }
+            None => {
+                self.grid = None;
+                self.message = Some(match &self.source {
+                    DiffSource::Git { files, .. } if files.is_empty() => "no changes".to_string(),
+                    _ => "binary or unreadable".to_string(),
+                });
+            }
+        }
+    }
+
+    fn content_dims(&self) -> (usize, usize) {
+        let Some(grid) = &self.grid else { return (0, 0) };
+        if self.transposed {
+            let rows = transposed_rows(grid);
+            let w = rows.iter().map(|r| UnicodeWidthStr::width(r.as_str())).max().unwrap_or(0);
+            (grid.steps.len(), w)
+        } else {
+            let rows = build_rows(grid);
+            // Content rows may be wider than the marker row (wide chars),
+            // so clamp against the widest row.
+            let w = rows.iter().map(|r| UnicodeWidthStr::width(r.as_str())).max().unwrap_or(0);
+            (grid.height, w)
+        }
+    }
+
+    fn max_scroll_y(&self) -> usize {
+        let (h, _) = self.content_dims();
+        h.saturating_sub(self.pane_height.max(1))
+    }
+
+    fn max_scroll_x(&self) -> usize {
+        let (_, w) = self.content_dims();
+        w.saturating_sub(self.pane_width.max(1))
+    }
+
+    pub fn render(&mut self, frame: &mut Frame<'_>) {
+        let area = frame.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(area);
+        let (sidebar_area, diff_area) = if self.has_sidebar() && self.show_sidebar {
+            let c = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(28), Constraint::Min(0)])
+                .split(chunks[0]);
+            (Some(c[0]), c[1])
+        } else {
+            (None, chunks[0])
+        };
+        if let Some(area) = sidebar_area {
+            self.render_sidebar(frame, area);
+        }
+        self.render_diff(frame, diff_area);
+        self.render_status(frame, chunks[1]);
+        self.pane_width = diff_area.width as usize;
+        self.pane_height = diff_area.height as usize;
+    }
+
+    fn render_sidebar(&self, frame: &mut Frame<'_>, area: Rect) {
+        let items: Vec<ListItem> = self
+            .entries()
+            .iter()
+            .map(|f| {
+                let (letter, color) = match f.status {
+                    Status::Modified => ("M", Color::Yellow),
+                    Status::Added => ("A", Color::Green),
+                    Status::Deleted => ("D", Color::Red),
+                    Status::Renamed => ("R", Color::Cyan),
+                };
+                let path = if f.status == Status::Renamed {
+                    format!("{} → {}", f.old_path, f.new_path)
+                } else {
+                    f.new_path.clone()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(letter, Style::default().fg(color)),
+                    Span::raw(" "),
+                    Span::raw(path),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default().with_selected(Some(self.selection));
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(" Files "))
+            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_symbol("> ");
+        frame.render_stateful_widget(list, area, &mut state);
+    }
+
+    fn render_diff(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let title = format!(" {} → {} ", self.labels.0, self.labels.1);
+        let block = Block::default().borders(Borders::ALL).title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        match (&self.grid, &self.message) {
+            (Some(grid), _) => {
+                let rows: Vec<String> = if self.transposed {
+                    transposed_rows(grid)
+                } else {
+                    build_rows(grid)
+                };
+                if self.transposed {
+                    for (i, row) in rows.iter().enumerate() {
+                        // saturating: rows scrolled past the top clamp to
+                        // 0 and are skipped below (plain subtraction would
+                        // underflow u16 in debug builds).
+                        let y = inner.y.saturating_add(i as u16).saturating_sub(self.scroll_y as u16);
+                        if y < inner.y {
+                            continue;
+                        }
+                        if y >= inner.y + inner.height {
+                            break;
+                        }
+                        self.draw_step_row(frame, inner, y, row);
+                    }
+                } else {
+                    if let Some(marker) = rows.first() {
+                        self.draw_marker_row(frame, inner, inner.y, marker);
+                    }
+                    for (i, row) in rows.iter().enumerate().skip(1) {
+                        // saturating: rows scrolled past the top clamp to
+                        // 0 and are skipped below (plain subtraction would
+                        // underflow u16 in debug builds).
+                        let y = inner.y.saturating_add(i as u16).saturating_sub(self.scroll_y as u16);
+                        // Content rows live below the sticky marker row:
+                        // y == inner.y is the marker's row and must not be
+                        // overwritten once the user scrolls.
+                        if y <= inner.y {
+                            continue;
+                        }
+                        if y >= inner.y + inner.height {
+                            break;
+                        }
+                        self.draw_content_row(frame, inner, y, row);
+                    }
+                }
+            }
+            (None, Some(message)) => {
+                let area = Rect {
+                    x: inner.x,
+                    y: inner.y + inner.height.saturating_sub(1) / 2,
+                    width: inner.width,
+                    height: 1,
+                };
+                frame.render_widget(Paragraph::new(message.as_str()).alignment(ratatui::layout::Alignment::Center), area);
+            }
+            (None, None) => {}
+        }
+    }
+
+    fn draw_row(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, row: &str, scroll_x: usize, style_for: impl Fn(char) -> Style) {
+        let visible = slice_by_width(row, scroll_x, inner.width as usize);
+        let mut x = inner.x;
+        for c in visible.chars() {
+            frame.buffer_mut().set_string(x, y, c.to_string(), style_for(c));
+            x += c.width().unwrap_or(0) as u16;
+        }
+    }
+
+    fn draw_marker_row(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, row: &str) {
+        self.draw_row(frame, inner, y, row, self.scroll_x, |c| match c {
+            '-' => Style::default().fg(Color::Red),
+            '+' => Style::default().fg(Color::Green),
+            '|' => Style::default().fg(Color::DarkGray),
+            _ => Style::default(),
+        });
+    }
+
+    fn draw_content_row(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, row: &str) {
+        self.draw_row(frame, inner, y, row, self.scroll_x, |c| {
+            if c == '|' {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            }
+        });
+    }
+
+    fn draw_step_row(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, row: &str) {
+        // Transposed rows start with the prefix char — color only that one.
+        self.draw_row(frame, inner, y, row, self.scroll_x, |c| match c {
+            '-' => Style::default().fg(Color::Red),
+            '+' => Style::default().fg(Color::Green),
+            _ => Style::default(),
+        });
+    }
+
+    fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
+        let mut spans = vec![Span::raw(format!(" {} → {}  ", self.labels.0, self.labels.1))];
+        match (&self.grid, &self.message) {
+            (Some(_), _) => {
+                spans.push(Span::raw(format!(
+                    "v{}/{} h{}/{}  ",
+                    self.scroll_y,
+                    self.max_scroll_y(),
+                    self.scroll_x,
+                    self.max_scroll_x()
+                )));
+                if self.degraded {
+                    spans.push(Span::raw("LCS skipped (wide file)  "));
+                }
+            }
+            (None, Some(m)) => spans.push(Span::raw(format!("{m}  "))),
+            (None, None) => {}
+        }
+        spans.push(Span::raw("hjkl scroll · n/p changes · t transpose · e sidebar · q quit"));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    // Temporary stub — Task 9 replaces this with real key handling.
+    pub fn handle_key(&mut self, _key: KeyEvent) -> bool {
+        false
+    }
+}
+
+/// Transposed display rows: one per step — prefix char (` `/`-`/`+`) +
+/// `' '` + column content.
+fn transposed_rows(grid: &DiffGrid) -> Vec<String> {
+    grid.steps
+        .iter()
+        .map(|s| {
+            let mut line = String::with_capacity(s.content.len() + 2);
+            line.push(match s.kind {
+                StepKind::Match => ' ',
+                StepKind::Delete => '-',
+                StepKind::Insert => '+',
+            });
+            line.push(' ');
+            line.extend(s.content.iter());
+            line
+        })
+        .collect()
+}
+
+pub fn run_tui(cli: &crate::cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let source = DiffSource::from_cli(cli)?;
+    let mut app = App::new(source);
+    run_tui_app(&mut app)?;
+    Ok(())
+}
+
+/// Drive the terminal loop until the app signals quit.
+pub fn run_tui_app(app: &mut App) -> io::Result<()> {
+    let mut terminal = ratatui::init();
+    let result = (|| {
+        loop {
+            terminal.draw(|frame| app.render(frame))?;
+            if let Event::Key(key) = event::read()? {
+                if app.handle_key(key) {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    })();
+    ratatui::restore();
+    result
 }
 
 /// Slice `s` by display width: skip the first `start` cells, keep at
@@ -115,5 +486,129 @@ mod tests {
     fn slice_past_end_is_empty() {
         assert_eq!(slice_by_width("abc", 10, 5), "");
         assert_eq!(slice_by_width("", 0, 5), "");
+    }
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use crate::git::{FakeGit, RevSpec, Source, Status, ChangedFile};
+
+    fn temp_file(name: &str, contents: &str) -> std::path::PathBuf {
+        // Unique per call: tests run in parallel and would otherwise
+        // clobber each other's files and remove them mid-test.
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("vdiff-app-{}-{n}-{name}", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn files_app(old: &str, new: &str) -> (App, std::path::PathBuf, std::path::PathBuf) {
+        let a = temp_file("a.txt", old);
+        let b = temp_file("b.txt", new);
+        let app = App::new(DiffSource::Files { old: a.clone(), new: b.clone() });
+        (app, a, b)
+    }
+
+    /// A git-mode app whose diff content is faked through a seeded
+    /// FakeGit (the same instance must be inside the App, since
+    /// App::new → reload → load_content fetches through it).
+    fn git_app(contents: Vec<(&str, &str)>) -> App {
+        let mut f = FakeGit::default();
+        let mut files = Vec::new();
+        for (i, (old, new)) in contents.into_iter().enumerate() {
+            let path = format!("f{i}.txt");
+            f.set(&["cat-file", "-p", &format!("HEAD:{path}")], Some(old.to_string()));
+            f.set(&["cat-file", "-p", &format!("HEAD~1:{path}")], Some(new.to_string()));
+            files.push(ChangedFile { status: Status::Modified, old_path: path.clone(), new_path: path });
+        }
+        let spec = RevSpec { old: Source::Rev("HEAD~1".into()), new: Source::Rev("HEAD".into()), diff_args: vec![] };
+        App::new(DiffSource::Git { spec, files, git: Box::new(f) })
+    }
+
+    fn draw(app: &mut App) -> TestBackend {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.backend().clone()
+    }
+
+    #[test]
+    fn renders_marker_row_with_colors() {
+        let (mut app, a, b) = files_app("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
+        let backend = draw(&mut app);
+        let buf = backend.buffer();
+        // The diff pane block is bordered, so inner starts at (1,1):
+        // border at y=0, marker row at y=1 from x=1.
+        // Marker: "    |-|+...": '|' at col 5, '-' at col 6, '+' at col 8.
+        assert_eq!(buf[(6, 1)].symbol(), "-");
+        assert_eq!(buf[(6, 1)].fg, ratatui::style::Color::Red);
+        assert_eq!(buf[(8, 1)].symbol(), "+");
+        assert_eq!(buf[(8, 1)].fg, ratatui::style::Color::Green);
+        assert_eq!(buf[(5, 1)].symbol(), "|");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn marker_row_is_sticky_when_scrolling() {
+        let (mut app, a, b) = files_app("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n21\n");
+        app.scroll_y = 10;
+        let backend = draw(&mut app);
+        let buf = backend.buffer();
+        // Marker " |-|+" starts at x=1 (block border), '-' at x=3 —
+        // still at the top row after vertical scroll.
+        assert_eq!(buf[(3, 1)].symbol(), "-");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn sidebar_shows_status_letters() {
+        let mut app = git_app(vec![("foo\n", "bar\n"), ("a\n", "b\n")]);
+        let backend = draw(&mut app);
+        let buf = backend.buffer();
+        // Sidebar block is bordered (inner x=1) and the highlight symbol
+        // "> " occupies columns 1-2, so the status letter starts at x=3.
+        assert_eq!(buf[(3, 1)].symbol(), "M"); // first entry: 'M' + space + path
+        // highlight symbol "> " on the selected entry
+        assert_eq!(buf[(1, 1)].symbol(), ">");
+    }
+
+    #[test]
+    fn transposed_view_renders_step_rows() {
+        let (mut app, a, b) = files_app("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
+        app.transposed = true;
+        let backend = draw(&mut app);
+        let buf = backend.buffer();
+        // The diff pane block is bordered: rows start at x=1. Transposed
+        // row 0 = "  fbq" — prefix space + separator space at (1,1) and
+        // (2,1), 'f' at (3,1).
+        assert_eq!(buf[(3, 1)].symbol(), "f");
+        // delete step row "- b " is row 4 of the stack: y = 1 + 4, prefix at x=1
+        assert_eq!(buf[(1, 5)].symbol(), "-");
+        assert_eq!(buf[(1, 5)].fg, ratatui::style::Color::Red);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn sidebar_hidden_diff_takes_full_width() {
+        let mut app = git_app(vec![("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n")]);
+        let buf_before = draw(&mut app);
+        assert_ne!(buf_before.buffer()[(4, 1)].symbol(), "-"); // (4,1) is inside the sidebar
+        app.show_sidebar = false;
+        let buf_after = draw(&mut app);
+        // Full-width diff pane is still bordered: inner starts at x=1,
+        // marker "    |-|+|  " → '|' at (5,1), '-' at (6,1).
+        assert_eq!(buf_after.buffer()[(5, 1)].symbol(), "|"); // marker separator at (5,1)
+        assert_eq!(buf_after.buffer()[(6, 1)].symbol(), "-");
+    }
+
+    #[test]
+    fn placeholder_for_no_changes() {
+        let mut app = git_app(vec![]);
+        let backend = draw(&mut app);
+        let buf = backend.buffer();
+        let row: String = (0..80).map(|x| buf[(x, 11)].symbol().to_string()).collect();
+        assert!(row.contains("no changes"), "expected placeholder text, got {row:?}");
     }
 }
