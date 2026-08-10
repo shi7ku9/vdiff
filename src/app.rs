@@ -41,6 +41,11 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     out
 }
 
+/// Placeholder — the real TUI arrives in Task 8.
+pub fn run_tui(_cli: &crate::cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
+    Err("TUI not implemented yet".into())
+}
+
 /// Slice `s` by display width: skip the first `start` cells, keep at
 /// most `max_width` cells. A wide char that straddles a boundary is
 /// skipped whole (its width still consumes the cells up to the
