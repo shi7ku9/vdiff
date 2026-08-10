@@ -389,11 +389,7 @@ impl App {
                 self.scroll_y = 0;
                 self.scroll_x = 0;
             }
-            KeyCode::Char('e') => {
-                if self.has_sidebar() {
-                    self.show_sidebar = !self.show_sidebar;
-                }
-            }
+            KeyCode::Char('e') if self.has_sidebar() => self.show_sidebar = !self.show_sidebar,
             KeyCode::Char('g') => self.scroll_y = self.max_scroll_y(),
             KeyCode::Char('G') => self.scroll_y = 0,
             KeyCode::Char('n') => self.jump_group(1),
@@ -408,11 +404,7 @@ impl App {
                 Focus::List => self.move_selection(-1),
                 Focus::Diff => self.scroll_y = self.scroll_y.saturating_sub(1),
             },
-            KeyCode::Enter => {
-                if self.focus == Focus::List {
-                    self.focus = Focus::Diff;
-                }
-            }
+            KeyCode::Enter if self.focus == Focus::List => self.focus = Focus::Diff,
             KeyCode::Tab => match self.focus {
                 Focus::List => self.move_selection(1),
                 Focus::Diff => self.focus = Focus::List,
@@ -421,11 +413,7 @@ impl App {
                 Focus::List => self.move_selection(-1),
                 Focus::Diff => self.focus = Focus::List,
             },
-            KeyCode::Esc => {
-                if self.focus == Focus::Diff {
-                    self.focus = Focus::List;
-                }
-            }
+            KeyCode::Esc if self.focus == Focus::Diff => self.focus = Focus::List,
             _ => {}
         }
         false
@@ -584,10 +572,10 @@ pub fn run_tui_app(app: &mut App) -> io::Result<()> {
     let result = (|| {
         loop {
             terminal.draw(|frame| app.render(frame))?;
-            if let Event::Key(key) = event::read()? {
-                if app.handle_key(key) {
-                    break;
-                }
+            if let Event::Key(key) = event::read()?
+                && app.handle_key(key)
+            {
+                break;
             }
         }
         Ok(())

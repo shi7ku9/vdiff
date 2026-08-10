@@ -233,7 +233,7 @@ pub struct ChangedFile {
 /// Modified.
 pub fn parse_name_status_z(out: &str) -> Vec<ChangedFile> {
     let fields: Vec<&str> = out
-        .split(|c| c == '\0' || c == '\t')
+        .split(['\0', '\t'])
         .filter(|f| !f.is_empty())
         .collect();
     let mut files = Vec::new();

@@ -356,9 +356,9 @@ mod tests {
     fn diff_columns_empty_sides() {
         assert!(diff_columns(&[], &[]).0.is_empty());
         let (steps, _) = diff_columns(&[], &["x".to_string()]);
-        assert_eq!(ops_of(&DiffGrid { steps, height: 1, groups: vec![0..1], degraded: false }), exp(&[("+", "x")]));
+        assert_eq!(ops_of(&DiffGrid { steps, height: 1, groups: vec![Range { start: 0, end: 1 }], degraded: false }), exp(&[("+", "x")]));
         let (steps, _) = diff_columns(&["x".to_string()], &[]);
-        assert_eq!(ops_of(&DiffGrid { steps, height: 1, groups: vec![0..1], degraded: false }), exp(&[("-", "x")]));
+        assert_eq!(ops_of(&DiffGrid { steps, height: 1, groups: vec![Range { start: 0, end: 1 }], degraded: false }), exp(&[("-", "x")]));
     }
 
     #[test]
