@@ -16,15 +16,25 @@ fn temp_file(name: &str, contents: &str) -> std::path::PathBuf {
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
-        .arg("-C").arg(dir)
+        .arg("-C")
+        .arg(dir)
         .args(args)
         .output()
         .expect("git binary is required for integration tests");
-    assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn rev_parse(dir: &Path, rev: &str) -> String {
-    let out = Command::new("git").arg("-C").arg(dir).args(["rev-parse", rev]).output().unwrap();
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", rev])
+        .output()
+        .unwrap();
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
@@ -36,7 +46,10 @@ fn make_repo() -> (tempfile::TempDir, String) {
     git(dir.path(), &["config", "user.email", "test@example.com"]);
     std::fs::write(dir.path().join("a.txt"), "foo\nbar baz\n").unwrap();
     git(dir.path(), &["add", "."]);
-    git(dir.path(), &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "one"]);
+    git(
+        dir.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "one"],
+    );
     let hash = rev_parse(dir.path(), "HEAD");
     (dir, hash)
 }
@@ -49,7 +62,10 @@ fn files_mode_prints_expected_format() {
     let _ = std::fs::remove_file(&a);
     let _ = std::fs::remove_file(&b);
     assert!(out.status.success());
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "    |-|+|\nfoo | | |  \nbar |b|q|az\nquux| | |  \n");
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "    |-|+|\nfoo | | |  \nbar |b|q|az\nquux| | |  \n"
+    );
 }
 
 #[test]
@@ -74,9 +90,7 @@ fn files_mode_missing_file_fails() {
 fn bare_vdiff_shows_usage_hint() {
     // Piped stdout → run_plain → files mode with empty paths: a usage
     // hint instead of the cryptic "No such file or directory".
-    let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
-        .output()
-        .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vdiff")).output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("usage: vdiff <FILE1> <FILE2>"));
 
@@ -93,9 +107,11 @@ fn bare_vdiff_shows_usage_hint() {
 fn git_mode_clean_worktree_is_silent() {
     let (repo, _) = make_repo();
     let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
-        .arg("git").arg("HEAD")
+        .arg("git")
+        .arg("HEAD")
         .current_dir(repo.path())
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
 }
@@ -107,7 +123,8 @@ fn git_mode_uncommitted_changes() {
     let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
         .arg("git")
         .current_dir(repo.path())
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.starts_with("=== a.txt ===\n"));
@@ -123,13 +140,16 @@ fn git_mode_cached_shows_staged_only() {
     let unstaged = Command::new(env!("CARGO_BIN_EXE_vdiff"))
         .arg("git")
         .current_dir(repo.path())
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(unstaged.stdout.is_empty());
     // staged: index vs HEAD
     let staged = Command::new(env!("CARGO_BIN_EXE_vdiff"))
-        .arg("git").arg("--cached")
+        .arg("git")
+        .arg("--cached")
         .current_dir(repo.path())
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(staged.status.success());
     let stdout = String::from_utf8(staged.stdout).unwrap();
     assert!(stdout.starts_with("=== a.txt ===\n"));
@@ -145,16 +165,24 @@ fn git_mode_three_dot_range() {
     let (repo, _) = make_repo();
     std::fs::write(repo.path().join("a.txt"), "foo\nbar baz\nquux\n").unwrap();
     git(repo.path(), &["add", "a.txt"]);
-    git(repo.path(), &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "two"]);
+    git(
+        repo.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "two"],
+    );
     let first = rev_parse(repo.path(), "HEAD");
     std::fs::write(repo.path().join("a.txt"), "foo\nbar qaz\nquux\n").unwrap();
     git(repo.path(), &["add", "a.txt"]);
-    git(repo.path(), &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "three"]);
+    git(
+        repo.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "three"],
+    );
     let second = rev_parse(repo.path(), "HEAD");
     let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
-        .arg("git").arg(format!("{first}...{second}"))
+        .arg("git")
+        .arg(format!("{first}...{second}"))
         .current_dir(repo.path())
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.starts_with("=== a.txt ===\n"));
@@ -167,7 +195,8 @@ fn git_mode_outside_repo_fails() {
     let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
         .arg("git")
         .current_dir(dir.path())
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a git repository"));
 }

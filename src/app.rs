@@ -8,11 +8,11 @@
 use crate::diff::{self, DiffGrid, StepKind};
 use crate::git::{self, ChangedFile, GitShell, RevSpec, Status};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 use std::io;
 use std::path::PathBuf;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -41,7 +41,10 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
             }
         }
     }
-    let content_width = rows.first().map(|r| UnicodeWidthStr::width(r.as_str())).unwrap_or(0);
+    let content_width = rows
+        .first()
+        .map(|r| UnicodeWidthStr::width(r.as_str()))
+        .unwrap_or(0);
     while UnicodeWidthStr::width(marker.as_str()) < content_width {
         marker.push(' ');
     }
@@ -51,8 +54,15 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
 }
 
 pub enum DiffSource {
-    Files { old: PathBuf, new: PathBuf },
-    Git { spec: RevSpec, files: Vec<ChangedFile>, git: Box<dyn GitShell> },
+    Files {
+        old: PathBuf,
+        new: PathBuf,
+    },
+    Git {
+        spec: RevSpec,
+        files: Vec<ChangedFile>,
+        git: Box<dyn GitShell>,
+    },
 }
 
 impl DiffSource {
@@ -69,7 +79,11 @@ impl DiffSource {
                 }
                 let spec = git::resolve(&*g, *cached, revs)?;
                 let files = git::changed_files(&*g, &spec)?;
-                Ok(DiffSource::Git { spec, files, git: g })
+                Ok(DiffSource::Git {
+                    spec,
+                    files,
+                    git: g,
+                })
             }
         }
     }
@@ -93,7 +107,9 @@ pub struct App {
 impl App {
     pub fn new(source: DiffSource) -> App {
         let labels = match &source {
-            DiffSource::Files { old, new } => (old.display().to_string(), new.display().to_string()),
+            DiffSource::Files { old, new } => {
+                (old.display().to_string(), new.display().to_string())
+            }
             DiffSource::Git { spec, .. } => (spec.old_label(), spec.new_label()),
         };
         let mut app = App {
@@ -163,16 +179,26 @@ impl App {
     }
 
     fn content_dims(&self) -> (usize, usize) {
-        let Some(grid) = &self.grid else { return (0, 0) };
+        let Some(grid) = &self.grid else {
+            return (0, 0);
+        };
         if self.transposed {
             let rows = transposed_rows(grid);
-            let w = rows.iter().map(|r| UnicodeWidthStr::width(r.as_str())).max().unwrap_or(0);
+            let w = rows
+                .iter()
+                .map(|r| UnicodeWidthStr::width(r.as_str()))
+                .max()
+                .unwrap_or(0);
             (grid.steps.len(), w)
         } else {
             let rows = build_rows(grid);
             // Content rows may be wider than the marker row (wide chars),
             // so clamp against the widest row.
-            let w = rows.iter().map(|r| UnicodeWidthStr::width(r.as_str())).max().unwrap_or(0);
+            let w = rows
+                .iter()
+                .map(|r| UnicodeWidthStr::width(r.as_str()))
+                .max()
+                .unwrap_or(0);
             (grid.height, w)
         }
     }
@@ -243,7 +269,11 @@ impl App {
         let mut state = ListState::default().with_selected(Some(self.selection));
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(" Files "))
-            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
             .highlight_symbol("> ");
         frame.render_stateful_widget(list, area, &mut state);
     }
@@ -266,7 +296,10 @@ impl App {
                         // saturating: rows scrolled past the top clamp to
                         // 0 and are skipped below (plain subtraction would
                         // underflow u16 in debug builds).
-                        let y = inner.y.saturating_add(i as u16).saturating_sub(self.scroll_y as u16);
+                        let y = inner
+                            .y
+                            .saturating_add(i as u16)
+                            .saturating_sub(self.scroll_y as u16);
                         if y < inner.y {
                             continue;
                         }
@@ -283,7 +316,10 @@ impl App {
                         // saturating: rows scrolled past the top clamp to
                         // 0 and are skipped below (plain subtraction would
                         // underflow u16 in debug builds).
-                        let y = inner.y.saturating_add(i as u16).saturating_sub(self.scroll_y as u16);
+                        let y = inner
+                            .y
+                            .saturating_add(i as u16)
+                            .saturating_sub(self.scroll_y as u16);
                         // Content rows live below the sticky marker row:
                         // y == inner.y is the marker's row and must not be
                         // overwritten once the user scrolls.
@@ -304,17 +340,30 @@ impl App {
                     width: inner.width,
                     height: 1,
                 };
-                frame.render_widget(Paragraph::new(message.as_str()).alignment(ratatui::layout::Alignment::Center), area);
+                frame.render_widget(
+                    Paragraph::new(message.as_str()).alignment(ratatui::layout::Alignment::Center),
+                    area,
+                );
             }
             (None, None) => {}
         }
     }
 
-    fn draw_row(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, row: &str, scroll_x: usize, style_for: impl Fn(char) -> Style) {
+    fn draw_row(
+        &self,
+        frame: &mut Frame<'_>,
+        inner: Rect,
+        y: u16,
+        row: &str,
+        scroll_x: usize,
+        style_for: impl Fn(char) -> Style,
+    ) {
         let visible = slice_by_width(row, scroll_x, inner.width as usize);
         let mut x = inner.x;
         for c in visible.chars() {
-            frame.buffer_mut().set_string(x, y, c.to_string(), style_for(c));
+            frame
+                .buffer_mut()
+                .set_string(x, y, c.to_string(), style_for(c));
             x += c.width().unwrap_or(0) as u16;
         }
     }
@@ -348,7 +397,10 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
-        let mut spans = vec![Span::raw(format!(" {} → {}  ", self.labels.0, self.labels.1))];
+        let mut spans = vec![Span::raw(format!(
+            " {} → {}  ",
+            self.labels.0, self.labels.1
+        ))];
         match (&self.grid, &self.message) {
             (Some(_), _) => {
                 spans.push(Span::raw(format!(
@@ -365,7 +417,9 @@ impl App {
             (None, Some(m)) => spans.push(Span::raw(format!("{m}  "))),
             (None, None) => {}
         }
-        spans.push(Span::raw("tab/⇧tab select · hjkl scroll · n/p changes · t transpose · e sidebar · q quit"));
+        spans.push(Span::raw(
+            "tab/⇧tab select · hjkl scroll · n/p changes · t transpose · e sidebar · q quit",
+        ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
@@ -516,7 +570,11 @@ fn group_start_width(grid: &DiffGrid, group: &std::ops::Range<usize>) -> usize {
 /// count steps as cells, not sum the whole column. Taking the max keeps wide
 /// (CJK) columns from being undercounted.
 fn step_width(step: &crate::diff::Step) -> usize {
-    step.content.iter().map(|c| c.width().unwrap_or(0)).max().unwrap_or(0)
+    step.content
+        .iter()
+        .map(|c| c.width().unwrap_or(0))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Transposed display rows: one per step — prefix char (` `/`-`/`+`) +
@@ -606,8 +664,14 @@ mod tests {
         assert_eq!(rows[1], "foo | | |  ");
         assert_eq!(rows[2], "bar |b|q|az");
         assert_eq!(rows[3], "quux| | |  ");
-        let widths: Vec<usize> = rows.iter().map(|r| UnicodeWidthStr::width(r.as_str())).collect();
-        assert!(widths.windows(2).all(|w| w[0] == w[1]), "rows must share display width: {widths:?}");
+        let widths: Vec<usize> = rows
+            .iter()
+            .map(|r| UnicodeWidthStr::width(r.as_str()))
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "rows must share display width: {widths:?}"
+        );
     }
 
     #[test]
@@ -634,16 +698,17 @@ mod tests {
         assert_eq!(slice_by_width("", 0, 5), "");
     }
 
-    use ratatui::backend::TestBackend;
+    use crate::git::{ChangedFile, FakeGit, RevSpec, Source, Status};
     use ratatui::Terminal;
-    use crate::git::{FakeGit, RevSpec, Source, Status, ChangedFile};
+    use ratatui::backend::TestBackend;
 
     fn temp_file(name: &str, contents: &str) -> std::path::PathBuf {
         // Unique per call: tests run in parallel and would otherwise
         // clobber each other's files and remove them mid-test.
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("vdiff-app-{}-{n}-{name}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("vdiff-app-{}-{n}-{name}", std::process::id()));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -651,7 +716,10 @@ mod tests {
     fn files_app(old: &str, new: &str) -> (App, std::path::PathBuf, std::path::PathBuf) {
         let a = temp_file("a.txt", old);
         let b = temp_file("b.txt", new);
-        let app = App::new(DiffSource::Files { old: a.clone(), new: b.clone() });
+        let app = App::new(DiffSource::Files {
+            old: a.clone(),
+            new: b.clone(),
+        });
         (app, a, b)
     }
 
@@ -665,12 +733,30 @@ mod tests {
         let mut files = Vec::new();
         for (i, (old, new)) in contents.into_iter().enumerate() {
             let path = format!("f{i}.txt");
-            f.set(&["cat-file", "-p", &format!("HEAD~1:{path}")], Some(old.to_string()));
-            f.set(&["cat-file", "-p", &format!("HEAD:{path}")], Some(new.to_string()));
-            files.push(ChangedFile { status: Status::Modified, old_path: path.clone(), new_path: path });
+            f.set(
+                &["cat-file", "-p", &format!("HEAD~1:{path}")],
+                Some(old.to_string()),
+            );
+            f.set(
+                &["cat-file", "-p", &format!("HEAD:{path}")],
+                Some(new.to_string()),
+            );
+            files.push(ChangedFile {
+                status: Status::Modified,
+                old_path: path.clone(),
+                new_path: path,
+            });
         }
-        let spec = RevSpec { old: Source::Rev("HEAD~1".into()), new: Source::Rev("HEAD".into()), diff_args: vec![] };
-        App::new(DiffSource::Git { spec, files, git: Box::new(f) })
+        let spec = RevSpec {
+            old: Source::Rev("HEAD~1".into()),
+            new: Source::Rev("HEAD".into()),
+            diff_args: vec![],
+        };
+        App::new(DiffSource::Git {
+            spec,
+            files,
+            git: Box::new(f),
+        })
     }
 
     fn draw(app: &mut App) -> TestBackend {
@@ -698,7 +784,10 @@ mod tests {
 
     #[test]
     fn marker_row_is_sticky_when_scrolling() {
-        let (mut app, a, b) = files_app("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n21\n");
+        let (mut app, a, b) = files_app(
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n",
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n21\n",
+        );
         app.scroll_y = 10;
         let backend = draw(&mut app);
         let buf = backend.buffer();
@@ -757,7 +846,10 @@ mod tests {
         let backend = draw(&mut app);
         let buf = backend.buffer();
         let row: String = (0..80).map(|x| buf[(x, 11)].symbol().to_string()).collect();
-        assert!(row.contains("no changes"), "expected placeholder text, got {row:?}");
+        assert!(
+            row.contains("no changes"),
+            "expected placeholder text, got {row:?}"
+        );
     }
 
     #[test]
@@ -821,7 +913,10 @@ mod tests {
 
     #[test]
     fn hjkl_scroll_diff() {
-        let (mut app, a, b) = files_app("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n21\n");
+        let (mut app, a, b) = files_app(
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n",
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n21\n",
+        );
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll_y, 1);
         app.handle_key(key(KeyCode::Char('k')));
@@ -859,7 +954,10 @@ mod tests {
     #[test]
     fn jk_scrolls_diff_in_git_mode_without_moving_selection() {
         let mut app = git_app(vec![
-            ("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n21\n"),
+            (
+                "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n",
+                "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n21\n",
+            ),
             ("x\n", "y\n"),
         ]);
         app.handle_key(key(KeyCode::Char('j')));
@@ -867,12 +965,18 @@ mod tests {
         assert_eq!(app.selection, 0, "j must not move the selection");
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.selection, 1, "Tab moves the selection");
-        assert_eq!(app.scroll_y, 0, "selection change reloads and resets scroll");
+        assert_eq!(
+            app.scroll_y, 0,
+            "selection change reloads and resets scroll"
+        );
     }
 
     #[test]
     fn selection_change_reloads_diff() {
-        let mut app = git_app(vec![("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n"), ("x\n", "y\n")]);
+        let mut app = git_app(vec![
+            ("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n"),
+            ("x\n", "y\n"),
+        ]);
         let before = app.grid.clone();
         app.handle_key(key(KeyCode::Tab));
         let after = app.grid.clone();

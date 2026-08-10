@@ -17,10 +17,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Diff two files
-    Files {
-        file1: PathBuf,
-        file2: PathBuf,
-    },
+    Files { file1: PathBuf, file2: PathBuf },
     /// Diff revisions of a git repository (git diff semantics)
     Git {
         /// Compare the index against the given revision (default: HEAD)
@@ -36,7 +33,11 @@ pub enum Command {
 /// the `git` subcommand. `vdiff <file1> <file2>` fills the positionals
 /// (`command` is `None`); `vdiff git ...` picks the subcommand.
 #[derive(Debug, Parser)]
-#[command(name = "vdiff", version, about = "A vertical diff viewer: diffs files column-by-column instead of line-by-line")]
+#[command(
+    name = "vdiff",
+    version,
+    about = "A vertical diff viewer: diffs files column-by-column instead of line-by-line"
+)]
 struct RawCli {
     /// Diff two files: vdiff <file1> <file2>
     #[arg(value_name = "FILE1")]
@@ -129,8 +130,12 @@ mod tests {
     #[test]
     fn parses_git_revs() {
         let cli = Cli::parse_from(["vdiff", "git", "HEAD^"]);
-        assert!(matches!(cli.command, Command::Git { cached: false, revs } if revs == vec!["HEAD^"]));
+        assert!(
+            matches!(cli.command, Command::Git { cached: false, revs } if revs == vec!["HEAD^"])
+        );
         let cli = Cli::parse_from(["vdiff", "git", "xx...xx"]);
-        assert!(matches!(cli.command, Command::Git { cached: false, revs } if revs == vec!["xx...xx"]));
+        assert!(
+            matches!(cli.command, Command::Git { cached: false, revs } if revs == vec!["xx...xx"])
+        );
     }
 }

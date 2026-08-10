@@ -77,26 +77,30 @@ fn diff_columns(a: &[String], b: &[String]) -> (Vec<Step>, bool) {
 
     let mut ops: Vec<Step> = a[..prefix]
         .iter()
-        .map(|c| Step { kind: StepKind::Match, content: c.chars().collect() })
+        .map(|c| Step {
+            kind: StepKind::Match,
+            content: c.chars().collect(),
+        })
         .collect();
     let mid_a = &a[prefix..a.len() - suffix];
     let mid_b = &b[prefix..b.len() - suffix];
     let degraded = mid_a.len() * mid_b.len() > 10_000_000;
     if degraded {
-        ops.extend(
-            mid_a.iter().map(|c| Step { kind: StepKind::Delete, content: c.chars().collect() }),
-        );
-        ops.extend(
-            mid_b.iter().map(|c| Step { kind: StepKind::Insert, content: c.chars().collect() }),
-        );
+        ops.extend(mid_a.iter().map(|c| Step {
+            kind: StepKind::Delete,
+            content: c.chars().collect(),
+        }));
+        ops.extend(mid_b.iter().map(|c| Step {
+            kind: StepKind::Insert,
+            content: c.chars().collect(),
+        }));
     } else {
         lcs_ops(mid_a, mid_b, &mut ops);
     }
-    ops.extend(
-        a[a.len() - suffix..]
-            .iter()
-            .map(|c| Step { kind: StepKind::Match, content: c.chars().collect() }),
-    );
+    ops.extend(a[a.len() - suffix..].iter().map(|c| Step {
+        kind: StepKind::Match,
+        content: c.chars().collect(),
+    }));
     (ops, degraded)
 }
 
@@ -105,11 +109,17 @@ fn diff_columns(a: &[String], b: &[String]) -> (Vec<Step>, bool) {
 fn lcs_ops(a: &[String], b: &[String], out: &mut Vec<Step>) {
     let (n, m) = (a.len(), b.len());
     if n == 0 {
-        out.extend(b.iter().map(|c| Step { kind: StepKind::Insert, content: c.chars().collect() }));
+        out.extend(b.iter().map(|c| Step {
+            kind: StepKind::Insert,
+            content: c.chars().collect(),
+        }));
         return;
     }
     if m == 0 {
-        out.extend(a.iter().map(|c| Step { kind: StepKind::Delete, content: c.chars().collect() }));
+        out.extend(a.iter().map(|c| Step {
+            kind: StepKind::Delete,
+            content: c.chars().collect(),
+        }));
         return;
     }
 
@@ -127,19 +137,34 @@ fn lcs_ops(a: &[String], b: &[String], out: &mut Vec<Step>) {
     let (mut i, mut j) = (0, 0);
     while i < n && j < m {
         if a[i] == b[j] {
-            out.push(Step { kind: StepKind::Match, content: a[i].chars().collect() });
+            out.push(Step {
+                kind: StepKind::Match,
+                content: a[i].chars().collect(),
+            });
             i += 1;
             j += 1;
         } else if table[i + 1][j] >= table[i][j + 1] {
-            out.push(Step { kind: StepKind::Delete, content: a[i].chars().collect() });
+            out.push(Step {
+                kind: StepKind::Delete,
+                content: a[i].chars().collect(),
+            });
             i += 1;
         } else {
-            out.push(Step { kind: StepKind::Insert, content: b[j].chars().collect() });
+            out.push(Step {
+                kind: StepKind::Insert,
+                content: b[j].chars().collect(),
+            });
             j += 1;
         }
     }
-    out.extend(a[i..].iter().map(|c| Step { kind: StepKind::Delete, content: c.chars().collect() }));
-    out.extend(b[j..].iter().map(|c| Step { kind: StepKind::Insert, content: c.chars().collect() }));
+    out.extend(a[i..].iter().map(|c| Step {
+        kind: StepKind::Delete,
+        content: c.chars().collect(),
+    }));
+    out.extend(b[j..].iter().map(|c| Step {
+        kind: StepKind::Insert,
+        content: c.chars().collect(),
+    }));
 }
 
 /// Runs of consecutive steps with the same kind.
@@ -170,7 +195,12 @@ pub fn compute(a: &str, b: &str) -> DiffGrid {
     let b_cols = columns_padded(&b_lines, height);
     let (steps, degraded) = diff_columns(&a_cols, &b_cols);
     let groups = groups_of(&steps);
-    DiffGrid { steps, height, groups, degraded }
+    DiffGrid {
+        steps,
+        height,
+        groups,
+        degraded,
+    }
 }
 
 fn op_prefix(kind: StepKind) -> char {
@@ -230,7 +260,11 @@ pub fn render_text(grid: &DiffGrid) -> String {
         })
         .collect();
     let transposed = transpose_grid(&lines);
-    let boundaries: Vec<bool> = grid.steps.windows(2).map(|w| w[0].kind != w[1].kind).collect();
+    let boundaries: Vec<bool> = grid
+        .steps
+        .windows(2)
+        .map(|w| w[0].kind != w[1].kind)
+        .collect();
 
     let mut rows = Vec::with_capacity(transposed.len());
     for (i, row) in transposed.into_iter().enumerate() {
@@ -315,7 +349,12 @@ mod tests {
         let (steps, _) = diff_columns(&cols, &cols);
         let groups = groups_of(&steps);
         assert_eq!(
-            ops_of(&DiffGrid { steps, height: 2, groups, degraded: false }),
+            ops_of(&DiffGrid {
+                steps,
+                height: 2,
+                groups,
+                degraded: false
+            }),
             exp(&[("=", "ab"), ("=", "cd")])
         );
     }
@@ -327,7 +366,12 @@ mod tests {
         let (steps, _) = diff_columns(&a, &b);
         let groups = groups_of(&steps);
         assert_eq!(
-            ops_of(&DiffGrid { steps, height: 1, groups, degraded: false }),
+            ops_of(&DiffGrid {
+                steps,
+                height: 1,
+                groups,
+                degraded: false
+            }),
             exp(&[("=", "a"), ("-", "b"), ("+", "x"), ("=", "c")])
         );
     }
@@ -339,7 +383,12 @@ mod tests {
         let (steps, _) = diff_columns(&a, &b);
         let groups = groups_of(&steps);
         assert_eq!(
-            ops_of(&DiffGrid { steps, height: 1, groups, degraded: false }),
+            ops_of(&DiffGrid {
+                steps,
+                height: 1,
+                groups,
+                degraded: false
+            }),
             exp(&[("=", "a"), ("+", "b"), ("=", "c")])
         );
         let a = vec!["a".to_string(), "b".to_string(), "c".to_string()];
@@ -347,7 +396,12 @@ mod tests {
         let (steps, _) = diff_columns(&a, &b);
         let groups = groups_of(&steps);
         assert_eq!(
-            ops_of(&DiffGrid { steps, height: 1, groups, degraded: false }),
+            ops_of(&DiffGrid {
+                steps,
+                height: 1,
+                groups,
+                degraded: false
+            }),
             exp(&[("=", "a"), ("-", "b"), ("=", "c")])
         );
     }
@@ -356,9 +410,25 @@ mod tests {
     fn diff_columns_empty_sides() {
         assert!(diff_columns(&[], &[]).0.is_empty());
         let (steps, _) = diff_columns(&[], &["x".to_string()]);
-        assert_eq!(ops_of(&DiffGrid { steps, height: 1, groups: vec![Range { start: 0, end: 1 }], degraded: false }), exp(&[("+", "x")]));
+        assert_eq!(
+            ops_of(&DiffGrid {
+                steps,
+                height: 1,
+                groups: vec![Range { start: 0, end: 1 }],
+                degraded: false
+            }),
+            exp(&[("+", "x")])
+        );
         let (steps, _) = diff_columns(&["x".to_string()], &[]);
-        assert_eq!(ops_of(&DiffGrid { steps, height: 1, groups: vec![Range { start: 0, end: 1 }], degraded: false }), exp(&[("-", "x")]));
+        assert_eq!(
+            ops_of(&DiffGrid {
+                steps,
+                height: 1,
+                groups: vec![Range { start: 0, end: 1 }],
+                degraded: false
+            }),
+            exp(&[("-", "x")])
+        );
     }
 
     #[test]
@@ -372,10 +442,19 @@ mod tests {
     fn compute_marks_column_change() {
         let grid = compute("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
         // 7 columns (max line width); column 4 differs: old " b " vs new " q "
-        assert_eq!(ops_of(&grid), exp(&[
-            ("=", "fbq"), ("=", "oau"), ("=", "oru"), ("=", "  x"),
-            ("-", " b "), ("+", " q "), ("=", " a "), ("=", " z "),
-        ]));
+        assert_eq!(
+            ops_of(&grid),
+            exp(&[
+                ("=", "fbq"),
+                ("=", "oau"),
+                ("=", "oru"),
+                ("=", "  x"),
+                ("-", " b "),
+                ("+", " q "),
+                ("=", " a "),
+                ("=", " z "),
+            ])
+        );
         assert_eq!(grid.height, 3);
     }
 
@@ -402,7 +481,17 @@ mod tests {
     fn compute_utf8_multibyte() {
         let grid = compute("héllo\n", "héxlo\n");
         // one column per char position; column 2 differs (l vs x)
-        assert_eq!(ops_of(&grid), exp(&[("=", "h"), ("=", "é"), ("-", "l"), ("+", "x"), ("=", "l"), ("=", "o")]));
+        assert_eq!(
+            ops_of(&grid),
+            exp(&[
+                ("=", "h"),
+                ("=", "é"),
+                ("-", "l"),
+                ("+", "x"),
+                ("=", "l"),
+                ("=", "o")
+            ])
+        );
     }
 
     #[test]
@@ -459,17 +548,26 @@ mod tests {
 
     #[test]
     fn render_text_strips_crlf() {
-        assert_eq!(render_text(&compute("a\r\nb\r\n", "a\r\nc\r\n")), "-|+\na|a\nb|c\n");
+        assert_eq!(
+            render_text(&compute("a\r\nb\r\n", "a\r\nc\r\n")),
+            "-|+\na|a\nb|c\n"
+        );
     }
 
     #[test]
     fn render_text_utf8() {
-        assert_eq!(render_text(&compute("héllo\n", "héxlo\n")), "  |-|+|\nhé|l|x|lo\n");
+        assert_eq!(
+            render_text(&compute("héllo\n", "héxlo\n")),
+            "  |-|+|\nhé|l|x|lo\n"
+        );
     }
 
     #[test]
     fn render_text_keeps_trailing_empty_line() {
-        assert_eq!(render_text(&compute("ab\ncd\n", "ab\ncd\n\n")), "ab\ncd\n  \n");
+        assert_eq!(
+            render_text(&compute("ab\ncd\n", "ab\ncd\n\n")),
+            "ab\ncd\n  \n"
+        );
     }
 
     #[test]

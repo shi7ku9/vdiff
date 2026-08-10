@@ -137,7 +137,9 @@ fn merge_base(g: &dyn GitShell, a: &str, b: &str) -> Result<String, GitError> {
 pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpec, GitError> {
     if cached {
         if revs.len() > 1 {
-            return Err(GitError::InvalidRevSpec("--cached takes at most one revision".to_string()));
+            return Err(GitError::InvalidRevSpec(
+                "--cached takes at most one revision".to_string(),
+            ));
         }
         let old = match revs.first() {
             Some(r) => Source::Rev(r.clone()),
@@ -145,24 +147,42 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
         };
         let mut diff_args = vec!["--cached".to_string()];
         diff_args.extend(revs.iter().cloned());
-        return Ok(RevSpec { old, new: Source::Index, diff_args });
+        return Ok(RevSpec {
+            old,
+            new: Source::Index,
+            diff_args,
+        });
     }
     match revs.len() {
-        0 => Ok(RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] }),
+        0 => Ok(RevSpec {
+            old: Source::Index,
+            new: Source::Worktree,
+            diff_args: vec![],
+        }),
         1 => {
             let r = &revs[0];
             if let Some((kind, a, b)) = split_range(r) {
                 Ok(match kind {
                     RangeKind::MergeBase => {
                         let base = merge_base(g, &a, &b)?;
-                        RevSpec { old: Source::Rev(base), new: Source::Rev(b), diff_args: vec![r.clone()] }
+                        RevSpec {
+                            old: Source::Rev(base),
+                            new: Source::Rev(b),
+                            diff_args: vec![r.clone()],
+                        }
                     }
-                    RangeKind::Plain => {
-                        RevSpec { old: Source::Rev(a), new: Source::Rev(b), diff_args: vec![r.clone()] }
-                    }
+                    RangeKind::Plain => RevSpec {
+                        old: Source::Rev(a),
+                        new: Source::Rev(b),
+                        diff_args: vec![r.clone()],
+                    },
                 })
             } else {
-                Ok(RevSpec { old: Source::Rev(r.clone()), new: Source::Worktree, diff_args: vec![r.clone()] })
+                Ok(RevSpec {
+                    old: Source::Rev(r.clone()),
+                    new: Source::Worktree,
+                    diff_args: vec![r.clone()],
+                })
             }
         }
         2 => {
@@ -172,11 +192,17 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
                 Ok(match kind {
                     RangeKind::MergeBase => {
                         let base = merge_base(g, &a, &b)?;
-                        RevSpec { old: Source::Rev(base), new: Source::Rev(b), diff_args: revs.to_vec() }
+                        RevSpec {
+                            old: Source::Rev(base),
+                            new: Source::Rev(b),
+                            diff_args: revs.to_vec(),
+                        }
                     }
-                    RangeKind::Plain => {
-                        RevSpec { old: Source::Rev(a), new: Source::Rev(b), diff_args: revs.to_vec() }
-                    }
+                    RangeKind::Plain => RevSpec {
+                        old: Source::Rev(a),
+                        new: Source::Rev(b),
+                        diff_args: revs.to_vec(),
+                    },
                 })
             } else {
                 Ok(RevSpec {
@@ -236,10 +262,7 @@ pub struct ChangedFile {
 /// mistaken for a status. Unknown status letters are treated as
 /// Modified.
 pub fn parse_name_status_z(out: &str) -> Vec<ChangedFile> {
-    let fields: Vec<&str> = out
-        .split(['\0', '\t'])
-        .filter(|f| !f.is_empty())
-        .collect();
+    let fields: Vec<&str> = out.split(['\0', '\t']).filter(|f| !f.is_empty()).collect();
     let mut files = Vec::new();
     let mut i = 0;
     while i < fields.len() {
@@ -248,7 +271,11 @@ pub fn parse_name_status_z(out: &str) -> Vec<ChangedFile> {
         // Renames and copies carry two paths, old first.
         let n_paths = if letter == 'R' || letter == 'C' { 2 } else { 1 };
         let old = fields.get(i + 1).copied().unwrap_or("");
-        let new = if n_paths == 2 { fields.get(i + 2).copied().unwrap_or(old) } else { old };
+        let new = if n_paths == 2 {
+            fields.get(i + 2).copied().unwrap_or(old)
+        } else {
+            old
+        };
         files.push(ChangedFile {
             status,
             old_path: old.to_string(),
@@ -296,7 +323,11 @@ fn fetch_source(g: &dyn GitShell, src: &Source, path: &str) -> Option<String> {
 /// fetched (binary, non-UTF-8, missing blob, unreadable file) becomes
 /// empty; `None` only when both sides are unavailable. Added files
 /// have an empty old side; deleted files an empty new side.
-pub fn load_content(g: &dyn GitShell, spec: &RevSpec, file: &ChangedFile) -> Option<(String, String)> {
+pub fn load_content(
+    g: &dyn GitShell,
+    spec: &RevSpec,
+    file: &ChangedFile,
+) -> Option<(String, String)> {
     let old = match file.status {
         Status::Added => Some(String::new()),
         _ => fetch_source(g, &spec.old, &file.old_path),
@@ -315,7 +346,9 @@ pub fn load_content(g: &dyn GitShell, spec: &RevSpec, file: &ChangedFile) -> Opt
 mod tests {
     use super::*;
 
-    fn g() -> FakeGit { FakeGit::default() }
+    fn g() -> FakeGit {
+        FakeGit::default()
+    }
 
     #[test]
     fn in_repo_checks_git_dir() {
@@ -351,7 +384,10 @@ mod tests {
 
     #[test]
     fn resolve_cached_with_two_revs_fails() {
-        assert!(matches!(resolve(&g(), true, &["a".to_string(), "b".to_string()]), Err(GitError::InvalidRevSpec(_))));
+        assert!(matches!(
+            resolve(&g(), true, &["a".to_string(), "b".to_string()]),
+            Err(GitError::InvalidRevSpec(_))
+        ));
     }
 
     #[test]
@@ -396,7 +432,11 @@ mod tests {
     #[test]
     fn resolve_more_than_two_revs_fails() {
         assert!(matches!(
-            resolve(&g(), false, &["a".to_string(), "b".to_string(), "c".to_string()]),
+            resolve(
+                &g(),
+                false,
+                &["a".to_string(), "b".to_string(), "c".to_string()]
+            ),
             Err(GitError::InvalidRevSpec(_))
         ));
     }
@@ -414,14 +454,41 @@ mod tests {
     #[test]
     fn resolve_merge_base_failure() {
         let f = g(); // no merge-base seeded → None
-        assert!(matches!(resolve(&f, false, &["a...b".to_string()]), Err(GitError::MergeBaseFailed(_))));
+        assert!(matches!(
+            resolve(&f, false, &["a...b".to_string()]),
+            Err(GitError::MergeBaseFailed(_))
+        ));
     }
 
     #[test]
     fn labels() {
-        assert_eq!(RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] }.old_label(), "index");
-        assert_eq!(RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] }.new_label(), "worktree");
-        assert_eq!(RevSpec { old: Source::Rev("HEAD".into()), new: Source::Index, diff_args: vec![] }.old_label(), "HEAD");
+        assert_eq!(
+            RevSpec {
+                old: Source::Index,
+                new: Source::Worktree,
+                diff_args: vec![]
+            }
+            .old_label(),
+            "index"
+        );
+        assert_eq!(
+            RevSpec {
+                old: Source::Index,
+                new: Source::Worktree,
+                diff_args: vec![]
+            }
+            .new_label(),
+            "worktree"
+        );
+        assert_eq!(
+            RevSpec {
+                old: Source::Rev("HEAD".into()),
+                new: Source::Index,
+                diff_args: vec![]
+            }
+            .old_label(),
+            "HEAD"
+        );
     }
 
     #[test]
@@ -474,8 +541,15 @@ mod tests {
     #[test]
     fn changed_files_builds_diff_args() {
         let mut f = FakeGit::default();
-        f.set(&["diff", "--cached", "--name-status", "-z"], Some("M\ta.txt\0".to_string()));
-        let spec = RevSpec { old: Source::Rev("HEAD".into()), new: Source::Index, diff_args: vec!["--cached".into()] };
+        f.set(
+            &["diff", "--cached", "--name-status", "-z"],
+            Some("M\ta.txt\0".to_string()),
+        );
+        let spec = RevSpec {
+            old: Source::Rev("HEAD".into()),
+            new: Source::Index,
+            diff_args: vec!["--cached".into()],
+        };
         assert_eq!(changed_files(&f, &spec).unwrap().len(), 1);
     }
 
@@ -484,15 +558,26 @@ mod tests {
         // An unseeded FakeGit returns None, which now means git FAILED
         // (non-zero exit, bad rev, ...), not "no changes".
         let f = FakeGit::default();
-        let spec = RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] };
-        assert!(matches!(changed_files(&f, &spec), Err(GitError::GitFailed(_))));
+        let spec = RevSpec {
+            old: Source::Index,
+            new: Source::Worktree,
+            diff_args: vec![],
+        };
+        assert!(matches!(
+            changed_files(&f, &spec),
+            Err(GitError::GitFailed(_))
+        ));
     }
 
     #[test]
     fn changed_files_empty_output_is_clean_tree() {
         let mut f = FakeGit::default();
         f.set(&["diff", "--name-status", "-z"], Some(String::new()));
-        let spec = RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] };
+        let spec = RevSpec {
+            old: Source::Index,
+            new: Source::Worktree,
+            diff_args: vec![],
+        };
         assert_eq!(changed_files(&f, &spec).unwrap(), vec![]);
     }
 
@@ -500,18 +585,40 @@ mod tests {
     fn load_content_rev_sides() {
         let mut f = FakeGit::default();
         f.set(&["cat-file", "-p", "HEAD:a.txt"], Some("foo\n".to_string()));
-        f.set(&["cat-file", "-p", "HEAD~1:a.txt"], Some("bar\n".to_string()));
-        let spec = RevSpec { old: Source::Rev("HEAD~1".into()), new: Source::Rev("HEAD".into()), diff_args: vec![] };
-        let file = ChangedFile { status: Status::Modified, old_path: "a.txt".into(), new_path: "a.txt".into() };
-        assert_eq!(load_content(&f, &spec, &file), Some(("bar\n".to_string(), "foo\n".to_string())));
+        f.set(
+            &["cat-file", "-p", "HEAD~1:a.txt"],
+            Some("bar\n".to_string()),
+        );
+        let spec = RevSpec {
+            old: Source::Rev("HEAD~1".into()),
+            new: Source::Rev("HEAD".into()),
+            diff_args: vec![],
+        };
+        let file = ChangedFile {
+            status: Status::Modified,
+            old_path: "a.txt".into(),
+            new_path: "a.txt".into(),
+        };
+        assert_eq!(
+            load_content(&f, &spec, &file),
+            Some(("bar\n".to_string(), "foo\n".to_string()))
+        );
     }
 
     #[test]
     fn load_content_index_side() {
         let mut f = FakeGit::default();
         f.set(&["cat-file", "-p", ":a.txt"], Some("staged\n".to_string()));
-        let spec = RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] };
-        let file = ChangedFile { status: Status::Modified, old_path: "a.txt".into(), new_path: "a.txt".into() };
+        let spec = RevSpec {
+            old: Source::Index,
+            new: Source::Worktree,
+            diff_args: vec![],
+        };
+        let file = ChangedFile {
+            status: Status::Modified,
+            old_path: "a.txt".into(),
+            new_path: "a.txt".into(),
+        };
         assert_eq!(load_content(&f, &spec, &file).unwrap().0, "staged\n");
     }
 
@@ -519,7 +626,11 @@ mod tests {
     fn load_content_worktree_side_reads_disk() {
         let path = std::env::temp_dir().join(format!("vdiff-wt-{}", std::process::id()));
         std::fs::write(&path, "disk\n").unwrap();
-        let spec = RevSpec { old: Source::Rev("HEAD".into()), new: Source::Worktree, diff_args: vec![] };
+        let spec = RevSpec {
+            old: Source::Rev("HEAD".into()),
+            new: Source::Worktree,
+            diff_args: vec![],
+        };
         let file = ChangedFile {
             status: Status::Modified,
             old_path: path.to_str().unwrap().to_string(),
@@ -533,18 +644,44 @@ mod tests {
     #[test]
     fn load_content_added_and_deleted_sides_are_empty() {
         let f = FakeGit::default();
-        let spec = RevSpec { old: Source::Rev("HEAD".into()), new: Source::Rev("HEAD".into()), diff_args: vec![] };
-        let added = ChangedFile { status: Status::Added, old_path: "new.txt".into(), new_path: "new.txt".into() };
-        assert_eq!(load_content(&f, &spec, &added), Some(("".to_string(), "".to_string())));
-        let deleted = ChangedFile { status: Status::Deleted, old_path: "gone.txt".into(), new_path: "gone.txt".into() };
-        assert_eq!(load_content(&f, &spec, &deleted), Some(("".to_string(), "".to_string())));
+        let spec = RevSpec {
+            old: Source::Rev("HEAD".into()),
+            new: Source::Rev("HEAD".into()),
+            diff_args: vec![],
+        };
+        let added = ChangedFile {
+            status: Status::Added,
+            old_path: "new.txt".into(),
+            new_path: "new.txt".into(),
+        };
+        assert_eq!(
+            load_content(&f, &spec, &added),
+            Some(("".to_string(), "".to_string()))
+        );
+        let deleted = ChangedFile {
+            status: Status::Deleted,
+            old_path: "gone.txt".into(),
+            new_path: "gone.txt".into(),
+        };
+        assert_eq!(
+            load_content(&f, &spec, &deleted),
+            Some(("".to_string(), "".to_string()))
+        );
     }
 
     #[test]
     fn load_content_binary_is_none() {
         let f = FakeGit::default(); // cat-file → None (non-UTF-8)
-        let spec = RevSpec { old: Source::Rev("HEAD".into()), new: Source::Rev("HEAD".into()), diff_args: vec![] };
-        let file = ChangedFile { status: Status::Modified, old_path: "bin.dat".into(), new_path: "bin.dat".into() };
+        let spec = RevSpec {
+            old: Source::Rev("HEAD".into()),
+            new: Source::Rev("HEAD".into()),
+            diff_args: vec![],
+        };
+        let file = ChangedFile {
+            status: Status::Modified,
+            old_path: "bin.dat".into(),
+            new_path: "bin.dat".into(),
+        };
         assert_eq!(load_content(&f, &spec, &file), None);
     }
 }
