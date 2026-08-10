@@ -54,7 +54,7 @@ fn columns_padded(lines: &[String], height: usize) -> Vec<String> {
             for line in &chars {
                 column.push(line.get(col).copied().unwrap_or(' '));
             }
-            for _ in column.len()..height {
+            for _ in column.chars().count()..height {
                 column.push(' ');
             }
             column
@@ -301,6 +301,15 @@ mod tests {
         let grid = compute("héllo\n", "héxlo\n");
         // one column per char position; column 2 differs (l vs x)
         assert_eq!(ops_of(&grid), exp(&[("=", "h"), ("=", "é"), ("-", "l"), ("+", "x"), ("=", "l"), ("=", "o")]));
+    }
+
+    #[test]
+    fn compute_pads_multibyte_columns_by_chars() {
+        // "é" is 2 bytes but 1 char — the pad loop must count chars,
+        // or "é" vs "é " compares unequal and yields a spurious
+        // Delete+Insert (the ASCII analog "a\n" vs "a\n \n" is a Match).
+        let grid = compute("é\n", "é\n \n");
+        assert_eq!(ops_of(&grid), exp(&[("=", "é ")]));
     }
 
     #[test]
