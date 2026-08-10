@@ -209,6 +209,107 @@ impl GitShell for FakeGit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub status: Status,
+    pub old_path: String,
+    pub new_path: String,
+}
+
+/// Parse `git diff --name-status -z` output: a status letter (possibly
+/// `R` plus a similarity score) followed by one path — or old and new
+/// paths for renames — per file. Fields are NUL-separated in real
+/// `-z` output; tabs are also accepted as separators. Unknown status
+/// letters are treated as Modified.
+pub fn parse_name_status_z(out: &str) -> Vec<ChangedFile> {
+    let mut files: Vec<ChangedFile> = Vec::new();
+    for field in out.split(|c| c == '\0' || c == '\t').filter(|f| !f.is_empty()) {
+        if is_status_field(field) {
+            files.push(ChangedFile {
+                status: status_of(field),
+                old_path: String::new(),
+                new_path: String::new(),
+            });
+        } else if let Some(last) = files.last_mut() {
+            if last.old_path.is_empty() {
+                last.old_path = field.to_string();
+                last.new_path = field.to_string();
+            } else {
+                last.new_path = field.to_string();
+            }
+        }
+    }
+    files
+}
+
+/// A status field is a letter optionally followed by a similarity
+/// score (`M`, `A`, `D`, `R100`, `C50`).
+fn is_status_field(field: &str) -> bool {
+    let mut chars = field.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => chars.all(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+fn status_of(field: &str) -> Status {
+    match field.chars().next() {
+        Some('A') => Status::Added,
+        Some('D') => Status::Deleted,
+        Some('R') => Status::Renamed,
+        _ => Status::Modified,
+    }
+}
+
+/// The list of changed files for a rev spec, via
+/// `git diff <diff_args> --name-status -z`. Git failure → empty list.
+pub fn changed_files(g: &dyn GitShell, spec: &RevSpec) -> Vec<ChangedFile> {
+    let mut args: Vec<String> = vec!["diff".to_string()];
+    args.extend(spec.diff_args.iter().cloned());
+    args.push("--name-status".to_string());
+    args.push("-z".to_string());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match g.output(&arg_refs) {
+        Some(out) => parse_name_status_z(&out),
+        None => Vec::new(),
+    }
+}
+
+fn fetch_source(g: &dyn GitShell, src: &Source, path: &str) -> Option<String> {
+    match src {
+        Source::Worktree => std::fs::read_to_string(path).ok(),
+        Source::Index => g.output(&["cat-file", "-p", &format!(":{path}")]),
+        Source::Rev(rev) => g.output(&["cat-file", "-p", &format!("{rev}:{path}")]),
+    }
+}
+
+/// Fetch (old, new) contents for a changed file. A side that cannot be
+/// fetched (binary, non-UTF-8, missing blob, unreadable file) becomes
+/// empty; `None` only when both sides are unavailable. Added files
+/// have an empty old side; deleted files an empty new side.
+pub fn load_content(g: &dyn GitShell, spec: &RevSpec, file: &ChangedFile) -> Option<(String, String)> {
+    let old = match file.status {
+        Status::Added => Some(String::new()),
+        _ => fetch_source(g, &spec.old, &file.old_path),
+    };
+    let new = match file.status {
+        Status::Deleted => Some(String::new()),
+        _ => fetch_source(g, &spec.new, &file.new_path),
+    };
+    match (old, new) {
+        (None, None) => None,
+        (old, new) => Some((old.unwrap_or_default(), new.unwrap_or_default())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +413,105 @@ mod tests {
         assert_eq!(RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] }.old_label(), "index");
         assert_eq!(RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] }.new_label(), "worktree");
         assert_eq!(RevSpec { old: Source::Rev("HEAD".into()), new: Source::Index, diff_args: vec![] }.old_label(), "HEAD");
+    }
+
+    #[test]
+    fn parse_name_status_z_basic() {
+        let out = "M\tsrc/lib.rs\0A\tsrc/main.rs\0D\told.cpp\0R100\ta.cpp\tb.cpp\0";
+        let files = parse_name_status_z(out);
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0].status, Status::Modified);
+        assert_eq!(files[0].old_path, "src/lib.rs");
+        assert_eq!(files[0].new_path, "src/lib.rs");
+        assert_eq!(files[1].status, Status::Added);
+        assert_eq!(files[2].status, Status::Deleted);
+        assert_eq!(files[3].status, Status::Renamed);
+        assert_eq!(files[3].old_path, "a.cpp");
+        assert_eq!(files[3].new_path, "b.cpp");
+    }
+
+    #[test]
+    fn parse_name_status_z_empty() {
+        assert!(parse_name_status_z("").is_empty());
+    }
+
+    #[test]
+    fn parse_name_status_z_real_git_separators() {
+        // Real `git diff --name-status -z` separates every field with NUL.
+        let out = "M\0src/lib.rs\0R100\0a.cpp\0b.cpp\0";
+        let files = parse_name_status_z(out);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].status, Status::Modified);
+        assert_eq!(files[0].old_path, "src/lib.rs");
+        assert_eq!(files[1].status, Status::Renamed);
+        assert_eq!(files[1].old_path, "a.cpp");
+        assert_eq!(files[1].new_path, "b.cpp");
+    }
+
+    #[test]
+    fn changed_files_builds_diff_args() {
+        let mut f = FakeGit::default();
+        f.set(&["diff", "--cached", "--name-status", "-z"], Some("M\ta.txt\0".to_string()));
+        let spec = RevSpec { old: Source::Rev("HEAD".into()), new: Source::Index, diff_args: vec!["--cached".into()] };
+        assert_eq!(changed_files(&f, &spec).len(), 1);
+    }
+
+    #[test]
+    fn changed_files_git_failure_is_empty() {
+        let f = FakeGit::default();
+        let spec = RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] };
+        assert!(changed_files(&f, &spec).is_empty());
+    }
+
+    #[test]
+    fn load_content_rev_sides() {
+        let mut f = FakeGit::default();
+        f.set(&["cat-file", "-p", "HEAD:a.txt"], Some("foo\n".to_string()));
+        f.set(&["cat-file", "-p", "HEAD~1:a.txt"], Some("bar\n".to_string()));
+        let spec = RevSpec { old: Source::Rev("HEAD~1".into()), new: Source::Rev("HEAD".into()), diff_args: vec![] };
+        let file = ChangedFile { status: Status::Modified, old_path: "a.txt".into(), new_path: "a.txt".into() };
+        assert_eq!(load_content(&f, &spec, &file), Some(("bar\n".to_string(), "foo\n".to_string())));
+    }
+
+    #[test]
+    fn load_content_index_side() {
+        let mut f = FakeGit::default();
+        f.set(&["cat-file", "-p", ":a.txt"], Some("staged\n".to_string()));
+        let spec = RevSpec { old: Source::Index, new: Source::Worktree, diff_args: vec![] };
+        let file = ChangedFile { status: Status::Modified, old_path: "a.txt".into(), new_path: "a.txt".into() };
+        assert_eq!(load_content(&f, &spec, &file).unwrap().0, "staged\n");
+    }
+
+    #[test]
+    fn load_content_worktree_side_reads_disk() {
+        let path = std::env::temp_dir().join(format!("vdiff-wt-{}", std::process::id()));
+        std::fs::write(&path, "disk\n").unwrap();
+        let spec = RevSpec { old: Source::Rev("HEAD".into()), new: Source::Worktree, diff_args: vec![] };
+        let file = ChangedFile {
+            status: Status::Modified,
+            old_path: path.to_str().unwrap().to_string(),
+            new_path: path.to_str().unwrap().to_string(),
+        };
+        let f = FakeGit::default();
+        assert_eq!(load_content(&f, &spec, &file).unwrap().1, "disk\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_content_added_and_deleted_sides_are_empty() {
+        let f = FakeGit::default();
+        let spec = RevSpec { old: Source::Rev("HEAD".into()), new: Source::Rev("HEAD".into()), diff_args: vec![] };
+        let added = ChangedFile { status: Status::Added, old_path: "new.txt".into(), new_path: "new.txt".into() };
+        assert_eq!(load_content(&f, &spec, &added), Some(("".to_string(), "".to_string())));
+        let deleted = ChangedFile { status: Status::Deleted, old_path: "gone.txt".into(), new_path: "gone.txt".into() };
+        assert_eq!(load_content(&f, &spec, &deleted), Some(("".to_string(), "".to_string())));
+    }
+
+    #[test]
+    fn load_content_binary_is_none() {
+        let f = FakeGit::default(); // cat-file → None (non-UTF-8)
+        let spec = RevSpec { old: Source::Rev("HEAD".into()), new: Source::Rev("HEAD".into()), diff_args: vec![] };
+        let file = ChangedFile { status: Status::Modified, old_path: "bin.dat".into(), new_path: "bin.dat".into() };
+        assert_eq!(load_content(&f, &spec, &file), None);
     }
 }
