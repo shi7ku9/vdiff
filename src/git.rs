@@ -224,47 +224,42 @@ pub struct ChangedFile {
     pub new_path: String,
 }
 
-/// Parse `git diff --name-status -z` output: a status letter (possibly
-/// `R` plus a similarity score) followed by one path — or old and new
-/// paths for renames — per file. Fields are NUL-separated in real
-/// `-z` output; tabs are also accepted as separators. Unknown status
-/// letters are treated as Modified.
+/// Parse `git diff --name-status -z` output: fields NUL-separated (in
+/// real `-z` output) or tab-separated; each file is a status letter
+/// (possibly `R` plus a similarity score) followed by one path, or by
+/// old and new paths for renames/copies. The field stream is
+/// positional — no content sniffing, so a single-letter path cannot be
+/// mistaken for a status. Unknown status letters are treated as
+/// Modified.
 pub fn parse_name_status_z(out: &str) -> Vec<ChangedFile> {
-    let mut files: Vec<ChangedFile> = Vec::new();
-    for field in out.split(|c| c == '\0' || c == '\t').filter(|f| !f.is_empty()) {
-        if is_status_field(field) {
-            files.push(ChangedFile {
-                status: status_of(field),
-                old_path: String::new(),
-                new_path: String::new(),
-            });
-        } else if let Some(last) = files.last_mut() {
-            if last.old_path.is_empty() {
-                last.old_path = field.to_string();
-                last.new_path = field.to_string();
-            } else {
-                last.new_path = field.to_string();
-            }
-        }
+    let fields: Vec<&str> = out
+        .split(|c| c == '\0' || c == '\t')
+        .filter(|f| !f.is_empty())
+        .collect();
+    let mut files = Vec::new();
+    let mut i = 0;
+    while i < fields.len() {
+        let letter = fields[i].chars().next().unwrap_or('\0');
+        let status = status_of(letter);
+        // Renames and copies carry two paths, old first.
+        let n_paths = if letter == 'R' || letter == 'C' { 2 } else { 1 };
+        let old = fields.get(i + 1).copied().unwrap_or("");
+        let new = if n_paths == 2 { fields.get(i + 2).copied().unwrap_or(old) } else { old };
+        files.push(ChangedFile {
+            status,
+            old_path: old.to_string(),
+            new_path: new.to_string(),
+        });
+        i += 1 + n_paths;
     }
     files
 }
 
-/// A status field is a letter optionally followed by a similarity
-/// score (`M`, `A`, `D`, `R100`, `C50`).
-fn is_status_field(field: &str) -> bool {
-    let mut chars = field.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() => chars.all(|c| c.is_ascii_digit()),
-        _ => false,
-    }
-}
-
-fn status_of(field: &str) -> Status {
-    match field.chars().next() {
-        Some('A') => Status::Added,
-        Some('D') => Status::Deleted,
-        Some('R') => Status::Renamed,
+fn status_of(letter: char) -> Status {
+    match letter {
+        'A' => Status::Added,
+        'D' => Status::Deleted,
+        'R' => Status::Renamed,
         _ => Status::Modified,
     }
 }
@@ -446,6 +441,20 @@ mod tests {
         assert_eq!(files[1].status, Status::Renamed);
         assert_eq!(files[1].old_path, "a.cpp");
         assert_eq!(files[1].new_path, "b.cpp");
+    }
+
+    #[test]
+    fn parse_name_status_z_single_letter_paths() {
+        // A single-letter path ("a") must not be misread as a status.
+        let out = "M\0a\0D\0x.rs\0";
+        let files = parse_name_status_z(out);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].status, Status::Modified);
+        assert_eq!(files[0].old_path, "a");
+        assert_eq!(files[0].new_path, "a");
+        assert_eq!(files[1].status, Status::Deleted);
+        assert_eq!(files[1].old_path, "x.rs");
+        assert_eq!(files[1].new_path, "x.rs");
     }
 
     #[test]
