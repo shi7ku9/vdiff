@@ -50,12 +50,6 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     out
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
-    List,
-    Diff,
-}
-
 pub enum DiffSource {
     Files { old: PathBuf, new: PathBuf },
     Git { spec: RevSpec, files: Vec<ChangedFile>, git: Box<dyn GitShell> },
@@ -86,7 +80,6 @@ pub struct App {
     pub selection: usize,
     pub show_sidebar: bool,
     pub transposed: bool,
-    pub focus: Focus,
     pub scroll_y: usize,
     pub scroll_x: usize,
     pub grid: Option<DiffGrid>,
@@ -103,19 +96,11 @@ impl App {
             DiffSource::Files { old, new } => (old.display().to_string(), new.display().to_string()),
             DiffSource::Git { spec, .. } => (spec.old_label(), spec.new_label()),
         };
-        // Files mode has no sidebar (entries() is empty), so List focus
-        // would make j/k/Tab/BackTab dead keys on the primary path —
-        // start in Diff focus there; git mode starts in the sidebar.
-        let focus = match &source {
-            DiffSource::Git { .. } => Focus::List,
-            DiffSource::Files { .. } => Focus::Diff,
-        };
         let mut app = App {
             source,
             selection: 0,
             show_sidebar: true,
             transposed: false,
-            focus,
             scroll_y: 0,
             scroll_x: 0,
             grid: None,
@@ -380,7 +365,7 @@ impl App {
             (None, Some(m)) => spans.push(Span::raw(format!("{m}  "))),
             (None, None) => {}
         }
-        spans.push(Span::raw("hjkl scroll · n/p changes · t transpose · e sidebar · q quit"));
+        spans.push(Span::raw("tab/⇧tab select · hjkl scroll · n/p changes · t transpose · e sidebar · q quit"));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
@@ -404,24 +389,10 @@ impl App {
             KeyCode::Char('p') => self.jump_group(-1),
             KeyCode::Char('h') => self.scroll_x = self.scroll_x.saturating_sub(1),
             KeyCode::Char('l') => self.scroll_x = (self.scroll_x + 1).min(self.max_scroll_x()),
-            KeyCode::Char('j') => match self.focus {
-                Focus::List => self.move_selection(1),
-                Focus::Diff => self.scroll_y = (self.scroll_y + 1).min(self.max_scroll_y()),
-            },
-            KeyCode::Char('k') => match self.focus {
-                Focus::List => self.move_selection(-1),
-                Focus::Diff => self.scroll_y = self.scroll_y.saturating_sub(1),
-            },
-            KeyCode::Enter if self.focus == Focus::List => self.focus = Focus::Diff,
-            KeyCode::Tab => match self.focus {
-                Focus::List => self.move_selection(1),
-                Focus::Diff => self.focus = Focus::List,
-            },
-            KeyCode::BackTab => match self.focus {
-                Focus::List => self.move_selection(-1),
-                Focus::Diff => self.focus = Focus::List,
-            },
-            KeyCode::Esc if self.focus == Focus::Diff => self.focus = Focus::List,
+            KeyCode::Char('j') => self.scroll_y = (self.scroll_y + 1).min(self.max_scroll_y()),
+            KeyCode::Char('k') => self.scroll_y = self.scroll_y.saturating_sub(1),
+            KeyCode::Tab => self.move_selection(1),
+            KeyCode::BackTab => self.move_selection(-1),
             _ => {}
         }
         false
@@ -849,9 +820,8 @@ mod tests {
     }
 
     #[test]
-    fn hjkl_scroll_diff_when_focused() {
+    fn hjkl_scroll_diff() {
         let (mut app, a, b) = files_app("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n21\n");
-        app.focus = Focus::Diff;
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.scroll_y, 1);
         app.handle_key(key(KeyCode::Char('k')));
@@ -871,31 +841,33 @@ mod tests {
     }
 
     #[test]
-    fn focus_defaults_to_diff_in_files_mode_and_list_in_git_mode() {
-        let (app, a, b) = files_app("a\n", "b\n");
-        assert_eq!(app.focus, Focus::Diff, "files mode has no sidebar: must start in diff focus");
-        let _ = std::fs::remove_file(&a);
-        let _ = std::fs::remove_file(&b);
-        let app = git_app(vec![("a\n", "b\n")]);
-        assert_eq!(app.focus, Focus::List, "git mode has a sidebar: must start in list focus");
-    }
-
-    #[test]
-    fn tab_and_j_move_selection_when_list_focused() {
+    fn tab_and_backtab_move_selection() {
         let mut app = git_app(vec![("foo\n", "bar\n"), ("x\n", "y\n")]);
-        assert_eq!(app.focus, Focus::List);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.selection, 1);
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.selection, 0);
+        // j/k scroll the diff — they never touch the selection.
         app.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(app.selection, 1);
-        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.scroll_y, 1);
         assert_eq!(app.selection, 0);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.focus, Focus::Diff);
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.focus, Focus::List);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.scroll_y, 0);
+        assert_eq!(app.selection, 0);
+    }
+
+    #[test]
+    fn jk_scrolls_diff_in_git_mode_without_moving_selection() {
+        let mut app = git_app(vec![
+            ("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n21\n"),
+            ("x\n", "y\n"),
+        ]);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll_y, 1, "j must scroll the diff in git mode");
+        assert_eq!(app.selection, 0, "j must not move the selection");
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.selection, 1, "Tab moves the selection");
+        assert_eq!(app.scroll_y, 0, "selection change reloads and resets scroll");
     }
 
     #[test]
