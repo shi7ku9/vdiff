@@ -7,12 +7,12 @@
 
 use crate::diff::{self, DiffGrid, StepKind};
 use crate::git::{self, ChangedFile, GitShell, RevSpec, Status};
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::{Frame, Terminal};
+use ratatui::Frame;
 use std::io;
 use std::path::PathBuf;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -115,8 +115,12 @@ impl App {
             message: None,
             degraded: false,
             labels,
-            pane_width: 80,
-            pane_height: 24,
+            // Unknown until the first render: 0 means "no clamp yet"
+            // (max_scroll = content size). A positive default like
+            // 80x24 would pin max_scroll_y/x to 0 for small diffs and
+            // make j/l/n/p unable to move.
+            pane_width: 0,
+            pane_height: 0,
         };
         app.reload();
         app
@@ -373,10 +377,179 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    // Temporary stub — Task 9 replaces this with real key handling.
-    pub fn handle_key(&mut self, _key: KeyEvent) -> bool {
+    /// Handle one key event. Returns true when the app should quit.
+    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+            return true;
+        }
+        match key.code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('t') => {
+                self.transposed = !self.transposed;
+                self.scroll_y = 0;
+                self.scroll_x = 0;
+            }
+            KeyCode::Char('e') => {
+                if self.has_sidebar() {
+                    self.show_sidebar = !self.show_sidebar;
+                }
+            }
+            KeyCode::Char('g') => self.scroll_y = self.max_scroll_y(),
+            KeyCode::Char('G') => self.scroll_y = 0,
+            KeyCode::Char('n') => self.jump_group(1),
+            KeyCode::Char('p') => self.jump_group(-1),
+            KeyCode::Char('h') => self.scroll_x = self.scroll_x.saturating_sub(1),
+            KeyCode::Char('l') => self.scroll_x = (self.scroll_x + 1).min(self.max_scroll_x()),
+            KeyCode::Char('j') => match self.focus {
+                Focus::List => self.move_selection(1),
+                Focus::Diff => self.scroll_y = (self.scroll_y + 1).min(self.max_scroll_y()),
+            },
+            KeyCode::Char('k') => match self.focus {
+                Focus::List => self.move_selection(-1),
+                Focus::Diff => self.scroll_y = self.scroll_y.saturating_sub(1),
+            },
+            KeyCode::Enter => {
+                if self.focus == Focus::List {
+                    self.focus = Focus::Diff;
+                }
+            }
+            KeyCode::Tab => match self.focus {
+                Focus::List => self.move_selection(1),
+                Focus::Diff => self.focus = Focus::List,
+            },
+            KeyCode::BackTab => match self.focus {
+                Focus::List => self.move_selection(-1),
+                Focus::Diff => self.focus = Focus::List,
+            },
+            KeyCode::Esc => {
+                if self.focus == Focus::Diff {
+                    self.focus = Focus::List;
+                }
+            }
+            _ => {}
+        }
         false
     }
+
+    fn move_selection(&mut self, delta: i32) {
+        let len = self.entries().len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.selection as i32 + delta).clamp(0, len as i32 - 1) as usize;
+        if next != self.selection {
+            self.selection = next;
+            self.reload();
+        }
+    }
+
+    /// Jump to the next (dir=1) or previous (dir=-1) change group.
+    fn jump_group(&mut self, dir: i32) {
+        let Some(grid) = &self.grid else { return };
+        // Change groups: runs of non-Match steps (kind != Match).
+        let change_groups: Vec<usize> = grid
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| grid.steps[g.start].kind != StepKind::Match)
+            .map(|(i, _)| i)
+            .collect();
+        if change_groups.is_empty() {
+            return;
+        }
+        // Anchor row of each change group: the first affected file row in
+        // normal view, the group's first step in transposed view.
+        let ranges: Vec<std::ops::Range<usize>> = change_groups
+            .iter()
+            .map(|&i| grid.groups[i].clone())
+            .collect();
+        let rows: Vec<usize> = ranges
+            .iter()
+            .map(|g| {
+                if self.transposed {
+                    g.start
+                } else {
+                    first_affected_row(grid, g).unwrap_or(usize::MAX)
+                }
+            })
+            .collect();
+        // All grid reads above are done; below we only mutate scrolls.
+        let target = if dir > 0 {
+            // Next change group after the current scroll row; at the
+            // bottom (nothing below) wrap around to the first one.
+            ranges
+                .iter()
+                .zip(&rows)
+                .find(|(_, r)| **r > self.scroll_y)
+                .map(|(g, _)| g.clone())
+                .or_else(|| ranges.first().cloned())
+        } else {
+            // Previous change group before the current scroll row.
+            ranges
+                .iter()
+                .zip(&rows)
+                .rev()
+                .find(|(_, r)| **r < self.scroll_y)
+                .map(|(g, _)| g.clone())
+                .or_else(|| {
+                    if self.scroll_y == 0 && self.scroll_x == 0 {
+                        // At the very top: wrap to the last group.
+                        ranges.last().cloned()
+                    } else {
+                        // Already at the first change group: back to the top.
+                        None
+                    }
+                })
+        };
+        let Some(group) = target else {
+            self.scroll_y = 0;
+            self.scroll_x = 0;
+            return;
+        };
+        if self.transposed {
+            self.scroll_y = group.start.min(self.max_scroll_y());
+            self.scroll_x = 0;
+            return;
+        }
+        let Some(grid) = &self.grid else { return };
+        if let Some(row) = first_affected_row(grid, &group) {
+            self.scroll_y = row.min(self.max_scroll_y());
+            self.scroll_x = group_start_width(grid, &group).min(self.max_scroll_x());
+        }
+    }
+}
+
+/// The first file line where any step in `group` has a non-padding char.
+fn first_affected_row(grid: &DiffGrid, group: &std::ops::Range<usize>) -> Option<usize> {
+    (0..grid.height).find(|&r| {
+        grid.steps[group.clone()]
+            .iter()
+            .any(|s| s.content.get(r).copied().unwrap_or(' ') != ' ')
+    })
+}
+
+/// Display width of the grid content before `group` ends (step widths
+/// plus one cell per group separator, counting the separator after the
+/// group's own last step). For a delete+insert pair this lands on the
+/// column of the insert's `+` — the marker position where the change
+/// is visible.
+fn group_start_width(grid: &DiffGrid, group: &std::ops::Range<usize>) -> usize {
+    let mut w = 0usize;
+    for (i, step) in grid.steps.iter().take(group.end).enumerate() {
+        w += step_width(step);
+        if grid.groups.iter().any(|g| g.end == i + 1) {
+            w += 1;
+        }
+    }
+    w
+}
+
+/// Display width of one step's column: the widest char in the column.
+/// The marker row renders one char per step, so group_start_width must
+/// count steps as cells, not sum the whole column. Taking the max keeps wide
+/// (CJK) columns from being undercounted.
+fn step_width(step: &crate::diff::Step) -> usize {
+    step.content.iter().map(|c| c.width().unwrap_or(0)).max().unwrap_or(0)
 }
 
 /// Transposed display rows: one per step — prefix char (` `/`-`/`+`) +
@@ -658,6 +831,112 @@ mod tests {
         let (mut app, a, b) = files_app(&old, &new);
         let _ = draw(&mut app); // sets pane_width from the real rect (80)
         assert_eq!(app.max_scroll_x(), 22);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn q_and_ctrl_c_quit() {
+        let (mut app, a, b) = files_app("a\n", "b\n");
+        assert!(app.handle_key(key(KeyCode::Char('q'))));
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn hjkl_scroll_diff_when_focused() {
+        let (mut app, a, b) = files_app("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n21\n");
+        app.focus = Focus::Diff;
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.scroll_y, 1);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.scroll_y, 0);
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.scroll_x, 1);
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.scroll_x, 0);
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.scroll_y, app.max_scroll_y());
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.scroll_y, 0);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn tab_and_j_move_selection_when_list_focused() {
+        let mut app = git_app(vec![("foo\n", "bar\n"), ("x\n", "y\n")]);
+        assert_eq!(app.focus, Focus::List);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.selection, 1);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.selection, 0);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.selection, 1);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.selection, 0);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::Diff);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::List);
+    }
+
+    #[test]
+    fn selection_change_reloads_diff() {
+        let mut app = git_app(vec![("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n"), ("x\n", "y\n")]);
+        let before = app.grid.clone();
+        app.handle_key(key(KeyCode::Tab));
+        let after = app.grid.clone();
+        assert_ne!(before, after, "diff must change when the selection moves");
+    }
+
+    #[test]
+    fn t_toggles_transposed_and_resets_scrolls() {
+        let (mut app, a, b) = files_app("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
+        app.scroll_y = 2;
+        app.scroll_x = 3;
+        app.handle_key(key(KeyCode::Char('t')));
+        assert!(app.transposed);
+        assert_eq!(app.scroll_y, 0);
+        assert_eq!(app.scroll_x, 0);
+        app.handle_key(key(KeyCode::Char('t')));
+        assert!(!app.transposed);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn e_toggles_sidebar_only_in_git_mode() {
+        let mut app = git_app(vec![("a\n", "b\n")]);
+        assert!(app.show_sidebar);
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(!app.show_sidebar);
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(app.show_sidebar);
+        let (mut files_app, a, b) = files_app("a\n", "b\n");
+        files_app.handle_key(key(KeyCode::Char('e'))); // no sidebar in files mode
+        assert!(files_app.show_sidebar);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn n_p_jump_to_change_groups() {
+        let (mut app, a, b) = files_app("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
+        app.handle_key(key(KeyCode::Char('n')));
+        // change group (del+ins) starts at display width 7 (4 steps × 1 cell + 3 separators)
+        assert_eq!(app.scroll_x, 7);
+        assert_eq!(app.scroll_y, 1); // first affected row is line 1 ("bar ...")
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.scroll_x, 0);
+        assert_eq!(app.scroll_y, 0);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
