@@ -173,6 +173,108 @@ pub fn compute(a: &str, b: &str) -> DiffGrid {
     DiffGrid { steps, height, groups, degraded }
 }
 
+fn op_prefix(kind: StepKind) -> char {
+    match kind {
+        StepKind::Match => ' ',
+        StepKind::Delete => '-',
+        StepKind::Insert => '+',
+    }
+}
+
+fn transpose_grid(grid: &[String]) -> Vec<String> {
+    let chars: Vec<Vec<char>> = grid.iter().map(|line| line.chars().collect()).collect();
+    let width = chars.iter().map(|line| line.len()).max().unwrap_or(0);
+    (0..width)
+        .map(|row| {
+            let mut line = String::new();
+            for grid_line in &chars {
+                line.push(grid_line.get(row).copied().unwrap_or(' '));
+            }
+            line
+        })
+        .collect()
+}
+
+/// Insert `|` after each step marked in `boundaries`. Each final row
+/// holds exactly one char per diff step, so steps map 1:1 to chars.
+fn separate_ops(row: &str, boundaries: &[bool]) -> String {
+    let mut out = String::with_capacity(row.len() * 2);
+    let len = row.chars().count();
+    for (i, c) in row.chars().enumerate() {
+        out.push(c);
+        // No trailing separator: a trimmed marker row may end before
+        // the last step.
+        if i + 1 < len && boundaries.get(i).copied().unwrap_or(false) {
+            out.push('|');
+        }
+    }
+    out
+}
+
+/// The plain-text view: marker row (trailing match markers
+/// trimmed, trailing `|` kept) followed by the file lines with `|`
+/// separators between groups. Empty when the grid has no steps.
+pub fn render_text(grid: &DiffGrid) -> String {
+    let lines: Vec<String> = grid
+        .steps
+        .iter()
+        .map(|s| {
+            let mut line = String::with_capacity(grid.height + 1);
+            line.push(op_prefix(s.kind));
+            line.extend(s.content.iter());
+            // content is a Vec<char>, so len() is already the char count.
+            for _ in s.content.len()..grid.height {
+                line.push(' ');
+            }
+            line
+        })
+        .collect();
+    let transposed = transpose_grid(&lines);
+    let boundaries: Vec<bool> = grid.steps.windows(2).map(|w| w[0].kind != w[1].kind).collect();
+
+    let mut rows = Vec::with_capacity(transposed.len());
+    for (i, row) in transposed.into_iter().enumerate() {
+        if i == 0 {
+            let trimmed = row.trim_end_matches(' ');
+            let mut marker = separate_ops(trimmed, &boundaries);
+            // The marker drops trailing match markers (spaces); keep
+            // the `|` that separates the last change from the tail.
+            if !marker.is_empty() && trimmed.len() < row.len() {
+                marker.push('|');
+            }
+            rows.push(marker);
+        } else {
+            rows.push(separate_ops(&row, &boundaries));
+        }
+    }
+
+    let mut out = String::new();
+    if let Some((first, rest)) = rows.split_first() {
+        if !first.is_empty() {
+            out.push_str(first);
+            out.push('\n');
+        }
+        out.push_str(&rest.join("\n"));
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// The raw step view: one row per diff step — prefix char (` `/`-`/`+`)
+/// + `' '` + the column content (one char per file line).
+pub fn render_transposed(grid: &DiffGrid) -> String {
+    let mut out = String::new();
+    for step in &grid.steps {
+        out.push(op_prefix(step.kind));
+        out.push(' ');
+        out.extend(step.content.iter());
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +429,67 @@ mod tests {
         assert_eq!(steps[4_999].kind, StepKind::Delete);
         assert_eq!(steps[5_000].kind, StepKind::Insert);
         assert_eq!(steps[9_999].kind, StepKind::Insert);
+    }
+
+    #[test]
+    fn render_text_marks_column_change() {
+        assert_eq!(
+            render_text(&compute("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n")),
+            "    |-|+|\nfoo | | |  \nbar |b|q|az\nquux| | |  \n",
+        );
+    }
+
+    #[test]
+    fn render_text_identical_files_have_no_marker() {
+        assert_eq!(
+            render_text(&compute("foo\nbar baz\n", "foo\nbar baz\n")),
+            "foo    \nbar baz\n",
+        );
+    }
+
+    #[test]
+    fn render_text_empty_vs_content() {
+        assert_eq!(render_text(&compute("", "foo\nbar\n")), "+++\nfoo\nbar\n");
+    }
+
+    #[test]
+    fn render_text_empty_vs_empty() {
+        assert_eq!(render_text(&compute("", "")), "");
+    }
+
+    #[test]
+    fn render_text_strips_crlf() {
+        assert_eq!(render_text(&compute("a\r\nb\r\n", "a\r\nc\r\n")), "-|+\na|a\nb|c\n");
+    }
+
+    #[test]
+    fn render_text_utf8() {
+        assert_eq!(render_text(&compute("héllo\n", "héxlo\n")), "  |-|+|\nhé|l|x|lo\n");
+    }
+
+    #[test]
+    fn render_text_keeps_trailing_empty_line() {
+        assert_eq!(render_text(&compute("ab\ncd\n", "ab\ncd\n\n")), "ab\ncd\n  \n");
+    }
+
+    #[test]
+    fn render_text_all_insert() {
+        let grid = compute("", "foo\nbar\nquux\n");
+        // "quux" is 4 chars wide, so there are 4 insert columns ("++++").
+        assert_eq!(render_text(&grid), "++++\nfoo \nbar \nquux\n");
+    }
+
+    #[test]
+    fn render_transposed_stacks_steps() {
+        let grid = compute("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
+        assert_eq!(
+            render_transposed(&grid),
+            "  fbq\n  oau\n  oru\n    x\n-  b \n+  q \n   a \n   z \n",
+        );
+    }
+
+    #[test]
+    fn render_transposed_empty() {
+        assert_eq!(render_transposed(&compute("", "")), "");
     }
 }
