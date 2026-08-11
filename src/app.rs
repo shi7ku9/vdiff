@@ -19,29 +19,21 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Display rows for the TUI: rows[0] is the marker row (one char per
 /// step, `|` between groups, padded with spaces to the full content
-/// display width), rows[i+1] is file line i. Cells are padded to
-/// their step column's display width up to the last `|`, so the
-/// separators line up vertically; past it, rows may differ at the
-/// tail.
+/// display width), rows[i+1] is file line i. Every cell is padded to
+/// its step column's display width, so each column occupies the same
+/// cells in every row: separators line up vertically, and narrow
+/// chars in wide columns sit at their column's start (a.txt case:
+/// `a b c d ` under `你好啊！`).
 pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     let mut marker = String::new();
     let mut rows: Vec<String> = (0..grid.height).map(|_| String::new()).collect();
-    // Only cells up to the last step with a `|` after it get padded.
-    let pad_until = grid
-        .groups
-        .iter()
-        .filter(|g| g.end < grid.steps.len())
-        .map(|g| g.end)
-        .max()
-        .unwrap_or(0);
     for (i, step) in grid.steps.iter().enumerate() {
         let col_w = step_width(step);
-        let pad_cell = |c: char| if i < pad_until { cell_pad(c, col_w) } else { 0 };
         for (r, c) in step.content.iter().enumerate() {
             rows[r].push(*c);
             // Pad every cell to its step column's display width so
             // wide (CJK) cells don't shift the `|` separators.
-            for _ in 0..pad_cell(*c) {
+            for _ in 0..cell_pad(*c, col_w) {
                 rows[r].push(' ');
             }
         }
@@ -53,7 +45,7 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
         marker.push(mark);
         // Marker glyphs are 1 cell wide, so the general cell rule
         // pads them to col_w - 1.
-        for _ in 0..pad_cell(mark) {
+        for _ in 0..cell_pad(mark, col_w) {
             marker.push(' ');
         }
         let ends_group = grid.groups.iter().any(|g| g.end == i + 1) && i + 1 < grid.steps.len();
@@ -64,9 +56,8 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
             }
         }
     }
-    // Pad the marker to the widest row: the tail cells past the last
-    // separator are unpadded, so rows (and the marker) may differ
-    // there.
+    // Every row already has the same display width (cells padded to
+    // their step column's width), so this is a no-op safety net.
     let content_width = rows
         .iter()
         .map(|r| UnicodeWidthStr::width(r.as_str()))
@@ -219,8 +210,8 @@ impl App {
             (grid.steps.len(), w)
         } else {
             let rows = build_rows(grid);
-            // Rows share width up to the last `|`, then differ at the
-            // unpadded tail; take the widest.
+            // Every row (marker included) is padded to the same display
+            // width, so the max is the common width.
             let w = rows
                 .iter()
                 .map(|r| UnicodeWidthStr::width(r.as_str()))

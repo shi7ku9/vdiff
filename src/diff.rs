@@ -250,21 +250,17 @@ pub(crate) fn cell_pad(c: char, col_w: usize) -> usize {
 }
 
 /// Insert `|` after each step marked in `boundaries`, padding every
-/// cell to its step column's display width (`widths`) so separators
-/// line up across rows. Only cells up to `pad_until` (the last step
-/// with a `|` after it, plus one) are padded: cells past the last
-/// separator align nothing, so padding them would add phantom
-/// trailing spaces (breaking verbatim output for identical files).
-/// Each final row holds exactly one char per diff step (plus pad
-/// spaces), so steps map 1:1 to chars.
-fn separate_ops(row: &str, boundaries: &[bool], widths: &[usize], pad_until: usize) -> String {
+/// cell to its step column's display width (`widths`), so each column
+/// occupies the same cells in every row and separators line up
+/// across rows. Each final row holds exactly one char per diff step
+/// (plus pad spaces), so steps map 1:1 to chars.
+fn separate_ops(row: &str, boundaries: &[bool], widths: &[usize]) -> String {
     let mut out = String::with_capacity(row.len() * 2 + widths.len());
     let len = row.chars().count();
     for (i, c) in row.chars().enumerate() {
         out.push(c);
         let cell = widths.get(i).copied().unwrap_or(1);
-        let pad = if i < pad_until { cell_pad(c, cell) } else { 0 };
-        for _ in 0..pad {
+        for _ in 0..cell_pad(c, cell) {
             out.push(' ');
         }
         // No trailing separator: a trimmed marker row may end before
@@ -301,14 +297,12 @@ pub fn render_text(grid: &DiffGrid) -> String {
         .map(|w| w[0].kind != w[1].kind)
         .collect();
     let widths: Vec<usize> = grid.steps.iter().map(step_width).collect();
-    // Only cells up to the last boundary step get padded (see separate_ops).
-    let pad_until = boundaries.iter().rposition(|b| *b).map_or(0, |i| i + 1);
 
     let mut rows = Vec::with_capacity(transposed.len());
     for (i, row) in transposed.into_iter().enumerate() {
         if i == 0 {
             let trimmed = row.trim_end_matches(' ');
-            let mut marker = separate_ops(trimmed, &boundaries, &widths, pad_until);
+            let mut marker = separate_ops(trimmed, &boundaries, &widths);
             // The marker drops trailing match markers (spaces); keep
             // the `|` that separates the last change from the tail.
             if !marker.is_empty() && trimmed.len() < row.len() {
@@ -316,7 +310,7 @@ pub fn render_text(grid: &DiffGrid) -> String {
             }
             rows.push(marker);
         } else {
-            rows.push(separate_ops(&row, &boundaries, &widths, pad_until));
+            rows.push(separate_ops(&row, &boundaries, &widths));
         }
     }
 
@@ -641,12 +635,25 @@ mod tests {
     }
 
     #[test]
-    fn render_text_identical_wide_files_are_verbatim() {
-        // No boundaries → no separators → no padding: identical
-        // mixed-width files print their content byte-for-byte.
+    fn render_text_identical_wide_files_align_columns() {
+        // Identical mixed-width files still display the column grid:
+        // the narrow `x` is padded to its column's 2-cell width so it
+        // sits under `中`, and the row spans the full grid width.
         assert_eq!(
             render_text(&compute("中中\n中x\n", "中中\n中x\n")),
-            "中中\n中x\n"
+            "中中\n中x \n"
+        );
+    }
+
+    #[test]
+    fn render_text_wide_columns_align_halfwidth_chars() {
+        // a.txt case: four full-width chars vs four half-width chars
+        // on the same columns; each half-width char is padded to 2
+        // cells so it sits at its column's start (a under 你, b under
+        // 好, c under 啊, d under ！), trailing pad included.
+        assert_eq!(
+            render_text(&compute("你好啊！\nabcd\n", "你好啊！\nabcd\n")),
+            "你好啊！\na b c d \n"
         );
     }
 
@@ -659,13 +666,13 @@ mod tests {
     }
 
     #[test]
-    fn render_text_cjk_last_change_has_no_trailing_pad() {
-        // The last change's cell is past the last `|`, so it is
-        // unpadded and the marker gains no trailing space. `|`s at
-        // display 2 and 5; the unpadded `+` sits over 日's cells 6-7.
+    fn render_text_cjk_pads_trailing_cells() {
+        // The last change's cell is padded too, so the marker ends at
+        // the grid width. `|`s at display 2 and 5; the padded `+` sits
+        // over 日's cells 6-7, matching the content row's width.
         assert_eq!(
             render_text(&compute("中文\n", "中日\n")),
-            "  |- |+\n中|文|日\n"
+            "  |- |+ \n中|文|日\n"
         );
     }
 

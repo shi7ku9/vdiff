@@ -85,16 +85,33 @@ fn files_mode_cjk_aligns_separators() {
 }
 
 #[test]
-fn files_mode_cjk_identical_is_verbatim() {
-    // Identical mixed-width files must print their content unchanged:
-    // no boundaries means no separators means no alignment padding.
+fn files_mode_cjk_identical_aligns_columns() {
+    // Identical mixed-width files still display the column grid: the
+    // narrow `x` is padded to its column's 2-cell width.
     let a = temp_file("a-cjk-identical.txt", "中中\n中x\n");
     let b = temp_file("b-cjk-identical.txt", "中中\n中x\n");
     let out = run_vdiff(&[a.to_str().unwrap(), b.to_str().unwrap()]);
     let _ = std::fs::remove_file(&a);
     let _ = std::fs::remove_file(&b);
     assert!(out.status.success());
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "中中\n中x\n");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "中中\n中x \n");
+}
+
+#[test]
+fn files_mode_cjk_mixed_width_identical_aligns() {
+    // a.txt case: each half-width char is padded to its column's
+    // 2-cell width, sitting at its column's start (a under 你, b
+    // under 好, c under 啊, d under ！).
+    let a = temp_file("a-cjk-mixed.txt", "你好啊！\nabcd\n");
+    let b = temp_file("b-cjk-mixed.txt", "你好啊！\nabcd\n");
+    let out = run_vdiff(&[a.to_str().unwrap(), b.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "你好啊！\na b c d \n"
+    );
 }
 
 #[test]
