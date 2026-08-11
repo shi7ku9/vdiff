@@ -4,6 +4,7 @@
 //! file, padded with spaces, emitted as a structured `DiffGrid`.
 
 use std::ops::Range;
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
@@ -225,13 +226,47 @@ fn transpose_grid(grid: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Insert `|` after each step marked in `boundaries`. Each final row
-/// holds exactly one char per diff step, so steps map 1:1 to chars.
-fn separate_ops(row: &str, boundaries: &[bool]) -> String {
-    let mut out = String::with_capacity(row.len() * 2);
+/// Display width of one step's column: the widest char in the column.
+/// Every rendered row (marker and content) pads its cells to this so
+/// the `|` separators line up. The marker row renders one char per
+/// step, so a column counts as cells, not chars; `max(1)` keeps
+/// all-zero-width columns (bare combining marks) at one cell instead
+/// of zero.
+pub(crate) fn step_width(step: &Step) -> usize {
+    step.content
+        .iter()
+        .map(|c| c.width().unwrap_or(0))
+        .max()
+        .unwrap_or(0)
+        .max(1)
+}
+
+/// Pad count for one cell: `col_w` cells minus the char's own width.
+/// Zero-width chars (ZWJ, combining marks) count as 1 cell so a pad
+/// space is never inserted inside a grapheme cluster. The pad lands
+/// after the char, keeping the cell left-aligned.
+pub(crate) fn cell_pad(c: char, col_w: usize) -> usize {
+    col_w.saturating_sub(c.width().unwrap_or(0).max(1))
+}
+
+/// Insert `|` after each step marked in `boundaries`, padding every
+/// cell to its step column's display width (`widths`) so separators
+/// line up across rows. Only cells up to `pad_until` (the last step
+/// with a `|` after it, plus one) are padded: cells past the last
+/// separator align nothing, so padding them would add phantom
+/// trailing spaces (breaking verbatim output for identical files).
+/// Each final row holds exactly one char per diff step (plus pad
+/// spaces), so steps map 1:1 to chars.
+fn separate_ops(row: &str, boundaries: &[bool], widths: &[usize], pad_until: usize) -> String {
+    let mut out = String::with_capacity(row.len() * 2 + widths.len());
     let len = row.chars().count();
     for (i, c) in row.chars().enumerate() {
         out.push(c);
+        let cell = widths.get(i).copied().unwrap_or(1);
+        let pad = if i < pad_until { cell_pad(c, cell) } else { 0 };
+        for _ in 0..pad {
+            out.push(' ');
+        }
         // No trailing separator: a trimmed marker row may end before
         // the last step.
         if i + 1 < len && boundaries.get(i).copied().unwrap_or(false) {
@@ -265,12 +300,15 @@ pub fn render_text(grid: &DiffGrid) -> String {
         .windows(2)
         .map(|w| w[0].kind != w[1].kind)
         .collect();
+    let widths: Vec<usize> = grid.steps.iter().map(step_width).collect();
+    // Only cells up to the last boundary step get padded (see separate_ops).
+    let pad_until = boundaries.iter().rposition(|b| *b).map_or(0, |i| i + 1);
 
     let mut rows = Vec::with_capacity(transposed.len());
     for (i, row) in transposed.into_iter().enumerate() {
         if i == 0 {
             let trimmed = row.trim_end_matches(' ');
-            let mut marker = separate_ops(trimmed, &boundaries);
+            let mut marker = separate_ops(trimmed, &boundaries, &widths, pad_until);
             // The marker drops trailing match markers (spaces); keep
             // the `|` that separates the last change from the tail.
             if !marker.is_empty() && trimmed.len() < row.len() {
@@ -278,7 +316,7 @@ pub fn render_text(grid: &DiffGrid) -> String {
             }
             rows.push(marker);
         } else {
-            rows.push(separate_ops(&row, &boundaries));
+            rows.push(separate_ops(&row, &boundaries, &widths, pad_until));
         }
     }
 
@@ -559,6 +597,75 @@ mod tests {
         assert_eq!(
             render_text(&compute("héllo\n", "héxlo\n")),
             "  |-|+|\nhé|l|x|lo\n"
+        );
+    }
+
+    #[test]
+    fn step_width_measures_wide_chars() {
+        assert_eq!(
+            step_width(&Step {
+                kind: StepKind::Match,
+                content: vec!['a', '中']
+            }),
+            2
+        );
+        // All-zero-width column (bare combining mark) floors at 1.
+        assert_eq!(
+            step_width(&Step {
+                kind: StepKind::Match,
+                content: vec!['\u{0301}']
+            }),
+            1
+        );
+    }
+
+    #[test]
+    fn render_text_cjk_aligns_separators() {
+        // 文→日 is width 2, so the marker's `-`/`+` and the content
+        // cells are 2 cells wide; the `|`s line up at display 2, 5, 8.
+        assert_eq!(
+            render_text(&compute("中文abc\n", "中日abc\n")),
+            "  |- |+ |\n中|文|日|abc\n",
+        );
+    }
+
+    #[test]
+    fn render_text_cjk_pads_narrow_cells() {
+        // Column 0 changes whole (中a → 中b): D+I steps carry width-2
+        // cells, so the narrow `a`/`b` cells are padded to 2 cells and
+        // the marker's `-`/`+` align with the content.
+        assert_eq!(
+            render_text(&compute("中文\na文\n", "中文\nb文\n")),
+            "- |+ |\n中|中|文\na |b |文\n",
+        );
+    }
+
+    #[test]
+    fn render_text_identical_wide_files_are_verbatim() {
+        // No boundaries → no separators → no padding: identical
+        // mixed-width files print their content byte-for-byte.
+        assert_eq!(
+            render_text(&compute("中中\n中x\n", "中中\n中x\n")),
+            "中中\n中x\n"
+        );
+    }
+
+    #[test]
+    fn render_text_keeps_zero_width_clusters_intact() {
+        // A ZWJ cell is width 0; padding it would insert a space into
+        // the 👨‍👩 emoji cluster and break it into separate glyphs.
+        let s = "👨\u{200D}👩\n";
+        assert_eq!(render_text(&compute(s, s)), s);
+    }
+
+    #[test]
+    fn render_text_cjk_last_change_has_no_trailing_pad() {
+        // The last change's cell is past the last `|`, so it is
+        // unpadded and the marker gains no trailing space. `|`s at
+        // display 2 and 5; the unpadded `+` sits over 日's cells 6-7.
+        assert_eq!(
+            render_text(&compute("中文\n", "中日\n")),
+            "  |- |+\n中|文|日\n"
         );
     }
 

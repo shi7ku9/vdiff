@@ -5,7 +5,7 @@
 //! `slice_by_width` implements width-aware horizontal scrolling so
 //! wide characters (CJK) are never split in half.
 
-use crate::diff::{self, DiffGrid, StepKind};
+use crate::diff::{self, DiffGrid, StepKind, cell_pad, step_width};
 use crate::git::{self, ChangedFile, GitShell, RevSpec, Status};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -19,20 +19,43 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Display rows for the TUI: rows[0] is the marker row (one char per
 /// step, `|` between groups, padded with spaces to the full content
-/// display width), rows[i+1] is file line i. All rows share the same
-/// display width.
+/// display width), rows[i+1] is file line i. Cells are padded to
+/// their step column's display width up to the last `|`, so the
+/// separators line up vertically; past it, rows may differ at the
+/// tail.
 pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     let mut marker = String::new();
     let mut rows: Vec<String> = (0..grid.height).map(|_| String::new()).collect();
+    // Only cells up to the last step with a `|` after it get padded.
+    let pad_until = grid
+        .groups
+        .iter()
+        .filter(|g| g.end < grid.steps.len())
+        .map(|g| g.end)
+        .max()
+        .unwrap_or(0);
     for (i, step) in grid.steps.iter().enumerate() {
+        let col_w = step_width(step);
+        let pad_cell = |c: char| if i < pad_until { cell_pad(c, col_w) } else { 0 };
         for (r, c) in step.content.iter().enumerate() {
             rows[r].push(*c);
+            // Pad every cell to its step column's display width so
+            // wide (CJK) cells don't shift the `|` separators.
+            for _ in 0..pad_cell(*c) {
+                rows[r].push(' ');
+            }
         }
-        marker.push(match step.kind {
+        let mark = match step.kind {
             StepKind::Match => ' ',
             StepKind::Delete => '-',
             StepKind::Insert => '+',
-        });
+        };
+        marker.push(mark);
+        // Marker glyphs are 1 cell wide, so the general cell rule
+        // pads them to col_w - 1.
+        for _ in 0..pad_cell(mark) {
+            marker.push(' ');
+        }
         let ends_group = grid.groups.iter().any(|g| g.end == i + 1) && i + 1 < grid.steps.len();
         if ends_group {
             marker.push('|');
@@ -41,9 +64,13 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
             }
         }
     }
+    // Pad the marker to the widest row: the tail cells past the last
+    // separator are unpadded, so rows (and the marker) may differ
+    // there.
     let content_width = rows
-        .first()
+        .iter()
         .map(|r| UnicodeWidthStr::width(r.as_str()))
+        .max()
         .unwrap_or(0);
     while UnicodeWidthStr::width(marker.as_str()) < content_width {
         marker.push(' ');
@@ -192,8 +219,8 @@ impl App {
             (grid.steps.len(), w)
         } else {
             let rows = build_rows(grid);
-            // Content rows may be wider than the marker row (wide chars),
-            // so clamp against the widest row.
+            // Rows share width up to the last `|`, then differ at the
+            // unpadded tail; take the widest.
             let w = rows
                 .iter()
                 .map(|r| UnicodeWidthStr::width(r.as_str()))
@@ -358,8 +385,12 @@ impl App {
         scroll_x: usize,
         style_for: impl Fn(char) -> Style,
     ) {
-        let visible = slice_by_width(row, scroll_x, inner.width as usize);
-        let mut x = inner.x;
+        let (visible, first_cell) = slice_by_width(row, scroll_x, inner.width as usize);
+        // A wide char straddling the scroll boundary is skipped whole,
+        // so the first drawn char may sit past the viewport start; the
+        // offset keeps this row's grid cells under the same viewport
+        // columns as the (all-width-1) marker row.
+        let mut x = inner.x + (first_cell - scroll_x) as u16;
         for c in visible.chars() {
             frame
                 .buffer_mut()
@@ -565,18 +596,6 @@ fn group_start_width(grid: &DiffGrid, group: &std::ops::Range<usize>) -> usize {
     w
 }
 
-/// Display width of one step's column: the widest char in the column.
-/// The marker row renders one char per step, so group_start_width must
-/// count steps as cells, not sum the whole column. Taking the max keeps wide
-/// (CJK) columns from being undercounted.
-fn step_width(step: &crate::diff::Step) -> usize {
-    step.content
-        .iter()
-        .map(|c| c.width().unwrap_or(0))
-        .max()
-        .unwrap_or(0)
-}
-
 /// Transposed display rows: one per step — prefix char (` `/`-`/`+`) +
 /// `' '` + column content.
 fn transposed_rows(grid: &DiffGrid) -> Vec<String> {
@@ -624,9 +643,14 @@ pub fn run_tui_app(app: &mut App) -> io::Result<()> {
 /// Slice `s` by display width: skip the first `start` cells, keep at
 /// most `max_width` cells. A wide char that straddles a boundary is
 /// skipped whole (its width still consumes the cells up to the
-/// boundary), so output never contains a partial wide char.
-pub fn slice_by_width(s: &str, start: usize, max_width: usize) -> String {
+/// boundary), so output never contains a partial wide char. Returns
+/// the drawn text plus the grid cell index of its first char. That
+/// index sits past `start` when a straddling wide char was skipped,
+/// so the caller can keep rows aligned under the same viewport
+/// columns.
+pub fn slice_by_width(s: &str, start: usize, max_width: usize) -> (String, usize) {
     let mut out = String::new();
+    let mut first = start;
     let mut pos = 0usize;
     for c in s.chars() {
         let w = c.width().unwrap_or(0);
@@ -640,13 +664,16 @@ pub fn slice_by_width(s: &str, start: usize, max_width: usize) -> String {
             continue;
         }
         if pos + w <= start + max_width {
+            if out.is_empty() {
+                first = pos;
+            }
             out.push(c);
             pos += w;
         } else {
             break;
         }
     }
-    out
+    (out, first)
 }
 
 #[cfg(test)]
@@ -680,22 +707,43 @@ mod tests {
     }
 
     #[test]
+    fn build_rows_cjk_pads_cells_to_column_width() {
+        // Column 0 changes whole (中a → 中b): its cells are width 2, so
+        // the narrow `a`/`b` cells get a trailing pad and the marker's
+        // `-`/`+` sit over the `中`/`中` cells' first display cell.
+        let grid = compute("中文\na文\n", "中文\nb文\n");
+        let rows = build_rows(&grid);
+        assert_eq!(rows[0], "- |+ |  ");
+        assert_eq!(rows[1], "中|中|文");
+        assert_eq!(rows[2], "a |b |文");
+        let widths: Vec<usize> = rows
+            .iter()
+            .map(|r| UnicodeWidthStr::width(r.as_str()))
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "rows must share display width: {widths:?}"
+        );
+    }
+
+    #[test]
     fn slice_ascii() {
-        assert_eq!(slice_by_width("abcdef", 2, 3), "cde");
+        assert_eq!(slice_by_width("abcdef", 2, 3), ("cde".to_string(), 2));
     }
 
     #[test]
     fn slice_skips_straddling_wide_char() {
-        // 中 (width 2) starts at 0, straddles start=1 → skipped whole
-        assert_eq!(slice_by_width("中文", 1, 3), "文");
+        // 中 (width 2) starts at 0, straddles start=1 → skipped whole;
+        // the first drawn char sits at cell 2, one past the viewport.
+        assert_eq!(slice_by_width("中文", 1, 3), ("文".to_string(), 2));
         // 中 straddles the right edge: width 2 does not fit in 1 cell
-        assert_eq!(slice_by_width("中a", 0, 1), "");
+        assert_eq!(slice_by_width("中a", 0, 1), (String::new(), 0));
     }
 
     #[test]
     fn slice_past_end_is_empty() {
-        assert_eq!(slice_by_width("abc", 10, 5), "");
-        assert_eq!(slice_by_width("", 0, 5), "");
+        assert_eq!(slice_by_width("abc", 10, 5), (String::new(), 10));
+        assert_eq!(slice_by_width("", 0, 5), (String::new(), 0));
     }
 
     use crate::git::{ChangedFile, FakeGit, RevSpec, Source, Status};
@@ -778,6 +826,58 @@ mod tests {
         assert_eq!(buf[(8, 1)].symbol(), "+");
         assert_eq!(buf[(8, 1)].fg, ratatui::style::Color::Green);
         assert_eq!(buf[(5, 1)].symbol(), "|");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn cjk_separators_align_in_tui() {
+        let (mut app, a, b) = files_app("中文abc\n", "中日abc\n");
+        let backend = draw(&mut app);
+        let buf = backend.buffer();
+        // Marker "  |- |+ |   " and content "中|文|日|abc" both place
+        // the `|`s at display cells 2, 5, 8. In buffer coords (inner
+        // starts at (1,1)) those are x = 3, 6, 9 on the marker row
+        // (y=1) and the content row (y=2).
+        for x in [3, 6, 9] {
+            assert_eq!(buf[(x, 1)].symbol(), "|", "marker | at x={x}");
+            assert_eq!(buf[(x, 2)].symbol(), "|", "content | at x={x}");
+        }
+        // The `-`/`+` markers sit over their column's first display
+        // cell: '-' at buffer (4,1) over 文 at (4,2), '+' at (7,1) over
+        // 日 at (7,2). Continuation cells (x=5, x=8) are skipped;
+        // TestBackend leaves them empty.
+        assert_eq!(buf[(4, 1)].symbol(), "-");
+        assert_eq!(buf[(7, 1)].symbol(), "+");
+        assert_eq!(buf[(4, 2)].symbol(), "文");
+        assert_eq!(buf[(7, 2)].symbol(), "日");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn cjk_separators_stay_aligned_when_scrolled_into_wide_char() {
+        let (mut app, a, b) = files_app("中文abc\n", "中日abc\n");
+        for scroll_x in [1, 4] {
+            // scroll_x cuts inside a wide char (中 at cells 0-1, 文 at
+            // 3-4): it is skipped whole, so the first drawn char sits
+            // one cell past the viewport; the marker row must still
+            // show the cell-2 `|` (viewport 1, buffer x = inner.x + 1
+            // = 2) over the content row's cell-2 `|`.
+            app.scroll_x = scroll_x;
+            let backend = draw(&mut app);
+            let buf = backend.buffer();
+            assert_eq!(
+                buf[(2, 1)].symbol(),
+                "|",
+                "marker | at viewport 1 (scroll_x={scroll_x})"
+            );
+            assert_eq!(
+                buf[(2, 2)].symbol(),
+                "|",
+                "content | at viewport 1 (scroll_x={scroll_x})"
+            );
+        }
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }

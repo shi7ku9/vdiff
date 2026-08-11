@@ -69,6 +69,35 @@ fn files_mode_prints_expected_format() {
 }
 
 #[test]
+fn files_mode_cjk_aligns_separators() {
+    let a = temp_file("a-cjk.txt", "中文abc\n");
+    let b = temp_file("b-cjk.txt", "中日abc\n");
+    let out = run_vdiff(&[a.to_str().unwrap(), b.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    assert!(out.status.success());
+    // 文→日 cells are 2 display cells wide; the `|`s line up at
+    // display 2, 5, 8 on both the marker row and the content row.
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "  |- |+ |\n中|文|日|abc\n"
+    );
+}
+
+#[test]
+fn files_mode_cjk_identical_is_verbatim() {
+    // Identical mixed-width files must print their content unchanged:
+    // no boundaries means no separators means no alignment padding.
+    let a = temp_file("a-cjk-identical.txt", "中中\n中x\n");
+    let b = temp_file("b-cjk-identical.txt", "中中\n中x\n");
+    let out = run_vdiff(&[a.to_str().unwrap(), b.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "中中\n中x\n");
+}
+
+#[test]
 fn files_mode_identical_files() {
     let a = temp_file("a2.txt", "x\ny\n");
     let b = temp_file("b2.txt", "x\ny\n");
