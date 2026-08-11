@@ -8,28 +8,94 @@ Yes, this is counterintuitive. That's the point. It's a toy, a fun way to look a
 
 ## What it looks like
 
-Diffing `foo/bar baz/quux` against `foo/bar qaz/quux`:
+Diffing `old.cpp` against `new.cpp`:
 
-```
-    |-|+|
-foo | | |  
-bar |b|q|az
-quux| | |  
+```cpp
+// old.cpp
+#include <cstdio>
+
+int main() {
+  std::printf("Hello, World\n");
+  return 0;
+}
 ```
 
-The first row is the **marker row**: `-`/`+` mark the columns that changed (only column 4 here, 0-indexed). The `|` separators group runs of changes; the one between `-` and `+` separates the delete run and insert run of the same changed column. Each following row is one line of the file, with the old and new characters of each changed column shown side by side.
+```cpp
+// new.cpp
+#include <print>
+
+auto main() -> int {
+  std::println("Hello, World");
+  return 0;
+}
+```
+
+`vdiff old.cpp new.cpp` prints:
+```
+--|++| |---------------|+++++++++++++++| |+|        |--|
+#i|#i|n|clude <cstdio> |clude <print>  | | |        |  |   
+  |  | |               |               | | |        |  |   
+in|au|t| main() {      |o main() -> int| |{|        |  |   
+  |  |s|td::printf("Hel|td::println("He|l|l|o, World|\n|");
+  |  |r|eturn 0;       |eturn 0;       | | |        |  |   
+} |} | |               |               | | |        |  |   
+```
+
+The first row is the **marker row**: `-`/`+` mark the columns that changed. The `|` separators group runs of changes; the one between `-` and `+` separates the delete run and insert run of the same changed column. Each following row is one line of the file, with the old and new characters of each changed column shown side by side.
 
 `vdiff` can also show the diff the way it actually computes it: a stack of columns, one row per diff step:
 
 ```
-  fbq
-  oau
-  oru
-    x
--  b 
-+  q 
-   a 
-   z 
+- # i  }
+- i n   
++ # a  }
++ i u   
+  n tsr 
+- c  te 
+- l mdt 
+- u a:u 
+- d i:r 
+- e npn 
+-   (r  
+- < )i0 
+- c  n; 
+- s {t  
+- t  f  
+- d  (  
+- i  "  
+- o  H  
+- >  e  
+-    l  
++ c ote 
++ l  dt 
++ u m:u 
++ d a:r 
++ e ipn 
++   nr  
++ < (i0 
++ p )n; 
++ r  t  
++ i -l  
++ n >n  
++ t  (  
++ > i"  
++   nH  
++   te  
+     l  
++   {l  
+     o  
+     ,  
+        
+     W  
+     o  
+     r  
+     l  
+     d  
+-    \  
+-    n  
+     "  
+     )  
+     ;  
 ```
 
 Press `t` in the TUI to flip between the two views. Reading the file 90° rotated is the full counterintuitive experience.
@@ -38,7 +104,7 @@ Press `t` in the TUI to flip between the two views. Reading the file 90° rotate
 
 ```console
 # Diff two files
-$ vdiff file1.txt file2.txt
+$ vdiff old.cpp new.cpp
 
 # Diff a git repository (git diff semantics)
 $ vdiff git                 # worktree vs index
@@ -67,7 +133,7 @@ When stdout is not a terminal, `vdiff` prints plain text instead of opening the 
 
 ```console
 $ cargo build --release
-$ cargo run --release -- file1.txt file2.txt
+$ cargo run --release -- old.cpp new.cpp
 ```
 
 Requires a Rust toolchain (edition 2024). Git mode requires the `git` binary.
