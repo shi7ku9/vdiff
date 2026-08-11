@@ -31,6 +31,35 @@ pub struct DiffGrid {
     /// True when the LCS was skipped (pathological widths); the middle
     /// columns are then all Delete+Insert.
     pub degraded: bool,
+    /// Display width of each step's column (see `step_width`),
+    /// precomputed once. Every rendered row pads its cells to this.
+    pub widths: Vec<usize>,
+    /// `is_group_end[i]` is true when step `i` is the last step of a
+    /// group. Precomputed from `groups` so renderers test a group
+    /// boundary in O(1) instead of scanning every group per step.
+    pub is_group_end: Vec<bool>,
+}
+
+impl DiffGrid {
+    /// Build a grid from steps, deriving the group runs, per-step
+    /// column widths, and group-end flags (all pure functions of the
+    /// steps) in one pass.
+    pub fn from_parts(steps: Vec<Step>, height: usize, degraded: bool) -> DiffGrid {
+        let groups = groups_of(&steps);
+        let widths: Vec<usize> = steps.iter().map(step_width).collect();
+        let mut is_group_end = vec![false; steps.len()];
+        for g in &groups {
+            is_group_end[g.end - 1] = true;
+        }
+        DiffGrid {
+            steps,
+            height,
+            groups,
+            degraded,
+            widths,
+            is_group_end,
+        }
+    }
 }
 
 /// Split into lines, keeping the meaning of a trailing empty line
@@ -195,13 +224,7 @@ pub fn compute(a: &str, b: &str) -> DiffGrid {
     let a_cols = columns_padded(&a_lines, height);
     let b_cols = columns_padded(&b_lines, height);
     let (steps, degraded) = diff_columns(&a_cols, &b_cols);
-    let groups = groups_of(&steps);
-    DiffGrid {
-        steps,
-        height,
-        groups,
-        degraded,
-    }
+    DiffGrid::from_parts(steps, height, degraded)
 }
 
 fn op_prefix(kind: StepKind) -> char {
@@ -296,13 +319,13 @@ pub fn render_text(grid: &DiffGrid) -> String {
         .windows(2)
         .map(|w| w[0].kind != w[1].kind)
         .collect();
-    let widths: Vec<usize> = grid.steps.iter().map(step_width).collect();
+    let widths = &grid.widths;
 
     let mut rows = Vec::with_capacity(transposed.len());
     for (i, row) in transposed.into_iter().enumerate() {
         if i == 0 {
             let trimmed = row.trim_end_matches(' ');
-            let mut marker = separate_ops(trimmed, &boundaries, &widths);
+            let mut marker = separate_ops(trimmed, &boundaries, widths);
             // The marker drops trailing match markers (spaces); keep
             // the `|` that separates the last change from the tail.
             if !marker.is_empty() && trimmed.len() < row.len() {
@@ -310,7 +333,7 @@ pub fn render_text(grid: &DiffGrid) -> String {
             }
             rows.push(marker);
         } else {
-            rows.push(separate_ops(&row, &boundaries, &widths));
+            rows.push(separate_ops(&row, &boundaries, widths));
         }
     }
 
@@ -379,14 +402,8 @@ mod tests {
     fn diff_columns_all_equal() {
         let cols = vec!["ab".to_string(), "cd".to_string()];
         let (steps, _) = diff_columns(&cols, &cols);
-        let groups = groups_of(&steps);
         assert_eq!(
-            ops_of(&DiffGrid {
-                steps,
-                height: 2,
-                groups,
-                degraded: false
-            }),
+            ops_of(&DiffGrid::from_parts(steps, 2, false)),
             exp(&[("=", "ab"), ("=", "cd")])
         );
     }
@@ -396,14 +413,8 @@ mod tests {
         let a = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let b = vec!["a".to_string(), "x".to_string(), "c".to_string()];
         let (steps, _) = diff_columns(&a, &b);
-        let groups = groups_of(&steps);
         assert_eq!(
-            ops_of(&DiffGrid {
-                steps,
-                height: 1,
-                groups,
-                degraded: false
-            }),
+            ops_of(&DiffGrid::from_parts(steps, 1, false)),
             exp(&[("=", "a"), ("-", "b"), ("+", "x"), ("=", "c")])
         );
     }
@@ -413,27 +424,15 @@ mod tests {
         let a = vec!["a".to_string(), "c".to_string()];
         let b = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let (steps, _) = diff_columns(&a, &b);
-        let groups = groups_of(&steps);
         assert_eq!(
-            ops_of(&DiffGrid {
-                steps,
-                height: 1,
-                groups,
-                degraded: false
-            }),
+            ops_of(&DiffGrid::from_parts(steps, 1, false)),
             exp(&[("=", "a"), ("+", "b"), ("=", "c")])
         );
         let a = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let b = vec!["a".to_string(), "c".to_string()];
         let (steps, _) = diff_columns(&a, &b);
-        let groups = groups_of(&steps);
         assert_eq!(
-            ops_of(&DiffGrid {
-                steps,
-                height: 1,
-                groups,
-                degraded: false
-            }),
+            ops_of(&DiffGrid::from_parts(steps, 1, false)),
             exp(&[("=", "a"), ("-", "b"), ("=", "c")])
         );
     }
@@ -443,22 +442,12 @@ mod tests {
         assert!(diff_columns(&[], &[]).0.is_empty());
         let (steps, _) = diff_columns(&[], &["x".to_string()]);
         assert_eq!(
-            ops_of(&DiffGrid {
-                steps,
-                height: 1,
-                groups: vec![Range { start: 0, end: 1 }],
-                degraded: false
-            }),
+            ops_of(&DiffGrid::from_parts(steps, 1, false)),
             exp(&[("+", "x")])
         );
         let (steps, _) = diff_columns(&["x".to_string()], &[]);
         assert_eq!(
-            ops_of(&DiffGrid {
-                steps,
-                height: 1,
-                groups: vec![Range { start: 0, end: 1 }],
-                degraded: false
-            }),
+            ops_of(&DiffGrid::from_parts(steps, 1, false)),
             exp(&[("-", "x")])
         );
     }

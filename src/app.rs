@@ -5,7 +5,7 @@
 //! `slice_by_width` implements width-aware horizontal scrolling so
 //! wide characters (CJK) are never split in half.
 
-use crate::diff::{self, DiffGrid, StepKind, cell_pad, step_width};
+use crate::diff::{self, DiffGrid, StepKind, cell_pad};
 use crate::git::{self, ChangedFile, GitShell, RevSpec, Status};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -28,7 +28,7 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     let mut marker = String::new();
     let mut rows: Vec<String> = (0..grid.height).map(|_| String::new()).collect();
     for (i, step) in grid.steps.iter().enumerate() {
-        let col_w = step_width(step);
+        let col_w = grid.widths[i];
         for (r, c) in step.content.iter().enumerate() {
             rows[r].push(*c);
             // Pad every cell to its step column's display width so
@@ -48,7 +48,9 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
         for _ in 0..cell_pad(mark, col_w) {
             marker.push(' ');
         }
-        let ends_group = grid.groups.iter().any(|g| g.end == i + 1) && i + 1 < grid.steps.len();
+        // Precomputed group-end flags: O(1) per step instead of
+        // scanning every group for each step.
+        let ends_group = grid.is_group_end[i] && i + 1 < grid.steps.len();
         if ends_group {
             marker.push('|');
             for row in &mut rows {
@@ -69,6 +71,39 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     let mut out = vec![marker];
     out.extend(rows);
     out
+}
+
+/// Cached display rows for the current grid + view mode. Rows depend
+/// only on the `DiffGrid` and the transposed flag, so they are built
+/// once per reload / transpose toggle instead of re-serializing the
+/// whole grid on every frame (which used to happen ~3× per keypress).
+struct Display {
+    rows: Vec<String>,
+    /// Content display width (cells), i.e. the common row width.
+    width: usize,
+    /// The view mode the rows were built for, so `ensure_display` can
+    /// detect a stale cache when `transposed` is toggled directly.
+    transposed: bool,
+}
+
+/// Build the display rows for a grid (marker + content rows in normal
+/// view, one step per row in transposed view) and their display width.
+fn build_display(grid: &DiffGrid, transposed: bool) -> Display {
+    let rows = if transposed {
+        transposed_rows(grid)
+    } else {
+        build_rows(grid)
+    };
+    let width = rows
+        .iter()
+        .map(|r| UnicodeWidthStr::width(r.as_str()))
+        .max()
+        .unwrap_or(0);
+    Display {
+        rows,
+        width,
+        transposed,
+    }
 }
 
 pub enum DiffSource {
@@ -107,6 +142,16 @@ impl DiffSource {
     }
 }
 
+/// Outcome of handling one key event.
+pub struct KeyResult {
+    /// True when the app should exit the event loop.
+    pub quit: bool,
+    /// True when the visible state changed and the screen must redraw.
+    /// Unknown keys and no-op scrolls (e.g. `h` at column 0) report
+    /// `changed: false` so the loop can skip the redraw.
+    pub changed: bool,
+}
+
 pub struct App {
     pub source: DiffSource,
     pub selection: usize,
@@ -115,6 +160,9 @@ pub struct App {
     pub scroll_y: usize,
     pub scroll_x: usize,
     pub grid: Option<DiffGrid>,
+    /// Cached display rows for the current grid + view mode (see
+    /// `Display`); rebuilt in `reload` and on the `t` toggle.
+    display: Option<Display>,
     pub message: Option<String>,
     pub degraded: bool,
     pub labels: (String, String),
@@ -138,6 +186,7 @@ impl App {
             scroll_y: 0,
             scroll_x: 0,
             grid: None,
+            display: None,
             message: None,
             degraded: false,
             labels,
@@ -156,10 +205,10 @@ impl App {
         matches!(self.source, DiffSource::Git { .. })
     }
 
-    fn entries(&self) -> Vec<ChangedFile> {
+    fn entries(&self) -> &[ChangedFile] {
         match &self.source {
-            DiffSource::Git { files, .. } => files.clone(),
-            DiffSource::Files { .. } => Vec::new(),
+            DiffSource::Git { files, .. } => files,
+            DiffSource::Files { .. } => &[],
         }
     }
 
@@ -183,11 +232,15 @@ impl App {
             Some((old, new)) => {
                 let grid = diff::compute(&old, &new);
                 self.degraded = grid.degraded;
+                // Display rows depend only on the grid + view mode;
+                // build them once here instead of on every frame.
+                self.display = Some(build_display(&grid, self.transposed));
                 self.grid = Some(grid);
                 self.message = None;
             }
             None => {
                 self.grid = None;
+                self.display = None;
                 self.message = Some(match &self.source {
                     DiffSource::Git { files, .. } if files.is_empty() => "no changes".to_string(),
                     _ => "binary or unreadable".to_string(),
@@ -200,25 +253,17 @@ impl App {
         let Some(grid) = &self.grid else {
             return (0, 0);
         };
-        if self.transposed {
-            let rows = transposed_rows(grid);
-            let w = rows
-                .iter()
-                .map(|r| UnicodeWidthStr::width(r.as_str()))
-                .max()
-                .unwrap_or(0);
-            (grid.steps.len(), w)
+        // Rows and their display width are precomputed in
+        // `build_display`; the height depends only on the view mode.
+        let Some(disp) = &self.display else {
+            return (0, 0);
+        };
+        let h = if self.transposed {
+            grid.steps.len()
         } else {
-            let rows = build_rows(grid);
-            // Every row (marker included) is padded to the same display
-            // width, so the max is the common width.
-            let w = rows
-                .iter()
-                .map(|r| UnicodeWidthStr::width(r.as_str()))
-                .max()
-                .unwrap_or(0);
-            (grid.height, w)
-        }
+            grid.height
+        };
+        (h, disp.width)
     }
 
     fn max_scroll_y(&self) -> usize {
@@ -237,7 +282,30 @@ impl App {
         w.saturating_sub(self.pane_width.saturating_sub(2))
     }
 
+    /// Rebuild the cached display rows when they are missing or were
+    /// built for a different view mode (e.g. `transposed` was toggled
+    /// directly rather than through `handle_key`). The check is O(1);
+    /// returns true when a rebuild happened so the caller can treat
+    /// that as a state change (and redraw).
+    fn ensure_display(&mut self) -> bool {
+        let Some(grid) = &self.grid else {
+            return false;
+        };
+        let stale = match &self.display {
+            Some(d) => d.transposed != self.transposed,
+            None => true,
+        };
+        if stale {
+            let transposed = self.transposed;
+            self.display = Some(build_display(grid, transposed));
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn render(&mut self, frame: &mut Frame<'_>) {
+        self.ensure_display();
         let area = frame.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -252,13 +320,16 @@ impl App {
         } else {
             (None, chunks[0])
         };
+        // Record the pane size before rendering the status bar so the
+        // scroll clamps are correct on the very first frame (and not
+        // only after a state-changing key triggers a redraw).
+        self.pane_width = diff_area.width as usize;
+        self.pane_height = diff_area.height as usize;
         if let Some(area) = sidebar_area {
             self.render_sidebar(frame, area);
         }
         self.render_diff(frame, diff_area);
         self.render_status(frame, chunks[1]);
-        self.pane_width = diff_area.width as usize;
-        self.pane_height = diff_area.height as usize;
     }
 
     fn render_sidebar(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -303,12 +374,14 @@ impl App {
         frame.render_widget(block, area);
 
         match (&self.grid, &self.message) {
-            (Some(grid), _) => {
-                let rows: Vec<String> = if self.transposed {
-                    transposed_rows(grid)
-                } else {
-                    build_rows(grid)
+            (Some(_), _) => {
+                // Rows are cached in `self.display` (see `build_display`);
+                // they are built once per reload / transpose toggle, not
+                // per frame.
+                let Some(disp) = &self.display else {
+                    return;
                 };
+                let rows = &disp.rows;
                 if self.transposed {
                     for (i, row) in rows.iter().enumerate() {
                         // saturating: rows scrolled past the top clamp to
@@ -382,11 +455,28 @@ impl App {
         // offset keeps this row's grid cells under the same viewport
         // columns as the (all-width-1) marker row.
         let mut x = inner.x + (first_cell - scroll_x) as u16;
+        // Group consecutive equally-styled chars into runs and write each
+        // run with one set_string — avoids allocating a String per char.
+        let mut run = String::new();
+        let mut run_style = Style::default();
+        let mut in_run = false;
         for c in visible.chars() {
-            frame
-                .buffer_mut()
-                .set_string(x, y, c.to_string(), style_for(c));
-            x += c.width().unwrap_or(0) as u16;
+            let style = style_for(c);
+            if !in_run {
+                run.push(c);
+                run_style = style;
+                in_run = true;
+            } else if run_style == style {
+                run.push(c);
+            } else {
+                set_run(frame, &mut x, y, &run, run_style);
+                run.clear();
+                run.push(c);
+                run_style = style;
+            }
+        }
+        if in_run {
+            set_run(frame, &mut x, y, &run, run_style);
         }
     }
 
@@ -445,17 +535,42 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// Handle one key event. Returns true when the app should quit.
-    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+    /// Handle one key event. Returns whether the app should quit and
+    /// whether the visible state changed (only then must the screen be
+    /// redrawn).
+    pub fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
+        // A rebuild here means the view mode was changed outside this
+        // method (e.g. `app.transposed = true` directly), so the screen
+        // must redraw even if no key-visible field changed.
+        let rebuilt = self.ensure_display();
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            return true;
+            return KeyResult {
+                quit: true,
+                changed: false,
+            };
         }
+        let before = (
+            self.scroll_y,
+            self.scroll_x,
+            self.selection,
+            self.transposed,
+            self.show_sidebar,
+        );
         match key.code {
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('q') => {
+                return KeyResult {
+                    quit: true,
+                    changed: false,
+                };
+            }
             KeyCode::Char('t') => {
                 self.transposed = !self.transposed;
                 self.scroll_y = 0;
                 self.scroll_x = 0;
+                // The transposed view has different rows and dimensions.
+                if let Some(grid) = &self.grid {
+                    self.display = Some(build_display(grid, self.transposed));
+                }
             }
             KeyCode::Char('e') if self.has_sidebar() => self.show_sidebar = !self.show_sidebar,
             // vim convention: g = top, G = bottom.
@@ -471,7 +586,17 @@ impl App {
             KeyCode::BackTab => self.move_selection(-1),
             _ => {}
         }
-        false
+        let after = (
+            self.scroll_y,
+            self.scroll_x,
+            self.selection,
+            self.transposed,
+            self.show_sidebar,
+        );
+        KeyResult {
+            quit: false,
+            changed: before != after || rebuilt,
+        }
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -578,9 +703,11 @@ fn first_affected_row(grid: &DiffGrid, group: &std::ops::Range<usize>) -> Option
 /// is visible.
 fn group_start_width(grid: &DiffGrid, group: &std::ops::Range<usize>) -> usize {
     let mut w = 0usize;
-    for (i, step) in grid.steps.iter().take(group.end).enumerate() {
-        w += step_width(step);
-        if grid.groups.iter().any(|g| g.end == i + 1) {
+    for i in 0..group.end {
+        w += grid.widths[i];
+        // A separator only exists between groups; build_rows never
+        // draws one after the final step, so don't count it either.
+        if grid.is_group_end[i] && i + 1 < grid.steps.len() {
             w += 1;
         }
     }
@@ -613,22 +740,41 @@ pub fn run_tui(cli: &crate::cli::Cli) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Drive the terminal loop until the app signals quit.
+/// Drive the terminal loop until the app signals quit. Redraws only
+/// when a key actually changed the state (or the terminal resized),
+/// instead of unconditionally on every event.
 pub fn run_tui_app(app: &mut App) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let result = (|| {
+        terminal.draw(|frame| app.render(frame))?;
         loop {
-            terminal.draw(|frame| app.render(frame))?;
-            if let Event::Key(key) = event::read()?
-                && app.handle_key(key)
-            {
-                break;
+            match event::read()? {
+                Event::Key(key) => {
+                    let r = app.handle_key(key);
+                    if r.quit {
+                        break;
+                    }
+                    if r.changed {
+                        terminal.draw(|frame| app.render(frame))?;
+                    }
+                }
+                Event::Resize(_, _) => {
+                    terminal.draw(|frame| app.render(frame))?;
+                }
+                _ => {}
             }
         }
         Ok(())
     })();
     ratatui::restore();
     result
+}
+
+/// Write `run` at `(x, y)` with `style` and advance `x` by the run's
+/// display width. Wide chars are handled by ratatui's `set_string`.
+fn set_run(frame: &mut Frame<'_>, x: &mut u16, y: u16, run: &str, style: Style) {
+    frame.buffer_mut().set_string(*x, y, run, style);
+    *x += UnicodeWidthStr::width(run) as u16;
 }
 
 /// Slice `s` by display width: skip the first `start` cells, keep at
@@ -996,8 +1142,11 @@ mod tests {
     #[test]
     fn q_and_ctrl_c_quit() {
         let (mut app, a, b) = files_app("a\n", "b\n");
-        assert!(app.handle_key(key(KeyCode::Char('q'))));
-        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(app.handle_key(key(KeyCode::Char('q'))).quit);
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+                .quit
+        );
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1114,6 +1263,33 @@ mod tests {
         app.handle_key(key(KeyCode::Char('p')));
         assert_eq!(app.scroll_x, 0);
         assert_eq!(app.scroll_y, 0);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn group_start_width_no_phantom_trailing_separator() {
+        // Only the final column differs ("aa" → "ab"): steps Match,
+        // Delete, Insert; the insert group ends at the last step, where
+        // build_rows draws no trailing `|`. group_start_width must not
+        // count a phantom separator after it (total width 3 steps × 1 +
+        // 2 real separators = 5; without the guard it would be 6).
+        let grid = compute("aa\n", "ab\n");
+        let last = grid.groups.last().unwrap().clone();
+        assert_eq!(group_start_width(&grid, &last), 5);
+    }
+
+    #[test]
+    fn direct_transposed_mutation_counts_as_changed() {
+        let (mut app, a, b) = files_app("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
+        // `transposed` is a pub field that can be mutated outside
+        // handle_key; the display rebuild such a mutation forces must
+        // count as a state change, or the transposed view would never
+        // be redrawn after a no-op key.
+        app.transposed = true;
+        let r = app.handle_key(key(KeyCode::Char('h'))); // no-op at scroll_x = 0
+        assert!(!r.quit);
+        assert!(r.changed, "display rebuild must mark the state changed");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
