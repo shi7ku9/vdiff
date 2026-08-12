@@ -241,6 +241,7 @@ impl App {
             Ok(None) => {
                 self.grid = None;
                 self.display = None;
+                self.degraded = false;
                 self.message = Some(match &self.source {
                     DiffSource::Git { files, .. } if files.is_empty() => "no changes".to_string(),
                     _ => "binary or unreadable".to_string(),
@@ -249,6 +250,7 @@ impl App {
             Err(message) => {
                 self.grid = None;
                 self.display = None;
+                self.degraded = false;
                 self.message = Some(message);
             }
         }
@@ -555,7 +557,11 @@ impl App {
         // method (e.g. `app.transposed = true` directly), so the screen
         // must redraw even if no key-visible field changed.
         let rebuilt = self.ensure_display();
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        // Uppercase C too: some terminals report Ctrl+Shift+C as
+        // Char('C') + CONTROL|SHIFT (kitty protocol).
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
             return KeyResult {
                 quit: true,
                 changed: false,
@@ -1068,16 +1074,33 @@ mod tests {
 
     #[test]
     fn marker_row_is_sticky_when_scrolling() {
-        let (mut app, a, b) = files_app(
-            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n",
-            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n21\n",
-        );
+        // 40 rows in a 23-row pane: max_scroll_y is 20, so a scroll of
+        // 10 survives the render clamp (with a 20-row diff the clamp
+        // pins it to 0 and the test would pass vacuously).
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 1..=39 {
+            old.push_str(&format!("{i}\n"));
+            new.push_str(&format!("{i}\n"));
+        }
+        old.push_str("L40\n");
+        new.push_str("X40\n");
+        let (mut app, a, b) = files_app(&old, &new);
+        let _ = draw(&mut app); // sets pane_height from the real rect (23)
+        assert_eq!(app.max_scroll_y(), 20);
         app.scroll_y = 10;
         let backend = draw(&mut app);
         let buf = backend.buffer();
-        // Marker " |-|+" starts at x=1 (block border), '-' at x=3 —
-        // still at the top row after vertical scroll.
-        assert_eq!(buf[(3, 1)].symbol(), "-");
+        // Marker "-|+|" starts at x=1 (block border): '-' over the
+        // delete column, '+' over the insert — still at the top row
+        // after vertical scroll.
+        assert_eq!(buf[(1, 1)].symbol(), "-");
+        assert_eq!(buf[(3, 1)].symbol(), "+");
+        assert_eq!(app.scroll_y, 10, "clamp must keep a valid scroll");
+        // Line 30 sits on the pane's bottom row: '3' at col 0, '0' at
+        // col 5 (delete|insert cells, then the '0' of "30").
+        assert_eq!(buf[(1, 21)].symbol(), "3");
+        assert_eq!(buf[(5, 21)].symbol(), "0");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1268,6 +1291,12 @@ mod tests {
         assert!(!r.changed);
         let r = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT));
         assert!(!r.quit, "Alt+Q must not quit");
+        // Ctrl+Shift+C still quits (kitty sends it as Char('C')).
+        let r = app.handle_key(KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(r.quit, "Ctrl+Shift+C must quit");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
