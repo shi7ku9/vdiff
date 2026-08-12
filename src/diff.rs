@@ -363,6 +363,9 @@ fn separate_ops(row: &str, boundaries: &[bool], widths: &[usize]) -> String {
         // No trailing separator: a trimmed marker row may end before
         // the last step.
         if i + 1 < len && boundaries.get(i).copied().unwrap_or(false) {
+            // A zero-width cell before a boundary emits no pad, so
+            // this `|` can land inside a grapheme cluster on that row
+            // only; padding the cell would break the cluster instead.
             out.push('|');
         }
     }
@@ -673,7 +676,7 @@ mod tests {
         // line becomes 5000 one-char columns (see columns_padded).
         let a = vec!["a".to_string(); 5_000];
         let b = vec!["b".to_string(); 5_000];
-        // 5000*5000 > 10_000_000 → degraded path: LCS skipped, so each
+        // 5000*5000 > 1_000_000 → degraded path: LCS skipped, so each
         // middle column is one Delete (from a) followed by one Insert (from b).
         let (steps, degraded) = diff_columns(&a, &b);
         assert!(degraded);

@@ -300,6 +300,22 @@ fn git_mode_with_diff_relative_reads_cwd_paths() {
 }
 
 #[test]
+fn git_mode_shows_missing_trailing_newline() {
+    // The worktree copy drops the trailing newline; the diff must
+    // report it (a synthetic ↵ column), not pass as identical.
+    let (repo, _) = make_repo();
+    std::fs::write(repo.path().join("a.txt"), "foo\nbar baz").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
+        .arg("git")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains('↵'), "got {stdout:?}");
+}
+
+#[test]
 fn git_mode_outside_repo_fails() {
     let dir = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
