@@ -73,37 +73,26 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     out
 }
 
-/// Cached display rows for the current grid + view mode. Rows depend
-/// only on the `DiffGrid` and the transposed flag, so they are built
-/// once per reload / transpose toggle instead of re-serializing the
-/// whole grid on every frame (which used to happen ~3× per keypress).
+/// Cached display rows for the current grid. Rows depend only on the
+/// `DiffGrid`, so they are built once per reload instead of
+/// re-serializing the whole grid on every frame (which used to happen
+/// ~3× per keypress).
 struct Display {
     rows: Vec<String>,
     /// Content display width (cells), i.e. the common row width.
     width: usize,
-    /// The view mode the rows were built for, so `ensure_display` can
-    /// detect a stale cache when `transposed` is toggled directly.
-    transposed: bool,
 }
 
-/// Build the display rows for a grid (marker + content rows in normal
-/// view, one step per row in transposed view) and their display width.
-fn build_display(grid: &DiffGrid, transposed: bool) -> Display {
-    let rows = if transposed {
-        transposed_rows(grid)
-    } else {
-        build_rows(grid)
-    };
+/// Build the display rows for a grid (marker row + one row per file
+/// line) and their display width.
+fn build_display(grid: &DiffGrid) -> Display {
+    let rows = build_rows(grid);
     let width = rows
         .iter()
         .map(|r| UnicodeWidthStr::width(r.as_str()))
         .max()
         .unwrap_or(0);
-    Display {
-        rows,
-        width,
-        transposed,
-    }
+    Display { rows, width }
 }
 
 pub enum DiffSource {
@@ -156,12 +145,11 @@ pub struct App {
     pub source: DiffSource,
     pub selection: usize,
     pub show_sidebar: bool,
-    pub transposed: bool,
     pub scroll_y: usize,
     pub scroll_x: usize,
     pub grid: Option<DiffGrid>,
-    /// Cached display rows for the current grid + view mode (see
-    /// `Display`); rebuilt in `reload` and on the `t` toggle.
+    /// Cached display rows for the current grid (see `Display`);
+    /// rebuilt in `reload`.
     display: Option<Display>,
     pub message: Option<String>,
     pub degraded: bool,
@@ -182,7 +170,6 @@ impl App {
             source,
             selection: 0,
             show_sidebar: true,
-            transposed: false,
             scroll_y: 0,
             scroll_x: 0,
             grid: None,
@@ -234,7 +221,7 @@ impl App {
                 self.degraded = grid.degraded;
                 // Display rows depend only on the grid + view mode;
                 // build them once here instead of on every frame.
-                self.display = Some(build_display(&grid, self.transposed));
+                self.display = Some(build_display(&grid));
                 self.grid = Some(grid);
                 self.message = None;
             }
@@ -265,26 +252,15 @@ impl App {
         let Some(disp) = &self.display else {
             return (0, 0);
         };
-        let h = if self.transposed {
-            grid.steps.len()
-        } else {
-            grid.height
-        };
-        (h, disp.width)
+        (grid.height, disp.width)
     }
 
     fn max_scroll_y(&self) -> usize {
         let (h, _) = self.content_dims();
-        // The bordered diff pane's inner area is pane_height - 2 rows.
-        // Normal view pins a sticky marker row on one of them, so
-        // pane_height - 3 content rows are visible; transposed view
-        // has no marker row and shows pane_height - 2.
-        let visible = if self.transposed {
-            self.pane_height.saturating_sub(2)
-        } else {
-            self.pane_height.saturating_sub(3)
-        };
-        h.saturating_sub(visible)
+        // The bordered diff pane's inner area is pane_height - 2 rows;
+        // the sticky marker row occupies one of them, so pane_height -
+        // 3 content rows are visible.
+        h.saturating_sub(self.pane_height.saturating_sub(3))
     }
 
     fn max_scroll_x(&self) -> usize {
@@ -294,22 +270,15 @@ impl App {
         w.saturating_sub(self.pane_width.saturating_sub(2))
     }
 
-    /// Rebuild the cached display rows when they are missing or were
-    /// built for a different view mode (e.g. `transposed` was toggled
-    /// directly rather than through `handle_key`). The check is O(1);
-    /// returns true when a rebuild happened so the caller can treat
-    /// that as a state change (and redraw).
+    /// Rebuild the cached display rows when they are missing. Returns
+    /// true when a rebuild happened so the caller can treat that as a
+    /// state change (and redraw).
     fn ensure_display(&mut self) -> bool {
         let Some(grid) = &self.grid else {
             return false;
         };
-        let stale = match &self.display {
-            Some(d) => d.transposed != self.transposed,
-            None => true,
-        };
-        if stale {
-            let transposed = self.transposed;
-            self.display = Some(build_display(grid, transposed));
+        if self.display.is_none() {
+            self.display = Some(build_display(grid));
             true
         } else {
             false
@@ -393,8 +362,7 @@ impl App {
         match (&self.grid, &self.message) {
             (Some(_), _) => {
                 // Rows are cached in `self.display` (see `build_display`);
-                // they are built once per reload / transpose toggle, not
-                // per frame.
+                // they are built once per reload, not per frame.
                 let Some(disp) = &self.display else {
                     return;
                 };
@@ -405,37 +373,21 @@ impl App {
                 // is cast.
                 let top = usize::from(inner.y);
                 let bottom = top + usize::from(inner.height);
-                if self.transposed {
-                    for (i, row) in rows.iter().enumerate() {
-                        // saturating: rows scrolled past the top clamp to
-                        // 0 and are skipped below (plain subtraction would
-                        // underflow).
-                        let y = top.saturating_add(i).saturating_sub(self.scroll_y);
-                        if y < top {
-                            continue;
-                        }
-                        if y >= bottom || y >= usize::from(u16::MAX) {
-                            break;
-                        }
-                        self.draw_step_row(frame, inner, y as u16, row);
+                if let Some(marker) = rows.first() {
+                    self.draw_marker_row(frame, inner, inner.y, marker);
+                }
+                for (i, row) in rows.iter().enumerate().skip(1) {
+                    let y = top.saturating_add(i).saturating_sub(self.scroll_y);
+                    // Content rows live below the sticky marker row:
+                    // y == top is the marker's row and must not be
+                    // overwritten once the user scrolls.
+                    if y <= top {
+                        continue;
                     }
-                } else {
-                    if let Some(marker) = rows.first() {
-                        self.draw_marker_row(frame, inner, inner.y, marker);
+                    if y >= bottom || y >= usize::from(u16::MAX) {
+                        break;
                     }
-                    for (i, row) in rows.iter().enumerate().skip(1) {
-                        let y = top.saturating_add(i).saturating_sub(self.scroll_y);
-                        // Content rows live below the sticky marker row:
-                        // y == top is the marker's row and must not be
-                        // overwritten once the user scrolls.
-                        if y <= top {
-                            continue;
-                        }
-                        if y >= bottom || y >= usize::from(u16::MAX) {
-                            break;
-                        }
-                        self.draw_content_row(frame, inner, y as u16, row);
-                    }
+                    self.draw_content_row(frame, inner, y as u16, row);
                 }
             }
             (None, Some(message)) => {
@@ -513,15 +465,6 @@ impl App {
         });
     }
 
-    fn draw_step_row(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, row: &str) {
-        // Transposed rows start with the prefix char — color only that one.
-        self.draw_row(frame, inner, y, row, self.scroll_x, |c| match c {
-            '-' => Style::default().fg(Color::Red),
-            '+' => Style::default().fg(Color::Green),
-            _ => Style::default(),
-        });
-    }
-
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
         let mut spans = vec![Span::raw(format!(
             " {} → {}  ",
@@ -544,7 +487,7 @@ impl App {
             (None, None) => {}
         }
         spans.push(Span::raw(
-            "tab/⇧tab select · hjkl scroll · n/p changes · t transpose · e sidebar · q quit",
+            "tab/⇧tab select · hjkl scroll · n/p changes · e sidebar · q quit",
         ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -553,9 +496,9 @@ impl App {
     /// whether the visible state changed (only then must the screen be
     /// redrawn).
     pub fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
-        // A rebuild here means the view mode was changed outside this
-        // method (e.g. `app.transposed = true` directly), so the screen
-        // must redraw even if no key-visible field changed.
+        // A rebuild here counts as a state change (e.g. after a reload
+        // failure cleared the display), so the screen redraws even if
+        // no key-visible field changed.
         let rebuilt = self.ensure_display();
         // Uppercase C too: some terminals report Ctrl+Shift+C as
         // Char('C') + CONTROL|SHIFT (kitty protocol).
@@ -583,7 +526,6 @@ impl App {
             self.scroll_y,
             self.scroll_x,
             self.selection,
-            self.transposed,
             self.show_sidebar,
         );
         match key.code {
@@ -592,15 +534,6 @@ impl App {
                     quit: true,
                     changed: false,
                 };
-            }
-            KeyCode::Char('t') => {
-                self.transposed = !self.transposed;
-                self.scroll_y = 0;
-                self.scroll_x = 0;
-                // The transposed view has different rows and dimensions.
-                if let Some(grid) = &self.grid {
-                    self.display = Some(build_display(grid, self.transposed));
-                }
             }
             KeyCode::Char('e') if self.has_sidebar() => self.show_sidebar = !self.show_sidebar,
             // vim convention: g = top, G = bottom.
@@ -620,7 +553,6 @@ impl App {
             self.scroll_y,
             self.scroll_x,
             self.selection,
-            self.transposed,
             self.show_sidebar,
         );
         KeyResult {
@@ -655,21 +587,14 @@ impl App {
         if change_groups.is_empty() {
             return;
         }
-        // Anchor row of each change group: the first affected file row in
-        // normal view, the group's first step in transposed view.
+        // Anchor row of each change group: the first affected file row.
         let ranges: Vec<std::ops::Range<usize>> = change_groups
             .iter()
             .map(|&i| grid.groups[i].clone())
             .collect();
         let rows: Vec<usize> = ranges
             .iter()
-            .map(|g| {
-                if self.transposed {
-                    g.start
-                } else {
-                    first_affected_row(grid, g).unwrap_or(usize::MAX)
-                }
-            })
+            .map(|g| first_affected_row(grid, g).unwrap_or(usize::MAX))
             .collect();
         // All grid reads above are done; below we only mutate scrolls.
         let target = if dir > 0 {
@@ -704,11 +629,6 @@ impl App {
             self.scroll_x = 0;
             return;
         };
-        if self.transposed {
-            self.scroll_y = group.start.min(self.max_scroll_y());
-            self.scroll_x = 0;
-            return;
-        }
         let Some(grid) = &self.grid else { return };
         if let Some(row) = first_affected_row(grid, &group) {
             self.scroll_y = row.min(self.max_scroll_y());
@@ -749,25 +669,6 @@ fn group_start_width(grid: &DiffGrid, group: &std::ops::Range<usize>) -> usize {
         }
     }
     w
-}
-
-/// Transposed display rows: one per step — prefix char (` `/`-`/`+`) +
-/// `' '` + column content.
-fn transposed_rows(grid: &DiffGrid) -> Vec<String> {
-    grid.steps
-        .iter()
-        .map(|s| {
-            let mut line = String::with_capacity(s.content.len() + 2);
-            line.push(match s.kind {
-                StepKind::Match => ' ',
-                StepKind::Delete => '-',
-                StepKind::Insert => '+',
-            });
-            line.push(' ');
-            line.push_str(&s.content);
-            line
-        })
-        .collect()
 }
 
 pub fn run_tui(cli: &crate::cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -1125,23 +1026,6 @@ mod tests {
     }
 
     #[test]
-    fn transposed_view_renders_step_rows() {
-        let (mut app, a, b) = files_app("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
-        app.transposed = true;
-        let backend = draw(&mut app);
-        let buf = backend.buffer();
-        // The diff pane block is bordered: rows start at x=1. Transposed
-        // row 0 = "  fbq" — prefix space + separator space at (1,1) and
-        // (2,1), 'f' at (3,1).
-        assert_eq!(buf[(3, 1)].symbol(), "f");
-        // delete step row "- b " is row 4 of the stack: y = 1 + 4, prefix at x=1
-        assert_eq!(buf[(1, 5)].symbol(), "-");
-        assert_eq!(buf[(1, 5)].fg, ratatui::style::Color::Red);
-        let _ = std::fs::remove_file(&a);
-        let _ = std::fs::remove_file(&b);
-    }
-
-    #[test]
     fn sidebar_hidden_diff_takes_full_width() {
         let mut app = git_app(vec![("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n")]);
         let buf_before = draw(&mut app);
@@ -1246,26 +1130,6 @@ mod tests {
         app.scroll_x = 150; // beyond the sidebar layout's window
         let _ = draw(&mut app);
         assert_eq!(app.scroll_x, app.max_scroll_x());
-    }
-
-    #[test]
-    fn transposed_view_reaches_bottom_step() {
-        // Transposed view has no sticky marker row, so its clamp is
-        // pane_height - 2: the last step row can sit on the bottom.
-        let old = format!("{}\n", "a".repeat(100));
-        let new = format!("{}\n", "b".repeat(100));
-        let (mut app, a, b) = files_app(&old, &new);
-        let _ = draw(&mut app); // pane_height = 23
-        app.handle_key(key(KeyCode::Char('t')));
-        let _ = draw(&mut app);
-        assert_eq!(app.max_scroll_y(), 200 - (23 - 2)); // 200 steps
-        app.handle_key(key(KeyCode::Char('G')));
-        assert_eq!(app.scroll_y, app.max_scroll_y());
-        let backend = draw(&mut app);
-        let buf = backend.buffer();
-        assert_eq!(buf[(1, 21)].symbol(), "+", "last step on the bottom");
-        let _ = std::fs::remove_file(&a);
-        let _ = std::fs::remove_file(&b);
     }
 
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -1381,21 +1245,6 @@ mod tests {
     }
 
     #[test]
-    fn t_toggles_transposed_and_resets_scrolls() {
-        let (mut app, a, b) = files_app("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
-        app.scroll_y = 2;
-        app.scroll_x = 3;
-        app.handle_key(key(KeyCode::Char('t')));
-        assert!(app.transposed);
-        assert_eq!(app.scroll_y, 0);
-        assert_eq!(app.scroll_x, 0);
-        app.handle_key(key(KeyCode::Char('t')));
-        assert!(!app.transposed);
-        let _ = std::fs::remove_file(&a);
-        let _ = std::fs::remove_file(&b);
-    }
-
-    #[test]
     fn e_toggles_sidebar_only_in_git_mode() {
         let mut app = git_app(vec![("a\n", "b\n")]);
         assert!(app.show_sidebar);
@@ -1434,20 +1283,5 @@ mod tests {
         let grid = compute("aa\n", "ab\n");
         let last = grid.groups.last().unwrap().clone();
         assert_eq!(group_start_width(&grid, &last), 5);
-    }
-
-    #[test]
-    fn direct_transposed_mutation_counts_as_changed() {
-        let (mut app, a, b) = files_app("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
-        // `transposed` is a pub field that can be mutated outside
-        // handle_key; the display rebuild such a mutation forces must
-        // count as a state change, or the transposed view would never
-        // be redrawn after a no-op key.
-        app.transposed = true;
-        let r = app.handle_key(key(KeyCode::Char('h'))); // no-op at scroll_x = 0
-        assert!(!r.quit);
-        assert!(r.changed, "display rebuild must mark the state changed");
-        let _ = std::fs::remove_file(&a);
-        let _ = std::fs::remove_file(&b);
     }
 }
