@@ -73,6 +73,36 @@ fn lines_with_trailing(input: &str) -> Vec<String> {
     body.split('\n').map(str::to_string).collect()
 }
 
+/// Tab stops every `TAB_STOP` display columns; a tab expands to the
+/// spaces up to the next stop. Terminals advance a tab to its own tab
+/// stop, so a fixed one-cell width would misalign every following
+/// column.
+const TAB_STOP: usize = 8;
+
+/// Replace tabs with spaces up to the next `TAB_STOP` column, using
+/// display widths so a wide char before the tab lands on the same
+/// stop as in a terminal. The column count resets at newlines.
+fn expand_tabs(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut col = 0usize;
+    for c in input.chars() {
+        if c == '\t' {
+            let next = (col / TAB_STOP + 1) * TAB_STOP;
+            for _ in col..next {
+                out.push(' ');
+            }
+            col = next;
+        } else if c == '\n' {
+            out.push(c);
+            col = 0;
+        } else {
+            out.push(c);
+            col += c.width().unwrap_or(1);
+        }
+    }
+    out
+}
+
 /// One column of a file: the k-th char of every line, missing chars
 /// padded with spaces. Every column is padded to `height`.
 fn columns_padded(lines: &[String], height: usize) -> Vec<String> {
@@ -210,13 +240,14 @@ fn groups_of(ops: &[Step]) -> Vec<Range<usize>> {
     groups
 }
 
-/// Compute the column diff of two file contents (CRLF stripped).
+/// Compute the column diff of two file contents (CRLF stripped, tabs
+/// expanded).
 pub fn compute(a: &str, b: &str) -> DiffGrid {
-    let a_lines: Vec<String> = lines_with_trailing(a)
+    let a_lines: Vec<String> = lines_with_trailing(&expand_tabs(a))
         .into_iter()
         .map(|line| line.trim_end_matches('\r').to_string())
         .collect();
-    let b_lines: Vec<String> = lines_with_trailing(b)
+    let b_lines: Vec<String> = lines_with_trailing(&expand_tabs(b))
         .into_iter()
         .map(|line| line.trim_end_matches('\r').to_string())
         .collect();
@@ -389,6 +420,40 @@ mod tests {
     /// `Vec<(&str, String)>` can't be compared against `Vec<(&str, &str)>`.
     fn exp<'a>(pairs: &[(&'a str, &'a str)]) -> Vec<(&'a str, String)> {
         pairs.iter().map(|(p, c)| (*p, c.to_string())).collect()
+    }
+
+    #[test]
+    fn expand_tabs_reaches_next_tab_stop() {
+        assert_eq!(expand_tabs("a\tb"), "a       b");
+        assert_eq!(expand_tabs("\t"), "        ");
+        // The column count resets at newlines.
+        assert_eq!(expand_tabs("a\tb\nab\tc"), "a       b\nab      c");
+        // Wide chars count display columns: 中 (2) then the tab lands
+        // at the same stop as in a terminal.
+        assert_eq!(expand_tabs("中\tx"), "中      x");
+    }
+
+    #[test]
+    fn compute_expands_tabs() {
+        // "a\tb" -> "a       b": only column 8 differs from "a\tc".
+        let grid = compute("a\tb\n", "a\tc\n");
+        let ops = ops_of(&grid);
+        assert_eq!(ops.len(), 10);
+        assert!(ops[..8].iter().all(|(p, _)| *p == "="));
+        assert_eq!(ops[8], ("-", "b".to_string()));
+        assert_eq!(ops[9], ("+", "c".to_string()));
+    }
+
+    #[test]
+    fn render_text_tabs_align_separators() {
+        let rendered = render_text(&compute("a\tb\n", "a\tc\n"));
+        let mut lines = rendered.lines();
+        let marker = lines.next().unwrap();
+        let content = lines.next().unwrap();
+        assert_eq!(
+            marker.chars().position(|c| c == '|'),
+            content.chars().position(|c| c == '|'),
+        );
     }
 
     #[test]
