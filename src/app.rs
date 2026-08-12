@@ -561,6 +561,18 @@ impl App {
                 changed: false,
             };
         }
+        // Ctrl/Alt chords would otherwise fall through to the plain
+        // arms (Ctrl+Q would quit, Ctrl+L would scroll right); only
+        // Shift is allowed (Shift+G is how `G` arrives).
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return KeyResult {
+                quit: false,
+                changed: rebuilt,
+            };
+        }
         let before = (
             self.scroll_y,
             self.scroll_x,
@@ -1223,6 +1235,22 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
                 .quit
         );
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn ctrl_and_alt_chords_do_nothing() {
+        // Without a modifier guard, Ctrl+Q would quit and Ctrl+L
+        // would scroll right through the plain char arms.
+        let (mut app, a, b) = files_app("a\n", "b\n");
+        let r = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(!r.quit, "Ctrl+Q must not quit");
+        let r = app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(app.scroll_x, 0, "Ctrl+L must not scroll");
+        assert!(!r.changed);
+        let r = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT));
+        assert!(!r.quit, "Alt+Q must not quit");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
