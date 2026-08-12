@@ -717,13 +717,20 @@ impl App {
     }
 }
 
-/// The first file line where any step in `group` has a non-padding char.
+/// The first file line where any step in `group` has a non-padding
+/// char. Each step's string is scanned once: `char_indices().find`
+/// lands on the first non-space char, whose index is the row.
 fn first_affected_row(grid: &DiffGrid, group: &std::ops::Range<usize>) -> Option<usize> {
-    (0..grid.height).find(|&r| {
-        grid.steps[group.clone()]
-            .iter()
-            .any(|s| s.content.chars().nth(r).unwrap_or(' ') != ' ')
-    })
+    grid.steps[group.clone()]
+        .iter()
+        .filter_map(|s| {
+            s.content
+                .char_indices()
+                .enumerate()
+                .find(|(_, (_, c))| *c != ' ')
+                .map(|(n, _)| n)
+        })
+        .min()
 }
 
 /// Display width of the grid content before `group` ends (step widths
