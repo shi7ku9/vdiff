@@ -84,7 +84,16 @@ impl From<RawCli> for Cli {
 
 impl FromArgMatches for Cli {
     fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(RawCli::from_arg_matches(matches)?.into())
+        let raw = RawCli::from_arg_matches(matches)?;
+        if raw.command.is_some() && (raw.file1.is_some() || raw.file2.is_some()) {
+            // `vdiff a b git` used to run git mode and silently drop
+            // the files; reject the mix instead.
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "vdiff <FILE1> <FILE2> and the git subcommand cannot be combined",
+            ));
+        }
+        Ok(raw.into())
     }
 
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
@@ -138,5 +147,12 @@ mod tests {
         assert!(
             matches!(cli.command, Command::Git { cached: false, revs } if revs == vec!["xx...xx"])
         );
+    }
+
+    #[test]
+    fn rejects_files_with_git_subcommand() {
+        assert!(Cli::try_parse_from(["vdiff", "a.txt", "b.txt", "git"]).is_err());
+        assert!(Cli::try_parse_from(["vdiff", "a.txt", "git"]).is_err());
+        assert!(Cli::try_parse_from(["vdiff", "git", "HEAD"]).is_ok());
     }
 }
