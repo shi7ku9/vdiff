@@ -275,6 +275,31 @@ fn git_mode_from_subdirectory_reads_worktree() {
 }
 
 #[test]
+fn git_mode_with_diff_relative_reads_cwd_paths() {
+    // diff.relative makes --name-status emit cwd-relative paths, so
+    // the worktree read and cat-file both need the cwd prefix, not a
+    // bare join against the repo root.
+    let (repo, _) = make_repo();
+    std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+    std::fs::write(repo.path().join("sub/s.txt"), "foo\nbar baz\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(
+        repo.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "two"],
+    );
+    git(repo.path(), &["config", "diff.relative", "true"]);
+    std::fs::write(repo.path().join("sub/s.txt"), "foo\nbar qaz\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
+        .arg("git")
+        .current_dir(repo.path().join("sub"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("-|+|\n"), "got {stdout:?}");
+}
+
+#[test]
 fn git_mode_outside_repo_fails() {
     let dir = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))

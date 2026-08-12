@@ -961,6 +961,7 @@ mod tests {
             new: Source::Rev("HEAD".into()),
             diff_args: vec![],
             toplevel: String::new(),
+            prefix: String::new(),
         };
         App::new(DiffSource::Git {
             spec,

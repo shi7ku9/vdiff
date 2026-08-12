@@ -99,10 +99,15 @@ pub struct RevSpec {
     pub old: Source,
     pub new: Source,
     pub diff_args: Vec<String>,
-    /// Repo root, resolved once. `git diff --name-status` emits
-    /// worktree paths relative to it even when vdiff runs from a
-    /// subdirectory.
+    /// Repo root (absolute, no trailing slash) that worktree and
+    /// index paths from `git diff --name-status` are relative to.
+    /// Empty when the root cannot be decoded or when paths are
+    /// cwd-relative (see `prefix`).
     pub toplevel: String,
+    /// Cwd relative to the root, with trailing slash ("sub/"). Under
+    /// `diff.relative` git reports cwd-relative paths, so `prefix +
+    /// path` gives the root-relative one every side needs.
+    pub prefix: String,
 }
 
 impl RevSpec {
@@ -201,6 +206,44 @@ fn merge_base(g: &dyn GitShell, a: &str, b: &str) -> Result<String, GitError> {
     }
 }
 
+/// Repo layout for resolving diff paths, resolved once per spec that
+/// reads the worktree: the repo root that paths are relative to, and
+/// the cwd's prefix inside it. Under `diff.relative` git reports
+/// cwd-relative paths, so the prefix must be prepended to make them
+/// root-relative for every side (worktree reads and `cat-file`).
+/// An empty root (undecodable, e.g. non-UTF-8) falls back to
+/// cwd-relative reads, which is right when running from the root.
+fn worktree_layout(g: &dyn GitShell) -> (String, String) {
+    let relative = g
+        .output(&["config", "--bool", "diff.relative"])
+        .map(|s| s.trim() == "true")
+        .unwrap_or(false);
+    let toplevel = g
+        .output_lossy(&["rev-parse", "--show-toplevel"])
+        .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
+        .unwrap_or_default();
+    if relative && !toplevel.is_empty() {
+        let prefix = g
+            .output_lossy(&["rev-parse", "--show-prefix"])
+            .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
+            .unwrap_or_default();
+        (toplevel, prefix)
+    } else {
+        (toplevel, String::new())
+    }
+}
+
+/// Both sides of a range must not look like options: git reads
+/// "A..-B" as a range plus a switch.
+fn check_components(a: &str, b: &str) -> Result<(), GitError> {
+    if a.starts_with('-') || b.starts_with('-') {
+        return Err(GitError::InvalidRevSpec(
+            "range sides must not start with '-'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve rev arguments into diff sides, following `git diff`
 /// semantics. `revs` is passed through to git unchanged for the file
 /// list (in `diff_args`).
@@ -212,12 +255,6 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
             "revision arguments must not start with '-': {bad}"
         )));
     }
-    // `git diff --name-status` emits worktree paths relative to the
-    // repo root, whatever directory vdiff runs from; resolve it once.
-    let toplevel = g
-        .output(&["rev-parse", "--show-toplevel"])
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
     if cached {
         if revs.len() > 1 {
             return Err(GitError::InvalidRevSpec(
@@ -234,19 +271,25 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
             old,
             new: Source::Index,
             diff_args,
-            toplevel,
+            toplevel: String::new(),
+            prefix: String::new(),
         });
     }
     match revs.len() {
-        0 => Ok(RevSpec {
-            old: Source::Index,
-            new: Source::Worktree,
-            diff_args: vec![],
-            toplevel,
-        }),
+        0 => {
+            let (toplevel, prefix) = worktree_layout(g);
+            Ok(RevSpec {
+                old: Source::Index,
+                new: Source::Worktree,
+                diff_args: vec![],
+                toplevel,
+                prefix,
+            })
+        }
         1 => {
             let r = &revs[0];
             if let Some((kind, a, b)) = split_range(r) {
+                check_components(&a, &b)?;
                 Ok(match kind {
                     RangeKind::MergeBase => {
                         let base = merge_base(g, &a, &b)?;
@@ -254,22 +297,26 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
                             old: Source::Rev(base),
                             new: Source::Rev(b),
                             diff_args: vec![r.clone()],
-                            toplevel,
+                            toplevel: String::new(),
+                            prefix: String::new(),
                         }
                     }
                     RangeKind::Plain => RevSpec {
                         old: Source::Rev(a),
                         new: Source::Rev(b),
                         diff_args: vec![r.clone()],
-                        toplevel,
+                        toplevel: String::new(),
+                        prefix: String::new(),
                     },
                 })
             } else {
+                let (toplevel, prefix) = worktree_layout(g);
                 Ok(RevSpec {
                     old: Source::Rev(r.clone()),
                     new: Source::Worktree,
                     diff_args: vec![r.clone()],
                     toplevel,
+                    prefix,
                 })
             }
         }
@@ -277,6 +324,7 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
             let first = revs[0].clone();
             let second = &revs[1];
             if let Some((kind, a, b)) = split_range(second) {
+                check_components(&a, &b)?;
                 Ok(match kind {
                     RangeKind::MergeBase => {
                         let base = merge_base(g, &a, &b)?;
@@ -284,14 +332,16 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
                             old: Source::Rev(base),
                             new: Source::Rev(b),
                             diff_args: revs.to_vec(),
-                            toplevel,
+                            toplevel: String::new(),
+                            prefix: String::new(),
                         }
                     }
                     RangeKind::Plain => RevSpec {
                         old: Source::Rev(a),
                         new: Source::Rev(b),
                         diff_args: revs.to_vec(),
-                        toplevel,
+                        toplevel: String::new(),
+                        prefix: String::new(),
                     },
                 })
             } else {
@@ -299,7 +349,8 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
                     old: Source::Rev(first),
                     new: Source::Rev(second.clone()),
                     diff_args: revs.to_vec(),
-                    toplevel,
+                    toplevel: String::new(),
+                    prefix: String::new(),
                 })
             }
         }
@@ -457,15 +508,18 @@ fn fetch_source(
     src: &Source,
     path: &str,
 ) -> Result<String, FetchError> {
+    // Paths from `git diff --name-status` are root-relative (or
+    // cwd-relative under diff.relative, when `prefix` carries the
+    // cwd); `cat-file` resolves paths against the root too, so every
+    // side reads `toplevel + prefix + path`.
+    let rooted = format!("{}{path}", spec.prefix);
     match src {
-        // Worktree paths from `git diff --name-status` are relative to
-        // the repo root, so join them against it.
         Source::Worktree => {
-            let full = std::path::Path::new(&spec.toplevel).join(path);
+            let full = std::path::Path::new(&spec.toplevel).join(&rooted);
             std::fs::read_to_string(full).map_err(|_| FetchError::Binary)
         }
-        Source::Index => fetch_blob(g, &format!(":{path}")),
-        Source::Rev(rev) => fetch_blob(g, &format!("{rev}:{path}")),
+        Source::Index => fetch_blob(g, &format!(":{rooted}")),
+        Source::Rev(rev) => fetch_blob(g, &format!("{rev}:{rooted}")),
     }
 }
 
@@ -632,7 +686,8 @@ mod tests {
                 old: Source::Index,
                 new: Source::Worktree,
                 diff_args: vec![],
-                toplevel: String::new()
+                toplevel: String::new(),
+                prefix: String::new()
             }
             .old_label(),
             "index"
@@ -642,7 +697,8 @@ mod tests {
                 old: Source::Index,
                 new: Source::Worktree,
                 diff_args: vec![],
-                toplevel: String::new()
+                toplevel: String::new(),
+                prefix: String::new()
             }
             .new_label(),
             "worktree"
@@ -652,7 +708,8 @@ mod tests {
                 old: Source::Rev("HEAD".into()),
                 new: Source::Index,
                 diff_args: vec![],
-                toplevel: String::new()
+                toplevel: String::new(),
+                prefix: String::new()
             }
             .old_label(),
             "HEAD"
@@ -732,6 +789,7 @@ mod tests {
             new: Source::Index,
             diff_args: vec!["--cached".into()],
             toplevel: String::new(),
+            prefix: String::new(),
         };
         assert_eq!(changed_files(&f, &spec).unwrap().len(), 1);
     }
@@ -746,6 +804,7 @@ mod tests {
             new: Source::Worktree,
             diff_args: vec![],
             toplevel: String::new(),
+            prefix: String::new(),
         };
         assert!(matches!(
             changed_files(&f, &spec),
@@ -762,6 +821,7 @@ mod tests {
             new: Source::Worktree,
             diff_args: vec![],
             toplevel: String::new(),
+            prefix: String::new(),
         };
         assert_eq!(changed_files(&f, &spec).unwrap(), vec![]);
     }
@@ -779,6 +839,7 @@ mod tests {
             new: Source::Rev("HEAD".into()),
             diff_args: vec![],
             toplevel: String::new(),
+            prefix: String::new(),
         };
         let file = ChangedFile {
             status: Status::Modified,
@@ -804,6 +865,7 @@ mod tests {
             new: Source::Rev("HEAD".into()),
             diff_args: vec![],
             toplevel: String::new(),
+            prefix: String::new(),
         };
         let file = ChangedFile {
             status: Status::Modified,
@@ -825,6 +887,7 @@ mod tests {
             new: Source::Worktree,
             diff_args: vec![],
             toplevel: std::env::temp_dir().to_str().unwrap().to_string(),
+            prefix: String::new(),
         };
         let file = ChangedFile {
             status: Status::Modified,
@@ -856,6 +919,7 @@ mod tests {
             new: Source::Rev("HEAD".into()),
             diff_args: vec![],
             toplevel: String::new(),
+            prefix: String::new(),
         };
         let added = ChangedFile {
             status: Status::Added,
@@ -888,6 +952,7 @@ mod tests {
             new: Source::Rev("HEAD".into()),
             diff_args: vec![],
             toplevel: String::new(),
+            prefix: String::new(),
         };
         let added = ChangedFile {
             status: Status::Added,
@@ -911,6 +976,7 @@ mod tests {
             new: Source::Rev("HEAD".into()),
             diff_args: vec![],
             toplevel: String::new(),
+            prefix: String::new(),
         };
         let file = ChangedFile {
             status: Status::Modified,
@@ -933,6 +999,7 @@ mod tests {
             new: Source::Worktree,
             diff_args: vec![],
             toplevel: dir.to_str().unwrap().to_string(),
+            prefix: String::new(),
         };
         let file = ChangedFile {
             status: Status::Modified,
@@ -961,6 +1028,7 @@ mod tests {
             new: Source::Rev("HEAD".into()),
             diff_args: vec![],
             toplevel: String::new(),
+            prefix: String::new(),
         };
         let file = ChangedFile {
             status: Status::Modified,
@@ -968,6 +1036,52 @@ mod tests {
             new_path: "bin.dat".into(),
         };
         assert_eq!(load_content(&f, &spec, &file), Ok(None));
+    }
+
+    #[test]
+    fn worktree_layout_reads_root_and_prefix() {
+        let mut f = FakeGit::default();
+        f.set(
+            &["config", "--bool", "diff.relative"],
+            Some("false\n".to_string()),
+        );
+        f.set(
+            &["rev-parse", "--show-toplevel"],
+            Some("/repo\n".to_string()),
+        );
+        assert_eq!(worktree_layout(&f), ("/repo".to_string(), String::new()));
+    }
+
+    #[test]
+    fn worktree_layout_prefixes_under_diff_relative() {
+        let mut f = FakeGit::default();
+        f.set(
+            &["config", "--bool", "diff.relative"],
+            Some("true\n".to_string()),
+        );
+        f.set(
+            &["rev-parse", "--show-toplevel"],
+            Some("/repo\n".to_string()),
+        );
+        f.set(&["rev-parse", "--show-prefix"], Some("sub/\n".to_string()));
+        assert_eq!(
+            worktree_layout(&f),
+            ("/repo".to_string(), "sub/".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_dash_range_components() {
+        // "A..-B" passes the whole-arg check but would make git read
+        // -B as a switch.
+        assert!(matches!(
+            resolve(&g(), false, &["A..-B".to_string()]),
+            Err(GitError::InvalidRevSpec(_))
+        ));
+        assert!(matches!(
+            resolve(&g(), false, &["A...-B".to_string()]),
+            Err(GitError::InvalidRevSpec(_))
+        ));
     }
 
     #[test]
