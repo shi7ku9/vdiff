@@ -129,7 +129,20 @@ fn files_mode_identical_files() {
 fn files_mode_missing_file_fails() {
     let out = run_vdiff(&["/nonexistent/vdiff-a", "/nonexistent/vdiff-b"]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).starts_with("vdiff: "));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("vdiff: "));
+    assert!(err.contains("vdiff-a"), "error should name the file: {err}");
+}
+
+#[test]
+fn files_with_git_subcommand_is_rejected() {
+    let a = temp_file("a3.txt", "x\n");
+    let b = temp_file("b3.txt", "y\n");
+    let out = run_vdiff(&[a.to_str().unwrap(), b.to_str().unwrap(), "git"]);
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be combined"));
 }
 
 #[test]
