@@ -428,19 +428,6 @@ pub fn render_text(grid: &DiffGrid) -> String {
     out
 }
 
-/// The raw step view: one row per diff step — prefix char (` `/`-`/`+`)
-/// + `' '` + the column content (one char per file line).
-pub fn render_transposed(grid: &DiffGrid) -> String {
-    let mut out = String::new();
-    for step in &grid.steps {
-        out.push(op_prefix(step.kind));
-        out.push(' ');
-        out.push_str(&step.content);
-        out.push('\n');
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,19 +827,5 @@ mod tests {
         // 4 insert columns ("++++"), plus the synthetic step for the
         // trailing newline the empty side does not have.
         assert_eq!(render_text(&grid), "+++++\nfoo  \nbar  \nquux \n    ↵\n");
-    }
-
-    #[test]
-    fn render_transposed_stacks_steps() {
-        let grid = compute("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
-        assert_eq!(
-            render_transposed(&grid),
-            "  fbq\n  oau\n  oru\n    x\n-  b \n+  q \n   a \n   z \n",
-        );
-    }
-
-    #[test]
-    fn render_transposed_empty() {
-        assert_eq!(render_transposed(&compute("", "")), "");
     }
 }
