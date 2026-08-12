@@ -2,7 +2,7 @@
 
 `vdiff` diffs files **column-by-column** instead of line-by-line.
 
-Normal diff tools ask *"which lines changed?"*; `vdiff` asks *"which columns changed?"*. Every character position across all lines is a diff unit: the k-th character of every line becomes one column, columns are compared, and the result is transposed back so you can see exactly which **column** of your file changed, with the old and new characters side by side.
+Normal diff tools ask *"which lines changed?"*; `vdiff` asks *"which columns changed?"*. Every character position across all lines is a diff unit: the k-th character of every line becomes one column, columns are compared, and the result is shown back as rows with a marker row on top, so you can see exactly which **column** of your file changed, with the old and new characters side by side.
 
 Yes, this is counterintuitive. That's the point. It's a toy, a fun way to look at your files sideways.
 
