@@ -29,11 +29,11 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     let mut rows: Vec<String> = (0..grid.height).map(|_| String::new()).collect();
     for (i, step) in grid.steps.iter().enumerate() {
         let col_w = grid.widths[i];
-        for (r, c) in step.content.iter().enumerate() {
-            rows[r].push(*c);
+        for (r, c) in step.content.chars().enumerate() {
+            rows[r].push(c);
             // Pad every cell to its step column's display width so
             // wide (CJK) cells don't shift the `|` separators.
-            for _ in 0..cell_pad(*c, col_w) {
+            for _ in 0..cell_pad(c, col_w) {
                 rows[r].push(' ');
             }
         }
@@ -716,7 +716,7 @@ fn first_affected_row(grid: &DiffGrid, group: &std::ops::Range<usize>) -> Option
     (0..grid.height).find(|&r| {
         grid.steps[group.clone()]
             .iter()
-            .any(|s| s.content.get(r).copied().unwrap_or(' ') != ' ')
+            .any(|s| s.content.chars().nth(r).unwrap_or(' ') != ' ')
     })
 }
 
@@ -751,7 +751,7 @@ fn transposed_rows(grid: &DiffGrid) -> Vec<String> {
                 StepKind::Insert => '+',
             });
             line.push(' ');
-            line.extend(s.content.iter());
+            line.extend(s.content.chars());
             line
         })
         .collect()

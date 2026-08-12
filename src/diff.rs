@@ -16,7 +16,9 @@ pub enum StepKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     pub kind: StepKind,
-    pub content: Vec<char>,
+    /// One char per file line, padded with spaces to `grid.height`.
+    /// A String (not Vec<char>) halves the allocations for wide files.
+    pub content: String,
 }
 
 /// One diff step per file column.
@@ -139,27 +141,29 @@ fn diff_columns(a: &[String], b: &[String]) -> (Vec<Step>, bool) {
         .iter()
         .map(|c| Step {
             kind: StepKind::Match,
-            content: c.chars().collect(),
+            content: c.clone(),
         })
         .collect();
     let mid_a = &a[prefix..a.len() - suffix];
     let mid_b = &b[prefix..b.len() - suffix];
-    let degraded = mid_a.len() * mid_b.len() > 10_000_000;
+    // saturating: on 32-bit builds a huge product would wrap and skip
+    // the guard. 1M cells is a ~8 MB flat table, a fine cliff.
+    let degraded = mid_a.len().saturating_mul(mid_b.len()) > 1_000_000;
     if degraded {
         ops.extend(mid_a.iter().map(|c| Step {
             kind: StepKind::Delete,
-            content: c.chars().collect(),
+            content: c.clone(),
         }));
         ops.extend(mid_b.iter().map(|c| Step {
             kind: StepKind::Insert,
-            content: c.chars().collect(),
+            content: c.clone(),
         }));
     } else {
         lcs_ops(mid_a, mid_b, &mut ops);
     }
     ops.extend(a[a.len() - suffix..].iter().map(|c| Step {
         kind: StepKind::Match,
-        content: c.chars().collect(),
+        content: c.clone(),
     }));
     (ops, degraded)
 }
@@ -171,25 +175,28 @@ fn lcs_ops(a: &[String], b: &[String], out: &mut Vec<Step>) {
     if n == 0 {
         out.extend(b.iter().map(|c| Step {
             kind: StepKind::Insert,
-            content: c.chars().collect(),
+            content: c.clone(),
         }));
         return;
     }
     if m == 0 {
         out.extend(a.iter().map(|c| Step {
             kind: StepKind::Delete,
-            content: c.chars().collect(),
+            content: c.clone(),
         }));
         return;
     }
 
-    let mut table = vec![vec![0usize; m + 1]; n + 1];
+    // One flat allocation instead of n+1 vectors of m+1 entries, so a
+    // table near the threshold costs a single ~8 MB block.
+    let stride = m + 1;
+    let mut table = vec![0usize; (n + 1) * stride];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            table[i][j] = if a[i] == b[j] {
-                table[i + 1][j + 1] + 1
+            table[i * stride + j] = if a[i] == b[j] {
+                table[(i + 1) * stride + j + 1] + 1
             } else {
-                table[i + 1][j].max(table[i][j + 1])
+                table[(i + 1) * stride + j].max(table[i * stride + j + 1])
             };
         }
     }
@@ -199,31 +206,31 @@ fn lcs_ops(a: &[String], b: &[String], out: &mut Vec<Step>) {
         if a[i] == b[j] {
             out.push(Step {
                 kind: StepKind::Match,
-                content: a[i].chars().collect(),
+                content: a[i].clone(),
             });
             i += 1;
             j += 1;
-        } else if table[i + 1][j] >= table[i][j + 1] {
+        } else if table[(i + 1) * stride + j] >= table[i * stride + j + 1] {
             out.push(Step {
                 kind: StepKind::Delete,
-                content: a[i].chars().collect(),
+                content: a[i].clone(),
             });
             i += 1;
         } else {
             out.push(Step {
                 kind: StepKind::Insert,
-                content: b[j].chars().collect(),
+                content: b[j].clone(),
             });
             j += 1;
         }
     }
     out.extend(a[i..].iter().map(|c| Step {
         kind: StepKind::Delete,
-        content: c.chars().collect(),
+        content: c.clone(),
     }));
     out.extend(b[j..].iter().map(|c| Step {
         kind: StepKind::Insert,
-        content: c.chars().collect(),
+        content: c.clone(),
     }));
 }
 
@@ -253,6 +260,19 @@ pub fn compute(a: &str, b: &str) -> DiffGrid {
         .collect();
     let height = a_lines.len().max(b_lines.len());
     let a_cols = columns_padded(&a_lines, height);
+    // Identical inputs are the common case; build the all-Match grid
+    // straight from the columns instead of diffing (and keep the
+    // memory down for very wide files).
+    if a == b {
+        let steps = a_cols
+            .iter()
+            .map(|c| Step {
+                kind: StepKind::Match,
+                content: c.clone(),
+            })
+            .collect();
+        return DiffGrid::from_parts(steps, height, false);
+    }
     let b_cols = columns_padded(&b_lines, height);
     let (steps, degraded) = diff_columns(&a_cols, &b_cols);
     DiffGrid::from_parts(steps, height, degraded)
@@ -288,7 +308,7 @@ fn transpose_grid(grid: &[String]) -> Vec<String> {
 /// of zero.
 pub(crate) fn step_width(step: &Step) -> usize {
     step.content
-        .iter()
+        .chars()
         .map(|c| c.width().unwrap_or(0))
         .max()
         .unwrap_or(0)
@@ -339,9 +359,9 @@ pub fn render_text(grid: &DiffGrid) -> String {
         .map(|s| {
             let mut line = String::with_capacity(grid.height + 1);
             line.push(op_prefix(s.kind));
-            line.extend(s.content.iter());
-            // content is a Vec<char>, so len() is already the char count.
-            for _ in s.content.len()..grid.height {
+            line.extend(s.content.chars());
+            // content is a String; chars() gives the char count.
+            for _ in s.content.chars().count()..grid.height {
                 line.push(' ');
             }
             line
@@ -392,7 +412,7 @@ pub fn render_transposed(grid: &DiffGrid) -> String {
     for step in &grid.steps {
         out.push(op_prefix(step.kind));
         out.push(' ');
-        out.extend(step.content.iter());
+        out.extend(step.content.chars());
         out.push('\n');
     }
     out
@@ -412,7 +432,7 @@ mod tests {
                     StepKind::Delete => "-",
                     StepKind::Insert => "+",
                 };
-                (p, s.content.iter().collect())
+                (p, s.content.chars().collect())
             })
             .collect()
     }
@@ -561,6 +581,13 @@ mod tests {
     }
 
     #[test]
+    fn compute_identical_inputs_are_all_match() {
+        let grid = compute("foo\nbar\n", "foo\nbar\n");
+        assert!(grid.steps.iter().all(|s| s.kind == StepKind::Match));
+        assert!(!grid.degraded);
+    }
+
+    #[test]
     fn compute_strips_crlf() {
         let grid = compute("a\r\nb\r\n", "a\r\nc\r\n");
         assert_eq!(ops_of(&grid), exp(&[("-", "ab"), ("+", "ac")]));
@@ -656,7 +683,7 @@ mod tests {
         assert_eq!(
             step_width(&Step {
                 kind: StepKind::Match,
-                content: vec!['a', '中']
+                content: "a中".to_string()
             }),
             2
         );
@@ -664,7 +691,7 @@ mod tests {
         assert_eq!(
             step_width(&Step {
                 kind: StepKind::Match,
-                content: vec!['\u{0301}']
+                content: "\u{0301}".to_string()
             }),
             1
         );
