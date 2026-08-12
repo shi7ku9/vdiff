@@ -38,10 +38,11 @@ fn run_plain(cli: &cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
             for file in files {
                 println!("=== {} ===", file.new_path);
                 match git::load_content(&g, &spec, &file) {
-                    Some((old, new)) => {
+                    Ok(Some((old, new))) => {
                         print!("{}", diff::render_text(&diff::compute(&old, &new)))
                     }
-                    None => println!("(binary or unreadable)"),
+                    Ok(None) => println!("(binary or unreadable)"),
+                    Err(e) => println!("(error: {e})"),
                 }
             }
             Ok(())

@@ -18,15 +18,12 @@ pub trait GitShell {
 }
 
 /// Why a git invocation failed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitRunError {
     /// The git executable could not be spawned (e.g. not on PATH).
     SpawnFailed,
     /// git ran but exited non-zero.
-    NonZero {
-        code: Option<i32>,
-        stderr: String,
-    },
+    NonZero { code: Option<i32>, stderr: String },
     /// The output was not valid UTF-8.
     NonUtf8,
 }
@@ -102,6 +99,10 @@ pub struct RevSpec {
     pub old: Source,
     pub new: Source,
     pub diff_args: Vec<String>,
+    /// Repo root, resolved once. `git diff --name-status` emits
+    /// worktree paths relative to it even when vdiff runs from a
+    /// subdirectory.
+    pub toplevel: String,
 }
 
 impl RevSpec {
@@ -211,6 +212,12 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
             "revision arguments must not start with '-': {bad}"
         )));
     }
+    // `git diff --name-status` emits worktree paths relative to the
+    // repo root, whatever directory vdiff runs from; resolve it once.
+    let toplevel = g
+        .output(&["rev-parse", "--show-toplevel"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     if cached {
         if revs.len() > 1 {
             return Err(GitError::InvalidRevSpec(
@@ -227,6 +234,7 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
             old,
             new: Source::Index,
             diff_args,
+            toplevel,
         });
     }
     match revs.len() {
@@ -234,6 +242,7 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
             old: Source::Index,
             new: Source::Worktree,
             diff_args: vec![],
+            toplevel,
         }),
         1 => {
             let r = &revs[0];
@@ -245,12 +254,14 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
                             old: Source::Rev(base),
                             new: Source::Rev(b),
                             diff_args: vec![r.clone()],
+                            toplevel,
                         }
                     }
                     RangeKind::Plain => RevSpec {
                         old: Source::Rev(a),
                         new: Source::Rev(b),
                         diff_args: vec![r.clone()],
+                        toplevel,
                     },
                 })
             } else {
@@ -258,6 +269,7 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
                     old: Source::Rev(r.clone()),
                     new: Source::Worktree,
                     diff_args: vec![r.clone()],
+                    toplevel,
                 })
             }
         }
@@ -272,12 +284,14 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
                             old: Source::Rev(base),
                             new: Source::Rev(b),
                             diff_args: revs.to_vec(),
+                            toplevel,
                         }
                     }
                     RangeKind::Plain => RevSpec {
                         old: Source::Rev(a),
                         new: Source::Rev(b),
                         diff_args: revs.to_vec(),
+                        toplevel,
                     },
                 })
             } else {
@@ -285,6 +299,7 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
                     old: Source::Rev(first),
                     new: Source::Rev(second.clone()),
                     diff_args: revs.to_vec(),
+                    toplevel,
                 })
             }
         }
@@ -414,37 +429,82 @@ pub fn changed_files(g: &dyn GitShell, spec: &RevSpec) -> Result<Vec<ChangedFile
     Ok(parse_name_status_z(&out))
 }
 
-fn fetch_source(g: &dyn GitShell, src: &Source, path: &str) -> Option<String> {
-    match src {
-        Source::Worktree => std::fs::read_to_string(path).ok(),
-        Source::Index => g.output(&["cat-file", "-p", &format!(":{path}")]).ok(),
-        Source::Rev(rev) => g
-            .output(&["cat-file", "-p", &format!("{rev}:{path}")])
-            .ok(),
+/// Why one diff side's content could not be loaded.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FetchError {
+    /// The side is not text: binary blob, non-UTF-8 bytes, or an
+    /// unreadable file. Surfaced as "(binary or unreadable)".
+    Binary,
+    /// git itself failed to produce the content (missing blob,
+    /// submodule, ...).
+    GitFailed(GitRunError),
+}
+
+impl fmt::Display for FetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FetchError::Binary => write!(f, "binary or unreadable"),
+            FetchError::GitFailed(e) => write!(f, "git failed: {e}"),
+        }
     }
 }
 
-/// Fetch (old, new) contents for a changed file. A side that cannot be
-/// fetched (binary, non-UTF-8, missing blob, unreadable file) becomes
-/// empty; `None` only when both sides are unavailable. Added files
-/// have an empty old side; deleted files an empty new side.
+impl std::error::Error for FetchError {}
+
+fn fetch_source(
+    g: &dyn GitShell,
+    spec: &RevSpec,
+    src: &Source,
+    path: &str,
+) -> Result<String, FetchError> {
+    match src {
+        // Worktree paths from `git diff --name-status` are relative to
+        // the repo root, so join them against it.
+        Source::Worktree => {
+            let full = std::path::Path::new(&spec.toplevel).join(path);
+            std::fs::read_to_string(full).map_err(|_| FetchError::Binary)
+        }
+        Source::Index => fetch_blob(g, &format!(":{path}")),
+        Source::Rev(rev) => fetch_blob(g, &format!("{rev}:{path}")),
+    }
+}
+
+fn fetch_blob(g: &dyn GitShell, object: &str) -> Result<String, FetchError> {
+    g.output(&["cat-file", "-p", object]).map_err(|e| match e {
+        GitRunError::NonUtf8 => FetchError::Binary,
+        e => FetchError::GitFailed(e),
+    })
+}
+
+/// Fetch (old, new) contents for a changed file. `Ok(None)` means one
+/// side is binary or unreadable; `Err` means git itself failed.
+/// Added files have an empty old side; deleted files an empty new
+/// side.
 pub fn load_content(
     g: &dyn GitShell,
     spec: &RevSpec,
     file: &ChangedFile,
-) -> Option<(String, String)> {
+) -> Result<Option<(String, String)>, FetchError> {
     let old = match file.status {
         Status::Added => Some(String::new()),
-        _ => fetch_source(g, &spec.old, &file.old_path),
+        _ => match fetch_source(g, spec, &spec.old, &file.old_path) {
+            Ok(s) => Some(s),
+            Err(FetchError::Binary) => None,
+            Err(e) => return Err(e),
+        },
     };
     let new = match file.status {
         Status::Deleted => Some(String::new()),
-        _ => fetch_source(g, &spec.new, &file.new_path),
+        _ => match fetch_source(g, spec, &spec.new, &file.new_path) {
+            Ok(s) => Some(s),
+            Err(FetchError::Binary) => None,
+            Err(e) => return Err(e),
+        },
     };
-    match (old, new) {
-        (None, None) => None,
-        (old, new) => Some((old.unwrap_or_default(), new.unwrap_or_default())),
-    }
+    Ok(match (old, new) {
+        (Some(old), Some(new)) => Some((old, new)),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -571,7 +631,8 @@ mod tests {
             RevSpec {
                 old: Source::Index,
                 new: Source::Worktree,
-                diff_args: vec![]
+                diff_args: vec![],
+                toplevel: String::new()
             }
             .old_label(),
             "index"
@@ -580,7 +641,8 @@ mod tests {
             RevSpec {
                 old: Source::Index,
                 new: Source::Worktree,
-                diff_args: vec![]
+                diff_args: vec![],
+                toplevel: String::new()
             }
             .new_label(),
             "worktree"
@@ -589,7 +651,8 @@ mod tests {
             RevSpec {
                 old: Source::Rev("HEAD".into()),
                 new: Source::Index,
-                diff_args: vec![]
+                diff_args: vec![],
+                toplevel: String::new()
             }
             .old_label(),
             "HEAD"
@@ -668,6 +731,7 @@ mod tests {
             old: Source::Rev("HEAD".into()),
             new: Source::Index,
             diff_args: vec!["--cached".into()],
+            toplevel: String::new(),
         };
         assert_eq!(changed_files(&f, &spec).unwrap().len(), 1);
     }
@@ -681,6 +745,7 @@ mod tests {
             old: Source::Index,
             new: Source::Worktree,
             diff_args: vec![],
+            toplevel: String::new(),
         };
         assert!(matches!(
             changed_files(&f, &spec),
@@ -696,6 +761,7 @@ mod tests {
             old: Source::Index,
             new: Source::Worktree,
             diff_args: vec![],
+            toplevel: String::new(),
         };
         assert_eq!(changed_files(&f, &spec).unwrap(), vec![]);
     }
@@ -712,6 +778,7 @@ mod tests {
             old: Source::Rev("HEAD~1".into()),
             new: Source::Rev("HEAD".into()),
             diff_args: vec![],
+            toplevel: String::new(),
         };
         let file = ChangedFile {
             status: Status::Modified,
@@ -720,7 +787,7 @@ mod tests {
         };
         assert_eq!(
             load_content(&f, &spec, &file),
-            Some(("bar\n".to_string(), "foo\n".to_string()))
+            Ok(Some(("bar\n".to_string(), "foo\n".to_string())))
         );
     }
 
@@ -728,17 +795,25 @@ mod tests {
     fn load_content_index_side() {
         let mut f = FakeGit::default();
         f.set(&["cat-file", "-p", ":a.txt"], Some("staged\n".to_string()));
+        f.set(
+            &["cat-file", "-p", "HEAD:a.txt"],
+            Some("head\n".to_string()),
+        );
         let spec = RevSpec {
             old: Source::Index,
-            new: Source::Worktree,
+            new: Source::Rev("HEAD".into()),
             diff_args: vec![],
+            toplevel: String::new(),
         };
         let file = ChangedFile {
             status: Status::Modified,
             old_path: "a.txt".into(),
             new_path: "a.txt".into(),
         };
-        assert_eq!(load_content(&f, &spec, &file).unwrap().0, "staged\n");
+        assert_eq!(
+            load_content(&f, &spec, &file).unwrap().unwrap().0,
+            "staged\n"
+        );
     }
 
     #[test]
@@ -746,27 +821,41 @@ mod tests {
         let path = std::env::temp_dir().join(format!("vdiff-wt-{}", std::process::id()));
         std::fs::write(&path, "disk\n").unwrap();
         let spec = RevSpec {
-            old: Source::Rev("HEAD".into()),
+            old: Source::Index,
             new: Source::Worktree,
             diff_args: vec![],
+            toplevel: std::env::temp_dir().to_str().unwrap().to_string(),
         };
         let file = ChangedFile {
             status: Status::Modified,
-            old_path: path.to_str().unwrap().to_string(),
-            new_path: path.to_str().unwrap().to_string(),
+            old_path: path.file_name().unwrap().to_str().unwrap().to_string(),
+            new_path: path.file_name().unwrap().to_str().unwrap().to_string(),
         };
-        let f = FakeGit::default();
-        assert_eq!(load_content(&f, &spec, &file).unwrap().1, "disk\n");
+        let mut f = FakeGit::default();
+        f.set(
+            &["cat-file", "-p", &format!(":{}", file.old_path)],
+            Some("staged\n".to_string()),
+        );
+        assert_eq!(load_content(&f, &spec, &file).unwrap().unwrap().1, "disk\n");
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn load_content_added_and_deleted_sides_are_empty() {
-        let f = FakeGit::default();
+        let mut f = FakeGit::default();
+        f.set(
+            &["cat-file", "-p", "HEAD:new.txt"],
+            Some("text\n".to_string()),
+        );
+        f.set(
+            &["cat-file", "-p", "HEAD:gone.txt"],
+            Some("gone\n".to_string()),
+        );
         let spec = RevSpec {
             old: Source::Rev("HEAD".into()),
             new: Source::Rev("HEAD".into()),
             diff_args: vec![],
+            toplevel: String::new(),
         };
         let added = ChangedFile {
             status: Status::Added,
@@ -775,7 +864,7 @@ mod tests {
         };
         assert_eq!(
             load_content(&f, &spec, &added),
-            Some(("".to_string(), "".to_string()))
+            Ok(Some(("".to_string(), "text\n".to_string())))
         );
         let deleted = ChangedFile {
             status: Status::Deleted,
@@ -784,23 +873,108 @@ mod tests {
         };
         assert_eq!(
             load_content(&f, &spec, &deleted),
-            Some(("".to_string(), "".to_string()))
+            Ok(Some(("gone\n".to_string(), "".to_string())))
         );
     }
 
     #[test]
-    fn load_content_binary_is_none() {
-        let f = FakeGit::default(); // cat-file → None (non-UTF-8)
+    fn load_content_binary_added_is_none_not_blank() {
+        // A binary file added to the repo must read as "binary or
+        // unreadable", not as an empty pair that renders a blank pane.
+        let mut f = FakeGit::default();
+        f.set_binary(&["cat-file", "-p", "HEAD:bin.dat"]);
         let spec = RevSpec {
             old: Source::Rev("HEAD".into()),
             new: Source::Rev("HEAD".into()),
             diff_args: vec![],
+            toplevel: String::new(),
+        };
+        let added = ChangedFile {
+            status: Status::Added,
+            old_path: "bin.dat".into(),
+            new_path: "bin.dat".into(),
+        };
+        assert_eq!(load_content(&f, &spec, &added), Ok(None));
+    }
+
+    #[test]
+    fn load_content_git_failure_is_error() {
+        // A failed fetch (submodule, missing blob) is not "binary";
+        // the caller must be able to show git's message.
+        let mut f = FakeGit::default();
+        f.set_failure(
+            &["cat-file", "-p", "HEAD:sm"],
+            "fatal: Not a valid object name :sm",
+        );
+        let spec = RevSpec {
+            old: Source::Rev("HEAD".into()),
+            new: Source::Rev("HEAD".into()),
+            diff_args: vec![],
+            toplevel: String::new(),
+        };
+        let file = ChangedFile {
+            status: Status::Modified,
+            old_path: "sm".into(),
+            new_path: "sm".into(),
+        };
+        let err = load_content(&f, &spec, &file).unwrap_err();
+        assert!(err.to_string().contains("Not a valid object name"));
+    }
+
+    #[test]
+    fn load_content_worktree_joins_repo_root() {
+        // `git diff --name-status` reports paths relative to the repo
+        // root; the worktree read must join them against it.
+        let dir = std::env::temp_dir().join(format!("vdiff-root-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/a.txt"), "disk\n").unwrap();
+        let spec = RevSpec {
+            old: Source::Rev("HEAD".into()),
+            new: Source::Worktree,
+            diff_args: vec![],
+            toplevel: dir.to_str().unwrap().to_string(),
+        };
+        let file = ChangedFile {
+            status: Status::Modified,
+            old_path: "sub/a.txt".into(),
+            new_path: "sub/a.txt".into(),
+        };
+        let mut f = FakeGit::default();
+        f.set(
+            &["cat-file", "-p", ":sub/a.txt"],
+            Some("staged\n".to_string()),
+        );
+        f.set(
+            &["cat-file", "-p", "HEAD:sub/a.txt"],
+            Some("old\n".to_string()),
+        );
+        assert_eq!(load_content(&f, &spec, &file).unwrap().unwrap().1, "disk\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_content_binary_is_none() {
+        let mut f = FakeGit::default();
+        f.set_binary(&["cat-file", "-p", "HEAD:bin.dat"]);
+        let spec = RevSpec {
+            old: Source::Rev("HEAD".into()),
+            new: Source::Rev("HEAD".into()),
+            diff_args: vec![],
+            toplevel: String::new(),
         };
         let file = ChangedFile {
             status: Status::Modified,
             old_path: "bin.dat".into(),
             new_path: "bin.dat".into(),
         };
-        assert_eq!(load_content(&f, &spec, &file), None);
+        assert_eq!(load_content(&f, &spec, &file), Ok(None));
+    }
+
+    #[test]
+    fn resolve_rejects_dash_prefixed_revisions() {
+        assert!(matches!(
+            resolve(&g(), false, &["--output=/tmp/x".to_string()]),
+            Err(GitError::InvalidRevSpec(_))
+        ));
     }
 }

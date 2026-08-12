@@ -213,23 +213,23 @@ impl App {
     }
 
     fn reload(&mut self) {
-        let contents = match &self.source {
+        let loaded: Result<Option<(String, String)>, String> = match &self.source {
             DiffSource::Files { old, new } => {
                 match (std::fs::read_to_string(old), std::fs::read_to_string(new)) {
-                    (Ok(a), Ok(b)) => Some((a, b)),
-                    _ => None,
+                    (Ok(a), Ok(b)) => Ok(Some((a, b))),
+                    _ => Ok(None),
                 }
             }
-            DiffSource::Git { files, .. } if files.is_empty() => None,
+            DiffSource::Git { files, .. } if files.is_empty() => Ok(None),
             DiffSource::Git { files, git, spec } => {
                 let idx = self.selection.min(files.len().saturating_sub(1));
-                git::load_content(&**git, spec, &files[idx])
+                git::load_content(&**git, spec, &files[idx]).map_err(|e| e.to_string())
             }
         };
         self.scroll_y = 0;
         self.scroll_x = 0;
-        match contents {
-            Some((old, new)) => {
+        match loaded {
+            Ok(Some((old, new))) => {
                 let grid = diff::compute(&old, &new);
                 self.degraded = grid.degraded;
                 // Display rows depend only on the grid + view mode;
@@ -238,13 +238,18 @@ impl App {
                 self.grid = Some(grid);
                 self.message = None;
             }
-            None => {
+            Ok(None) => {
                 self.grid = None;
                 self.display = None;
                 self.message = Some(match &self.source {
                     DiffSource::Git { files, .. } if files.is_empty() => "no changes".to_string(),
                     _ => "binary or unreadable".to_string(),
                 });
+            }
+            Err(message) => {
+                self.grid = None;
+                self.display = None;
+                self.message = Some(message);
             }
         }
     }
@@ -936,6 +941,7 @@ mod tests {
             old: Source::Rev("HEAD~1".into()),
             new: Source::Rev("HEAD".into()),
             diff_args: vec![],
+            toplevel: String::new(),
         };
         App::new(DiffSource::Git {
             spec,

@@ -236,6 +236,32 @@ fn git_mode_three_dot_range() {
 }
 
 #[test]
+fn git_mode_from_subdirectory_reads_worktree() {
+    // `git diff --name-status` reports paths relative to the repo
+    // root (here "sub/s.txt"); the worktree read must join them
+    // against it, or a run from a subdirectory would show the new
+    // content as missing.
+    let (repo, _) = make_repo();
+    std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+    std::fs::write(repo.path().join("sub/s.txt"), "foo\nbar baz\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(
+        repo.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "two"],
+    );
+    std::fs::write(repo.path().join("sub/s.txt"), "foo\nbar qaz\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
+        .arg("git")
+        .current_dir(repo.path().join("sub"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.starts_with("=== sub/s.txt ===\n"), "got {stdout:?}");
+    assert!(stdout.contains("-|+|\n"), "got {stdout:?}");
+}
+
+#[test]
 fn git_mode_outside_repo_fails() {
     let dir = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_vdiff"))
