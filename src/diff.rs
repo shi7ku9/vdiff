@@ -296,11 +296,14 @@ pub(crate) fn step_width(step: &Step) -> usize {
 }
 
 /// Pad count for one cell: `col_w` cells minus the char's own width.
-/// Zero-width chars (ZWJ, combining marks) count as 1 cell so a pad
-/// space is never inserted inside a grapheme cluster. The pad lands
-/// after the char, keeping the cell left-aligned.
+/// Zero-width chars (ZWJ, combining marks) get no pad: a space after
+/// them would break the grapheme cluster they belong to (the pad
+/// lands after the char, keeping the cell left-aligned).
 pub(crate) fn cell_pad(c: char, col_w: usize) -> usize {
-    col_w.saturating_sub(c.width().unwrap_or(0).max(1))
+    match c.width() {
+        Some(0) => 0,
+        _ => col_w.saturating_sub(c.width().unwrap_or(1)),
+    }
 }
 
 /// Insert `|` after each step marked in `boundaries`, padding every
@@ -717,6 +720,18 @@ mod tests {
         // the 👨‍👩 emoji cluster and break it into separate glyphs.
         let s = "👨\u{200D}👩\n";
         assert_eq!(render_text(&compute(s, s)), s);
+    }
+
+    #[test]
+    fn render_text_keeps_zwj_cluster_intact_in_wide_column() {
+        // A wide char in the ZWJ's column widens it to 2 cells; the
+        // ZWJ must still get no pad, or the family splits apart.
+        let s = "👨\u{200D}👩\n中中\n";
+        let rendered = render_text(&compute(s, s));
+        assert!(
+            rendered.contains("👨\u{200D}👩"),
+            "cluster must stay glued: {rendered:?}"
+        );
     }
 
     #[test]

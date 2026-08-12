@@ -1018,6 +1018,22 @@ mod tests {
     }
 
     #[test]
+    fn zwj_cluster_stays_glued_in_wide_column() {
+        // The ZWJ's column is 2 cells wide (the 中 line); a pad space
+        // after the ZWJ would push the following emoji apart.
+        let s = "👨\u{200D}👩\n中中\n";
+        let (mut app, a, b) = files_app(s, s);
+        let backend = draw(&mut app);
+        let buf = backend.buffer();
+        // ratatui stores the whole grapheme cluster in one cell; a pad
+        // space between the ZWJ and the following emoji would split it
+        // into separate symbols.
+        assert_eq!(buf[(1, 2)].symbol(), "👨\u{200D}👩");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
     fn cjk_separators_stay_aligned_when_scrolled_into_wide_char() {
         // Content wider than the pane, so the clamp lets scroll_x in.
         let block = "中文abc"; // 9 cells
