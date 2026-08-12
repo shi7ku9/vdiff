@@ -273,11 +273,16 @@ impl App {
 
     fn max_scroll_y(&self) -> usize {
         let (h, _) = self.content_dims();
-        // The bordered diff pane's inner area is pane_height - 2 rows;
-        // the sticky marker row occupies one of them in normal view,
-        // leaving pane_height - 3 content rows visible. Clamp against
-        // that window so the bottom rows of a tall diff are reachable.
-        h.saturating_sub(self.pane_height.saturating_sub(3))
+        // The bordered diff pane's inner area is pane_height - 2 rows.
+        // Normal view pins a sticky marker row on one of them, so
+        // pane_height - 3 content rows are visible; transposed view
+        // has no marker row and shows pane_height - 2.
+        let visible = if self.transposed {
+            self.pane_height.saturating_sub(2)
+        } else {
+            self.pane_height.saturating_sub(3)
+        };
+        h.saturating_sub(visible)
     }
 
     fn max_scroll_x(&self) -> usize {
@@ -330,6 +335,11 @@ impl App {
         // only after a state-changing key triggers a redraw).
         self.pane_width = diff_area.width as usize;
         self.pane_height = diff_area.height as usize;
+        // A resize or a sidebar toggle can shrink the pane below the
+        // current scroll; re-clamp here so every frame heals it (a
+        // stale scroll_y after `G` + enlarge would blank the pane).
+        self.scroll_y = self.scroll_y.min(self.max_scroll_y());
+        self.scroll_x = self.scroll_x.min(self.max_scroll_x());
         if let Some(area) = sidebar_area {
             self.render_sidebar(frame, area);
         }
@@ -387,45 +397,42 @@ impl App {
                     return;
                 };
                 let rows = &disp.rows;
+                // Row windows are computed in usize: u16 would wrap
+                // around for diffs taller than 65535 rows and blank
+                // out the bottom. `y` is in the frame by the time it
+                // is cast.
+                let top = usize::from(inner.y);
+                let bottom = top + usize::from(inner.height);
                 if self.transposed {
                     for (i, row) in rows.iter().enumerate() {
                         // saturating: rows scrolled past the top clamp to
                         // 0 and are skipped below (plain subtraction would
-                        // underflow u16 in debug builds).
-                        let y = inner
-                            .y
-                            .saturating_add(i as u16)
-                            .saturating_sub(self.scroll_y as u16);
-                        if y < inner.y {
+                        // underflow).
+                        let y = top.saturating_add(i).saturating_sub(self.scroll_y);
+                        if y < top {
                             continue;
                         }
-                        if y >= inner.y + inner.height {
+                        if y >= bottom || y >= usize::from(u16::MAX) {
                             break;
                         }
-                        self.draw_step_row(frame, inner, y, row);
+                        self.draw_step_row(frame, inner, y as u16, row);
                     }
                 } else {
                     if let Some(marker) = rows.first() {
                         self.draw_marker_row(frame, inner, inner.y, marker);
                     }
                     for (i, row) in rows.iter().enumerate().skip(1) {
-                        // saturating: rows scrolled past the top clamp to
-                        // 0 and are skipped below (plain subtraction would
-                        // underflow u16 in debug builds).
-                        let y = inner
-                            .y
-                            .saturating_add(i as u16)
-                            .saturating_sub(self.scroll_y as u16);
+                        let y = top.saturating_add(i).saturating_sub(self.scroll_y);
                         // Content rows live below the sticky marker row:
-                        // y == inner.y is the marker's row and must not be
+                        // y == top is the marker's row and must not be
                         // overwritten once the user scrolls.
-                        if y <= inner.y {
+                        if y <= top {
                             continue;
                         }
-                        if y >= inner.y + inner.height {
+                        if y >= bottom || y >= usize::from(u16::MAX) {
                             break;
                         }
-                        self.draw_content_row(frame, inner, y, row);
+                        self.draw_content_row(frame, inner, y as u16, row);
                     }
                 }
             }
@@ -1000,7 +1007,12 @@ mod tests {
 
     #[test]
     fn cjk_separators_stay_aligned_when_scrolled_into_wide_char() {
-        let (mut app, a, b) = files_app("中文abc\n", "中日abc\n");
+        // Content wider than the pane, so the clamp lets scroll_x in.
+        let block = "中文abc"; // 9 cells
+        let (mut app, a, b) = files_app(
+            &format!("{}\n", block.repeat(10)),
+            &format!("{}\n", block.replace("文", "日").repeat(10)),
+        );
         for scroll_x in [1, 4] {
             // scroll_x cuts inside a wide char (中 at cells 0-1, 文 at
             // 3-4): it is skipped whole, so the first drawn char sits
@@ -1135,6 +1147,64 @@ mod tests {
         let (mut app, a, b) = files_app(&old, &new);
         let _ = draw(&mut app); // sets pane_width from the real rect (80)
         assert_eq!(app.max_scroll_x(), 22);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn scroll_reclamps_after_pane_grows() {
+        // `G` at the bottom of a small pane leaves scroll_y beyond the
+        // window of a taller pane; render must re-clamp it, or the
+        // whole pane renders blank.
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 1..=50 {
+            old.push_str(&format!("L{i:02}\n"));
+            new.push_str(&format!("L{i:02}\n"));
+        }
+        old.push_str("L51\n");
+        new.push_str("X51\n");
+        let (mut app, a, b) = files_app(&old, &new);
+        let mut small = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        small.draw(|frame| app.render(frame)).unwrap();
+        app.handle_key(key(KeyCode::Char('G')));
+        assert!(app.scroll_y > 0);
+        let backend = draw(&mut app);
+        assert_eq!(app.scroll_y, app.max_scroll_y(), "scroll must re-clamp");
+        let buf = backend.buffer();
+        assert_eq!(buf[(3, 21)].symbol(), "X", "bottom row visible");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn scroll_x_reclamps_after_sidebar_toggle() {
+        // The sidebar shrinks the pane; a scroll_x set for the
+        // full-width layout must be clamped by the next render.
+        let line = "a".repeat(200) + "\n";
+        let mut app = git_app(vec![(&line, &line)]);
+        let _ = draw(&mut app); // with sidebar: narrow pane
+        app.scroll_x = 150; // beyond the sidebar layout's window
+        let _ = draw(&mut app);
+        assert_eq!(app.scroll_x, app.max_scroll_x());
+    }
+
+    #[test]
+    fn transposed_view_reaches_bottom_step() {
+        // Transposed view has no sticky marker row, so its clamp is
+        // pane_height - 2: the last step row can sit on the bottom.
+        let old = format!("{}\n", "a".repeat(100));
+        let new = format!("{}\n", "b".repeat(100));
+        let (mut app, a, b) = files_app(&old, &new);
+        let _ = draw(&mut app); // pane_height = 23
+        app.handle_key(key(KeyCode::Char('t')));
+        let _ = draw(&mut app);
+        assert_eq!(app.max_scroll_y(), 200 - (23 - 2)); // 200 steps
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.scroll_y, app.max_scroll_y());
+        let backend = draw(&mut app);
+        let buf = backend.buffer();
+        assert_eq!(buf[(1, 21)].symbol(), "+", "last step on the bottom");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
