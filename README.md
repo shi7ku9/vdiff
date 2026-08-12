@@ -141,7 +141,7 @@ Requires a Rust toolchain (edition 2024). Git mode requires the `git` binary.
 ## Fun facts
 
 - The diff engine is a classic LCS over columns, with common prefix/suffix trimmed first. Typical diffs only touch a handful of columns.
-- Files that are very wide on both sides degrade gracefully: when the product of the two middle widths would exceed 10,000,000 columns, the LCS table is skipped and the middle columns are treated as one big change (the status bar tells you).
-- CRLF, UTF-8, and CJK characters are handled; multi-byte characters never get split mid-character.
+- Files that are very wide on both sides degrade gracefully: when the product of the two middle widths would exceed 1,000,000 columns, the LCS table is skipped and the middle columns are treated as one big change (the status bar tells you).
+- CRLF, UTF-8, and CJK characters are handled; multi-byte characters never get split mid-character. Tabs expand to the next tab stop (8) so columns line up, and a missing trailing newline shows as a `↵` column.
 
 Enjoy looking at your diffs sideways.
