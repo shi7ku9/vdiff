@@ -30,7 +30,7 @@ fn run_plain(cli: &cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         cli::Command::Git { cached, revs } => {
             let g = git::RealGit;
-            if !git::in_repo(&g) {
+            if !git::in_repo(&g)? {
                 return Err(Box::new(git::GitError::NotARepo));
             }
             let spec = git::resolve(&g, *cached, revs)?;

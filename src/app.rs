@@ -127,7 +127,7 @@ impl DiffSource {
             }),
             crate::cli::Command::Git { cached, revs } => {
                 let g: Box<dyn GitShell> = Box::new(git::RealGit);
-                if !git::in_repo(&*g) {
+                if !git::in_repo(&*g)? {
                     return Err(git::GitError::NotARepo);
                 }
                 let spec = git::resolve(&*g, *cached, revs)?;

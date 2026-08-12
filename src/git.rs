@@ -7,20 +7,80 @@ use std::fmt;
 use std::process::Command;
 
 pub trait GitShell {
-    /// Run git with `args`; `None` on spawn failure, non-zero exit, or
-    /// non-UTF-8 output. `Some("")` is a successful empty output.
-    fn output(&self, args: &[&str]) -> Option<String>;
+    /// Run git with `args`; `Err` on spawn failure, non-zero exit, or
+    /// non-UTF-8 output. `Ok("")` is a successful empty output.
+    fn output(&self, args: &[&str]) -> Result<String, GitRunError>;
+    /// Like `output`, but decodes non-UTF-8 output lossily. Use for
+    /// output that must not fail on exotic bytes (e.g. file lists).
+    fn output_lossy(&self, args: &[&str]) -> Result<String, GitRunError> {
+        self.output(args)
+    }
 }
+
+/// Why a git invocation failed.
+#[derive(Debug, Clone)]
+pub enum GitRunError {
+    /// The git executable could not be spawned (e.g. not on PATH).
+    SpawnFailed,
+    /// git ran but exited non-zero.
+    NonZero {
+        code: Option<i32>,
+        stderr: String,
+    },
+    /// The output was not valid UTF-8.
+    NonUtf8,
+}
+
+impl fmt::Display for GitRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GitRunError::SpawnFailed => write!(f, "could not run git (is it installed?)"),
+            GitRunError::NonZero { code, stderr } => {
+                let code = code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                if stderr.is_empty() {
+                    write!(f, "git exited with status {code}")
+                } else {
+                    write!(f, "git exited with status {code}: {stderr}")
+                }
+            }
+            GitRunError::NonUtf8 => write!(f, "git produced non-UTF-8 output"),
+        }
+    }
+}
+
+impl std::error::Error for GitRunError {}
 
 pub struct RealGit;
 
 impl GitShell for RealGit {
-    fn output(&self, args: &[&str]) -> Option<String> {
-        let out = Command::new("git").args(args).output().ok()?;
+    fn output(&self, args: &[&str]) -> Result<String, GitRunError> {
+        let out = match Command::new("git").args(args).output() {
+            Ok(out) => out,
+            Err(_) => return Err(GitRunError::SpawnFailed),
+        };
         if !out.status.success() {
-            return None;
+            return Err(GitRunError::NonZero {
+                code: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
         }
-        String::from_utf8(out.stdout).ok()
+        String::from_utf8(out.stdout).map_err(|_| GitRunError::NonUtf8)
+    }
+
+    fn output_lossy(&self, args: &[&str]) -> Result<String, GitRunError> {
+        let out = match Command::new("git").args(args).output() {
+            Ok(out) => out,
+            Err(_) => return Err(GitRunError::SpawnFailed),
+        };
+        if !out.status.success() {
+            return Err(GitRunError::NonZero {
+                code: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 
@@ -83,11 +143,21 @@ impl fmt::Display for GitError {
 
 impl std::error::Error for GitError {}
 
+impl From<GitRunError> for GitError {
+    fn from(e: GitRunError) -> Self {
+        GitError::GitFailed(e.to_string())
+    }
+}
+
 /// True when the current directory is inside a git repository.
-pub fn in_repo(g: &dyn GitShell) -> bool {
-    g.output(&["rev-parse", "--git-dir"])
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)
+/// `Ok(false)` for a non-zero exit (outside a repo); other failures
+/// (missing git binary, non-UTF-8 output) are errors.
+pub fn in_repo(g: &dyn GitShell) -> Result<bool, GitRunError> {
+    match g.output(&["rev-parse", "--git-dir"]) {
+        Ok(s) => Ok(!s.is_empty()),
+        Err(GitRunError::NonZero { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// How a rev arg's range separators split it.
@@ -125,8 +195,8 @@ fn kind_len(kind: RangeKind) -> usize {
 
 fn merge_base(g: &dyn GitShell, a: &str, b: &str) -> Result<String, GitError> {
     match g.output(&["merge-base", a, b]) {
-        Some(hash) => Ok(hash.trim().to_string()),
-        None => Err(GitError::MergeBaseFailed(format!("{a}...{b}"))),
+        Ok(hash) => Ok(hash.trim().to_string()),
+        Err(e) => Err(GitError::MergeBaseFailed(format!("{a}...{b}: {e}"))),
     }
 }
 
@@ -134,6 +204,13 @@ fn merge_base(g: &dyn GitShell, a: &str, b: &str) -> Result<String, GitError> {
 /// semantics. `revs` is passed through to git unchanged for the file
 /// list (in `diff_args`).
 pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpec, GitError> {
+    // A revision that looks like an option would be read by git as
+    // one (e.g. --output=<file> writes a diff file).
+    if let Some(bad) = revs.iter().find(|r| r.starts_with('-')) {
+        return Err(GitError::InvalidRevSpec(format!(
+            "revision arguments must not start with '-': {bad}"
+        )));
+    }
     if cached {
         if revs.len() > 1 {
             return Err(GitError::InvalidRevSpec(
@@ -221,20 +298,47 @@ pub fn resolve(g: &dyn GitShell, cached: bool, revs: &[String]) -> Result<RevSpe
 #[cfg(test)]
 #[derive(Default)]
 pub struct FakeGit {
-    map: HashMap<String, Option<String>>,
+    map: HashMap<String, Result<String, GitRunError>>,
 }
 
 #[cfg(test)]
 impl FakeGit {
+    /// Seed a successful answer; `None` seeds a non-zero exit.
     pub fn set(&mut self, args: &[&str], out: Option<String>) {
-        self.map.insert(args.join(" "), out);
+        let result = out.map(Ok).unwrap_or(Err(GitRunError::NonZero {
+            code: Some(1),
+            stderr: "fake failure".to_string(),
+        }));
+        self.map.insert(args.join(" "), result);
+    }
+
+    /// Seed a non-zero exit with the given stderr.
+    pub fn set_failure(&mut self, args: &[&str], stderr: &str) {
+        self.map.insert(
+            args.join(" "),
+            Err(GitRunError::NonZero {
+                code: Some(128),
+                stderr: stderr.to_string(),
+            }),
+        );
+    }
+
+    /// Seed non-UTF-8 output (what git emits for binary blobs).
+    pub fn set_binary(&mut self, args: &[&str]) {
+        self.map.insert(args.join(" "), Err(GitRunError::NonUtf8));
     }
 }
 
 #[cfg(test)]
 impl GitShell for FakeGit {
-    fn output(&self, args: &[&str]) -> Option<String> {
-        self.map.get(&args.join(" ")).cloned().unwrap_or(None)
+    fn output(&self, args: &[&str]) -> Result<String, GitRunError> {
+        self.map
+            .get(&args.join(" "))
+            .cloned()
+            .unwrap_or(Err(GitRunError::NonZero {
+                code: Some(1),
+                stderr: "fake failure".to_string(),
+            }))
     }
 }
 
@@ -253,15 +357,15 @@ pub struct ChangedFile {
     pub new_path: String,
 }
 
-/// Parse `git diff --name-status -z` output: fields NUL-separated (in
-/// real `-z` output) or tab-separated; each file is a status letter
-/// (possibly `R` plus a similarity score) followed by one path, or by
-/// old and new paths for renames/copies. The field stream is
-/// positional — no content sniffing, so a single-letter path cannot be
-/// mistaken for a status. Unknown status letters are treated as
-/// Modified.
+/// Parse `git diff --name-status -z` output: fields NUL-separated,
+/// each file a status letter (possibly `R` plus a similarity score)
+/// followed by one path, or by old and new paths for renames/copies.
+/// Only the NUL separates fields; a tab inside a filename is data.
+/// The field stream is positional — no content sniffing, so a
+/// single-letter path cannot be mistaken for a status. Unknown status
+/// letters are treated as Modified.
 pub fn parse_name_status_z(out: &str) -> Vec<ChangedFile> {
-    let fields: Vec<&str> = out.split(['\0', '\t']).filter(|f| !f.is_empty()).collect();
+    let fields: Vec<&str> = out.split('\0').filter(|f| !f.is_empty()).collect();
     let mut files = Vec::new();
     let mut i = 0;
     while i < fields.len() {
@@ -295,26 +399,28 @@ fn status_of(letter: char) -> Status {
 }
 
 /// The list of changed files for a rev spec, via
-/// `git diff <diff_args> --name-status -z`. `None` from git means the
-/// command FAILED (non-zero exit, e.g. bad rev or `--cached` without a
-/// HEAD) → `Err`; `Some("")` is a genuinely clean tree → `Ok(vec![])`.
+/// `git diff <diff_args> --name-status -z`. An `Err` means the command
+/// FAILED (bad rev, `--cached` without a HEAD, ...); an empty list is
+/// a genuinely clean tree.
 pub fn changed_files(g: &dyn GitShell, spec: &RevSpec) -> Result<Vec<ChangedFile>, GitError> {
     let mut args: Vec<String> = vec!["diff".to_string()];
     args.extend(spec.diff_args.iter().cloned());
     args.push("--name-status".to_string());
     args.push("-z".to_string());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match g.output(&arg_refs) {
-        Some(out) => Ok(parse_name_status_z(&out)),
-        None => Err(GitError::GitFailed("git diff failed".into())),
-    }
+    // Lossy decode: one non-UTF-8 filename must not kill the whole
+    // file list (paths are only displayed, never diffed).
+    let out = g.output_lossy(&arg_refs).map_err(GitError::from)?;
+    Ok(parse_name_status_z(&out))
 }
 
 fn fetch_source(g: &dyn GitShell, src: &Source, path: &str) -> Option<String> {
     match src {
         Source::Worktree => std::fs::read_to_string(path).ok(),
-        Source::Index => g.output(&["cat-file", "-p", &format!(":{path}")]),
-        Source::Rev(rev) => g.output(&["cat-file", "-p", &format!("{rev}:{path}")]),
+        Source::Index => g.output(&["cat-file", "-p", &format!(":{path}")]).ok(),
+        Source::Rev(rev) => g
+            .output(&["cat-file", "-p", &format!("{rev}:{path}")])
+            .ok(),
     }
 }
 
@@ -352,9 +458,9 @@ mod tests {
     #[test]
     fn in_repo_checks_git_dir() {
         let mut f = g();
-        assert!(!in_repo(&f));
+        assert!(!in_repo(&f).unwrap());
         f.set(&["rev-parse", "--git-dir"], Some(".git".to_string()));
-        assert!(in_repo(&f));
+        assert!(in_repo(&f).unwrap());
     }
 
     #[test]
@@ -492,7 +598,7 @@ mod tests {
 
     #[test]
     fn parse_name_status_z_basic() {
-        let out = "M\tsrc/lib.rs\0A\tsrc/main.rs\0D\told.cpp\0R100\ta.cpp\tb.cpp\0";
+        let out = "M\0src/lib.rs\0A\0src/main.rs\0D\0old.cpp\0R100\0a.cpp\0b.cpp\0";
         let files = parse_name_status_z(out);
         assert_eq!(files.len(), 4);
         assert_eq!(files[0].status, Status::Modified);
@@ -503,6 +609,20 @@ mod tests {
         assert_eq!(files[3].status, Status::Renamed);
         assert_eq!(files[3].old_path, "a.cpp");
         assert_eq!(files[3].new_path, "b.cpp");
+    }
+
+    #[test]
+    fn parse_name_status_z_tab_in_filename() {
+        // A literal tab inside a filename is data, not a separator;
+        // splitting on it would cut the path and misalign every
+        // following record.
+        let out = "M\0tab\tname.txt\0A\0other.txt\0";
+        let files = parse_name_status_z(out);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].status, Status::Modified);
+        assert_eq!(files[0].new_path, "tab\tname.txt");
+        assert_eq!(files[1].status, Status::Added);
+        assert_eq!(files[1].new_path, "other.txt");
     }
 
     #[test]
@@ -542,7 +662,7 @@ mod tests {
         let mut f = FakeGit::default();
         f.set(
             &["diff", "--cached", "--name-status", "-z"],
-            Some("M\ta.txt\0".to_string()),
+            Some("M\0a.txt\0".to_string()),
         );
         let spec = RevSpec {
             old: Source::Rev("HEAD".into()),
