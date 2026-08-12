@@ -250,15 +250,22 @@ fn groups_of(ops: &[Step]) -> Vec<Range<usize>> {
 /// Compute the column diff of two file contents (CRLF stripped, tabs
 /// expanded).
 pub fn compute(a: &str, b: &str) -> DiffGrid {
-    let a_lines: Vec<String> = lines_with_trailing(&expand_tabs(a))
+    let a_expanded = expand_tabs(a);
+    let b_expanded = expand_tabs(b);
+    let a_has_trailing = a_expanded.ends_with('\n');
+    let b_has_trailing = b_expanded.ends_with('\n');
+    let trailing_differs = a_has_trailing != b_has_trailing;
+    let a_lines: Vec<String> = lines_with_trailing(&a_expanded)
         .into_iter()
         .map(|line| line.trim_end_matches('\r').to_string())
         .collect();
-    let b_lines: Vec<String> = lines_with_trailing(&expand_tabs(b))
+    let b_lines: Vec<String> = lines_with_trailing(&b_expanded)
         .into_iter()
         .map(|line| line.trim_end_matches('\r').to_string())
         .collect();
-    let height = a_lines.len().max(b_lines.len());
+    // A missing trailing newline is a real difference (git reports it
+    // too); give it its own row and step so it stays visible.
+    let height = a_lines.len().max(b_lines.len()) + usize::from(trailing_differs);
     let a_cols = columns_padded(&a_lines, height);
     // Identical inputs are the common case; build the all-Match grid
     // straight from the columns instead of diffing (and keep the
@@ -274,7 +281,20 @@ pub fn compute(a: &str, b: &str) -> DiffGrid {
         return DiffGrid::from_parts(steps, height, false);
     }
     let b_cols = columns_padded(&b_lines, height);
-    let (steps, degraded) = diff_columns(&a_cols, &b_cols);
+    let (mut steps, degraded) = diff_columns(&a_cols, &b_cols);
+    if trailing_differs {
+        // A column of spaces with a ↵ in the last row: the side that
+        // ends in a newline owns the mark, the kind says which one.
+        let mut content = " ".repeat(height);
+        content.pop();
+        content.push('↵');
+        let kind = if a_has_trailing {
+            StepKind::Delete
+        } else {
+            StepKind::Insert
+        };
+        steps.push(Step { kind, content });
+    }
     DiffGrid::from_parts(steps, height, degraded)
 }
 
@@ -570,7 +590,10 @@ mod tests {
     #[test]
     fn compute_empty_vs_content() {
         let grid = compute("", "foo\nbar\n");
-        assert_eq!(ops_of(&grid), exp(&[("+", "fb"), ("+", "oa"), ("+", "or")]));
+        assert_eq!(
+            ops_of(&grid),
+            exp(&[("+", "fb "), ("+", "oa "), ("+", "or "), ("+", "  ↵")])
+        );
     }
 
     #[test]
@@ -578,6 +601,31 @@ mod tests {
         let grid = compute("", "");
         assert!(grid.steps.is_empty());
         assert_eq!(grid.height, 0);
+    }
+
+    #[test]
+    fn compute_reports_missing_trailing_newline() {
+        // "a\nb" vs "a\nb\n" used to diff as identical; the missing
+        // trailing newline is a synthetic step with a ↵ in its row.
+        let grid = compute("a\nb", "a\nb\n");
+        assert_eq!(ops_of(&grid), exp(&[("=", "ab "), ("+", "  ↵")]));
+        let grid = compute("a\nb\n", "a\nb");
+        assert_eq!(ops_of(&grid).last().unwrap().0, "-");
+    }
+
+    #[test]
+    fn compute_empty_vs_single_newline() {
+        // "" vs "\n": the added empty line's newline shows as a step.
+        let grid = compute("", "\n");
+        assert_eq!(ops_of(&grid), exp(&[("+", " ↵")]));
+    }
+
+    #[test]
+    fn render_text_shows_missing_trailing_newline() {
+        assert_eq!(
+            render_text(&compute("a\nb", "a\nb\n")),
+            " |+\na| \nb| \n |↵\n"
+        );
     }
 
     #[test]
@@ -654,7 +702,10 @@ mod tests {
 
     #[test]
     fn render_text_empty_vs_content() {
-        assert_eq!(render_text(&compute("", "foo\nbar\n")), "+++\nfoo\nbar\n");
+        assert_eq!(
+            render_text(&compute("", "foo\nbar\n")),
+            "++++\nfoo \nbar \n   ↵\n"
+        );
     }
 
     #[test]
@@ -783,8 +834,9 @@ mod tests {
     #[test]
     fn render_text_all_insert() {
         let grid = compute("", "foo\nbar\nquux\n");
-        // "quux" is 4 chars wide, so there are 4 insert columns ("++++").
-        assert_eq!(render_text(&grid), "++++\nfoo \nbar \nquux\n");
+        // 4 insert columns ("++++"), plus the synthetic step for the
+        // trailing newline the empty side does not have.
+        assert_eq!(render_text(&grid), "+++++\nfoo  \nbar  \nquux \n    ↵\n");
     }
 
     #[test]
