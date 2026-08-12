@@ -379,7 +379,7 @@ pub fn render_text(grid: &DiffGrid) -> String {
         .map(|s| {
             let mut line = String::with_capacity(grid.height + 1);
             line.push(op_prefix(s.kind));
-            line.extend(s.content.chars());
+            line.push_str(&s.content);
             // content is a String; chars() gives the char count.
             for _ in s.content.chars().count()..grid.height {
                 line.push(' ');
@@ -432,7 +432,7 @@ pub fn render_transposed(grid: &DiffGrid) -> String {
     for step in &grid.steps {
         out.push(op_prefix(step.kind));
         out.push(' ');
-        out.extend(step.content.chars());
+        out.push_str(&step.content);
         out.push('\n');
     }
     out

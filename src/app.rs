@@ -751,7 +751,7 @@ fn transposed_rows(grid: &DiffGrid) -> Vec<String> {
                 StepKind::Insert => '+',
             });
             line.push(' ');
-            line.extend(s.content.chars());
+            line.push_str(&s.content);
             line
         })
         .collect()
