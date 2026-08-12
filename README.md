@@ -43,63 +43,6 @@ in|au|t| main() {      |o main() -> int| |{|        |  |
 
 The first row is the **marker row**: `-`/`+` mark the columns that changed. The `|` separators group runs of changes; the one between `-` and `+` separates the delete run and insert run of the same changed column. Each following row is one line of the file, with the old and new characters of each changed column shown side by side.
 
-`vdiff` can also show the diff the way it actually computes it: a stack of columns, one row per diff step:
-
-```
-- # i  }
-- i n   
-+ # a  }
-+ i u   
-  n tsr 
-- c  te 
-- l mdt 
-- u a:u 
-- d i:r 
-- e npn 
--   (r  
-- < )i0 
-- c  n; 
-- s {t  
-- t  f  
-- d  (  
-- i  "  
-- o  H  
-- >  e  
--    l  
-+ c ote 
-+ l  dt 
-+ u m:u 
-+ d a:r 
-+ e ipn 
-+   nr  
-+ < (i0 
-+ p )n; 
-+ r  t  
-+ i -l  
-+ n >n  
-+ t  (  
-+ > i"  
-+   nH  
-+   te  
-     l  
-+   {l  
-     o  
-     ,  
-        
-     W  
-     o  
-     r  
-     l  
-     d  
--    \  
--    n  
-     "  
-     )  
-     ;  
-```
-
-Press `t` in the TUI to flip between the two views. Reading the file 90° rotated is the full counterintuitive experience.
-
 ## Usage
 
 ```console
@@ -125,7 +68,6 @@ When stdout is not a terminal, `vdiff` prints plain text instead of opening the 
 | `Tab` / `Shift-Tab` | move the file selection (git mode; the diff updates live) |
 | `n` / `p` | jump to the next / previous change group |
 | `g` / `G` | scroll to top / bottom |
-| `t` | toggle the transposed view (columns as rows) |
 | `e` | toggle the file sidebar (git mode) |
 | `q` / `Ctrl-C` | quit |
 
