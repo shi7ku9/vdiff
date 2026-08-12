@@ -219,8 +219,8 @@ impl App {
             Ok(Some((old, new))) => {
                 let grid = diff::compute(&old, &new);
                 self.degraded = grid.degraded;
-                // Display rows depend only on the grid + view mode;
-                // build them once here instead of on every frame.
+                // Display rows depend only on the grid; build them
+                // once here instead of on every frame.
                 self.display = Some(build_display(&grid));
                 self.grid = Some(grid);
                 self.message = None;
@@ -248,7 +248,7 @@ impl App {
             return (0, 0);
         };
         // Rows and their display width are precomputed in
-        // `build_display`; the height depends only on the view mode.
+        // `build_display`; the height is the grid height.
         let Some(disp) = &self.display else {
             return (0, 0);
         };
@@ -270,23 +270,7 @@ impl App {
         w.saturating_sub(self.pane_width.saturating_sub(2))
     }
 
-    /// Rebuild the cached display rows when they are missing. Returns
-    /// true when a rebuild happened so the caller can treat that as a
-    /// state change (and redraw).
-    fn ensure_display(&mut self) -> bool {
-        let Some(grid) = &self.grid else {
-            return false;
-        };
-        if self.display.is_none() {
-            self.display = Some(build_display(grid));
-            true
-        } else {
-            false
-        }
-    }
-
     pub fn render(&mut self, frame: &mut Frame<'_>) {
-        self.ensure_display();
         let area = frame.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -496,10 +480,6 @@ impl App {
     /// whether the visible state changed (only then must the screen be
     /// redrawn).
     pub fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
-        // A rebuild here counts as a state change (e.g. after a reload
-        // failure cleared the display), so the screen redraws even if
-        // no key-visible field changed.
-        let rebuilt = self.ensure_display();
         // Uppercase C too: some terminals report Ctrl+Shift+C as
         // Char('C') + CONTROL|SHIFT (kitty protocol).
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -519,7 +499,7 @@ impl App {
         {
             return KeyResult {
                 quit: false,
-                changed: rebuilt,
+                changed: false,
             };
         }
         let before = (
@@ -557,7 +537,7 @@ impl App {
         );
         KeyResult {
             quit: false,
-            changed: before != after || rebuilt,
+            changed: before != after,
         }
     }
 
