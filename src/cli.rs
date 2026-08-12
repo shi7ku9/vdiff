@@ -51,6 +51,7 @@ struct RawCli {
 /// The git subcommand surface, mirroring [`Command::Git`].
 #[derive(Debug, Subcommand)]
 enum RawCommand {
+    /// Diff revisions of a git repository (git diff semantics)
     #[command(name = "git")]
     Git {
         /// Compare the index against the given revision (default: HEAD)
