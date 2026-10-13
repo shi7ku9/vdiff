@@ -16,8 +16,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Check changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run_rust: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.rust == 'true' }}
+    steps:
+      - name: Check out history for push detection
+        if: github.event_name == 'push'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect changes outside documentation
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          predicate-quantifier: every
+          filters: |
+            rust:
+              - '**'
+              - '!docs/**'
+              - '!README.md'
+
   lint:
     name: Format and Clippy
+    needs: changes
+    # Run Rust checks if path detection fails; docs-only runs skip this job.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run_rust == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -34,6 +65,8 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }})
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run_rust == 'true') }}
     strategy:
       fail-fast: false
       matrix:
