@@ -49,6 +49,11 @@ file content, and empty space down to the bottom of the diff pane.
 Unchanged columns use the terminal's default
 colors, and group separators stay neutral.
 
+Standalone combining marks use a dotted circle as a display base (`◌́`, `◌̈`)
+so edits to accents remain visible. Changes consisting only of filtered control
+characters are shown as Unicode code points, such as `U+000D`. These are TUI
+representations; the source files are unchanged.
+
 ## Usage
 
 ```console

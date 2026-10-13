@@ -13,8 +13,10 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Display rows for the TUI: rows[0] is the marker row (one marker per
 /// display block, `|` between groups, padded to the full content
@@ -71,10 +73,11 @@ fn build_display(grid: &DiffGrid) -> Display {
         // complete glyphs and one shared layout across unlike file lines.
         let mut boundaries = vec![true; group.len() + 1];
         for text in &group_rows {
-            let span = Span::raw(text.as_str());
             let mut step = 0;
-            for grapheme in span.styled_graphemes(Style::default()) {
-                let end = step + grapheme.symbol.chars().count();
+            // Keep raw scalar offsets here: styled_graphemes filters
+            // controls, but row_chars below consumes the original text.
+            for grapheme in text.graphemes(true) {
+                let end = step + grapheme.chars().count();
                 boundaries[step + 1..end].fill(false);
                 step = end;
             }
@@ -89,6 +92,7 @@ fn build_display(grid: &DiffGrid) -> Display {
                 .iter_mut()
                 .map(|chars| {
                     let text: String = chars.by_ref().take(end - start).collect();
+                    let text = visible_block(&text, kind);
                     let width = rendered_width(&text);
                     (text, width)
                 })
@@ -128,13 +132,45 @@ fn build_display(grid: &DiffGrid) -> Display {
     }
 }
 
+/// Give standalone zero-width glyphs a base so they cannot attach to
+/// separators or padding. Filter controls only after raw layout boundaries
+/// have been recorded; control-only edits still need a visible indication.
+fn visible_block(text: &str, kind: StepKind) -> String {
+    let mut visible = String::with_capacity(text.len());
+    for grapheme in text.graphemes(true) {
+        if grapheme.chars().any(char::is_control) {
+            // Keep raw boundaries until drawing. Removing a control here
+            // could join glyphs on either side into a different grapheme.
+            visible.push_str(grapheme);
+            continue;
+        }
+        if Span::raw(grapheme).width() == 0 {
+            visible.push('◌');
+        }
+        visible.push_str(grapheme);
+    }
+    if rendered_width(&visible) == 0 && kind != StepKind::Match {
+        visible.clear();
+        for c in text.chars() {
+            if !visible.is_empty() {
+                visible.push(' ');
+            }
+            write!(visible, "U+{:04X}", u32::from(c)).unwrap();
+        }
+    }
+    visible
+}
+
 /// Use the same grapheme widths and control filtering as the renderer.
 fn rendered_width(text: &str) -> usize {
-    Span::raw(text)
-        .styled_graphemes(Style::default())
-        .filter(|grapheme| !grapheme.symbol.chars().any(char::is_control))
-        .map(|grapheme| Span::raw(grapheme.symbol).width())
-        .sum()
+    rendered_graphemes(text).map(|(_, width)| width).sum()
+}
+
+fn rendered_graphemes(text: &str) -> impl Iterator<Item = (&str, usize)> {
+    text.graphemes(true)
+        .filter(|grapheme| !grapheme.chars().any(char::is_control))
+        .map(|grapheme| (grapheme, Span::raw(grapheme).width()))
+        .filter(|(_, width)| *width > 0)
 }
 
 pub enum DiffSource {
@@ -456,18 +492,26 @@ impl App {
         kinds: &[Option<StepKind>],
     ) {
         let scroll_x = self.scroll_x;
-        let (visible, first_cell) = slice_by_width(row, scroll_x, inner.width as usize);
-        // A wide char straddling the scroll boundary is skipped whole,
-        // so the first drawn char may sit past the viewport start; the
-        // offset keeps this row's grid cells under the same viewport
-        // columns as the (all-width-1) marker row.
-        let x = inner.x + (first_cell - scroll_x) as u16;
-        // Draw the text together to preserve grapheme clusters, then style
-        // display cells. This also colors wide-character continuation cells
-        // and blank cells where a wide character was clipped at either edge.
-        frame
-            .buffer_mut()
-            .set_string(x, y, &visible, Style::default());
+        let right = scroll_x + usize::from(inner.width);
+        let mut pos = 0;
+        // Draw complete graphemes at their cached layout positions. Do not
+        // concatenate across filtered controls and re-segment the result.
+        for (grapheme, width) in rendered_graphemes(row) {
+            let end = pos + width;
+            if end > right {
+                break;
+            }
+            if pos >= scroll_x {
+                frame.buffer_mut().set_string(
+                    inner.x + (pos - scroll_x) as u16,
+                    y,
+                    grapheme,
+                    Style::default(),
+                );
+            }
+            pos = end;
+        }
+        // Restore styles in wide-glyph continuation and clipped cells.
         for (offset, kind) in kinds
             .iter()
             .skip(scroll_x)
@@ -711,15 +755,7 @@ pub fn slice_by_width(s: &str, start: usize, max_width: usize) -> (String, usize
     let mut out = String::new();
     let mut first = start;
     let mut pos = 0usize;
-    let span = Span::raw(s);
-    for grapheme in span.styled_graphemes(Style::default()) {
-        if grapheme.symbol.chars().any(char::is_control) {
-            continue;
-        }
-        let w = Span::raw(grapheme.symbol).width();
-        if w == 0 {
-            continue;
-        }
+    for (grapheme, w) in rendered_graphemes(s) {
         if pos + w <= start {
             pos += w;
             continue;
@@ -733,7 +769,7 @@ pub fn slice_by_width(s: &str, start: usize, max_width: usize) -> (String, usize
             if out.is_empty() {
                 first = pos;
             }
-            out.push_str(grapheme.symbol);
+            out.push_str(grapheme);
             pos += w;
         } else {
             break;
@@ -785,6 +821,194 @@ mod tests {
             );
             assert_eq!(display.width, rendered_width(prefix) + 4);
         }
+    }
+
+    #[test]
+    fn combining_only_edits_keep_visible_markers_and_backgrounds() {
+        let grid = compute("e\u{301}\n", "e\u{308}\n");
+        let display = build_display(&grid);
+        assert_eq!(display.rows, [" |-|+", "e|◌\u{301}|◌\u{308}"]);
+        assert_eq!(display.group_end_offsets, [2, 4, 5]);
+        let (mut app, a, b) = files_app("e\u{301}\n", "e\u{308}\n");
+        let buf = draw_buffer(&mut app);
+        assert_column_backgrounds_align(&buf);
+        assert_eq!(buf[(3, 1)].symbol(), "-");
+        assert_eq!(buf[(3, 2)].symbol(), "◌\u{301}");
+        assert_eq!(buf[(3, 2)].bg, Color::Red);
+        assert_eq!(buf[(5, 1)].symbol(), "+");
+        assert_eq!(buf[(5, 2)].symbol(), "◌\u{308}");
+        assert_eq!(buf[(5, 2)].bg, Color::Green);
+        for x in [2, 4] {
+            assert_eq!(buf[(x, 2)].symbol(), "|");
+            assert_eq!(buf[(x, 2)].bg, Color::Reset);
+        }
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn control_prefix_keeps_raw_grapheme_boundaries() {
+        let text = "\ra\u{301}x\n中bcx\n";
+        let display = build_display(&compute(text, text));
+        assert!(
+            display.rows[1].contains("a\u{301}"),
+            "{:?}",
+            display.rows[1]
+        );
+        assert_eq!(
+            slice_by_width(&display.rows[1], 0, display.width).0,
+            "  a\u{301} x"
+        );
+        assert_eq!(display.rows[2], "中bcx");
+        for row in &display.rows {
+            assert_eq!(rendered_width(row), display.width);
+        }
+        let (mut app, a, b) = files_app(text, text);
+        let buf = draw_buffer(&mut app);
+        assert_eq!(buf[(3, 2)].symbol(), "a\u{301}");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn pure_combining_additions_and_deletions_are_visible() {
+        for (old, new, color, mark) in [
+            ("", "\u{301}\n", Color::Green, "+"),
+            ("\u{301}\n", "", Color::Red, "-"),
+        ] {
+            let (mut app, a, b) = files_app(old, new);
+            let buf = draw_buffer(&mut app);
+            assert_column_backgrounds_align(&buf);
+            assert_eq!(buf[(1, 1)].symbol(), mark);
+            assert_eq!(buf[(1, 2)].symbol(), "◌\u{301}");
+            assert_eq!(buf[(1, 2)].bg, color);
+            assert_eq!(buf[(1, 21)].bg, color);
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+        }
+    }
+
+    #[test]
+    fn orphan_marks_are_visible_when_other_rows_have_nonzero_width() {
+        let (mut app, a, b) = files_app("e\u{301}\nex\n", "e\u{308}\ney\n");
+        let display = app.display.as_ref().unwrap();
+        assert_eq!(display.rows, [" |-|+", "e|◌\u{301}|◌\u{308}", "e|x|y"]);
+        let buf = draw_buffer(&mut app);
+        assert_column_backgrounds_align(&buf);
+        assert_eq!(buf[(3, 2)].symbol(), "◌\u{301}");
+        assert_eq!(buf[(5, 2)].symbol(), "◌\u{308}");
+        for y in [2, 3] {
+            assert_eq!(buf[(3, y)].bg, Color::Red);
+            assert_eq!(buf[(5, y)].bg, Color::Green);
+            assert_eq!(buf[(2, y)].symbol(), "|");
+            assert_eq!(buf[(4, y)].symbol(), "|");
+        }
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn multiple_controls_preserve_combining_and_zwj_boundaries() {
+        let text = "\r\u{7}a\u{301}x\n中abcx\n";
+        let display = build_display(&compute(text, text));
+        assert_eq!(
+            slice_by_width(&display.rows[1], 0, display.width).0,
+            "   a\u{301} x"
+        );
+        assert_eq!(display.rows[2], "中abcx");
+        for row in &display.rows {
+            assert_eq!(rendered_width(row), display.width);
+        }
+
+        let prefix = "\r\u{7}👩‍❤️‍👩\r";
+        let grid = compute(&format!("{prefix}x\n"), &format!("{prefix}y\n"));
+        let display = build_display(&grid);
+        assert_eq!(display.rows[0], "  |-|+");
+        assert_eq!(
+            slice_by_width(&display.rows[1], 0, display.width).0,
+            "👩‍❤️‍👩|x|y"
+        );
+        assert_eq!(display.width, 6);
+        let (mut app, a, b) = files_app(&format!("{prefix}x\n"), &format!("{prefix}y\n"));
+        let buf = draw_buffer(&mut app);
+        assert_column_backgrounds_align(&buf);
+        assert_eq!(buf[(1, 2)].symbol(), "👩‍❤️‍👩");
+        assert_eq!(buf[(4, 2)].symbol(), "x");
+        assert_eq!(buf[(6, 2)].symbol(), "y");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn filtered_controls_do_not_join_neighboring_graphemes() {
+        let prefix = "🇺\r🇸";
+        let (mut app, a, b) = files_app(&format!("{prefix}x\n"), &format!("{prefix}y\n"));
+        let left_width = Span::raw("🇺").width() as u16;
+        let right_width = Span::raw("🇸").width() as u16;
+        let delete_x = left_width + right_width + 2;
+        assert!(app.display.as_ref().unwrap().rows[1].contains('\r'));
+        let buf = draw_buffer(&mut app);
+        assert_column_backgrounds_align(&buf);
+        assert_eq!(buf[(1, 2)].symbol(), "🇺");
+        assert_eq!(buf[(1 + left_width, 2)].symbol(), "🇸");
+        assert_eq!(buf[(delete_x, 2)].symbol(), "x");
+        assert_eq!(buf[(delete_x, 2)].bg, Color::Red);
+        assert_eq!(buf[(delete_x + 2, 2)].symbol(), "y");
+        assert_eq!(buf[(delete_x + 2, 2)].bg, Color::Green);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn control_only_edits_show_code_points() {
+        // A suffix keeps the CR inside the line, outside CRLF normalization.
+        let grid = compute("\rx", "\u{7}x");
+        let display = build_display(&grid);
+        assert_eq!(display.rows, ["-     |+     | ", "U+000D|U+0007|x"]);
+        assert_eq!(display.group_end_offsets, [7, 14, 15]);
+        let (mut app, a, b) = files_app("\rx", "\u{7}x");
+        let buf = draw_buffer(&mut app);
+        assert_column_backgrounds_align(&buf);
+        for x in 1..=6 {
+            assert_eq!(buf[(x, 2)].bg, Color::Red);
+        }
+        for x in 8..=13 {
+            assert_eq!(buf[(x, 2)].bg, Color::Green);
+        }
+        assert_eq!(buf[(7, 2)].symbol(), "|");
+        assert_eq!(buf[(7, 2)].bg, Color::Reset);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn dotted_circle_edits_survive_navigation_scrolling_and_resize() {
+        let suffix = "z".repeat(40);
+        let (mut app, a, b) = files_app(
+            &format!("e\u{301}{suffix}\n"),
+            &format!("e\u{308}{suffix}\n"),
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(app.scroll_x, 4);
+        let mut terminal = Terminal::new(TestBackend::new(12, 6)).unwrap();
+        let buf = terminal.draw(|frame| app.render(frame)).unwrap().buffer;
+        assert_column_backgrounds_align(buf);
+        assert_eq!(buf[(1, 1)].symbol(), "+");
+        assert_eq!(buf[(1, 2)].symbol(), "◌\u{308}");
+        assert_eq!(buf[(1, 2)].bg, Color::Green);
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.scroll_x, 0);
+        let buf = draw_buffer(&mut app);
+        assert_column_backgrounds_align(&buf);
+        assert_eq!(buf[(3, 2)].symbol(), "◌\u{301}");
+        assert_eq!(buf[(5, 2)].symbol(), "◌\u{308}");
+        app.scroll_x = 2;
+        let buf = terminal.draw(|frame| app.render(frame)).unwrap().buffer;
+        assert_column_backgrounds_align(buf);
+        assert_eq!(buf[(1, 2)].symbol(), "◌\u{301}");
+        assert_eq!(buf[(3, 2)].symbol(), "◌\u{308}");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 
     #[test]
