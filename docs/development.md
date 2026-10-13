@@ -87,5 +87,22 @@ source. The shell and Nix checks are defined in [flake.nix](../flake.nix).
 Linux, and builds and tests on Linux, macOS, and Windows for pushes and pull
 requests. Tests include doctests.
 
+The `Check changed paths` job decides whether to run the Rust jobs. Changes
+limited to `docs/` and `README.md` skip formatting, Clippy, builds, and tests
+through job-level `if` conditions. Any other changed path runs the Rust jobs,
+including Cargo files, toolchain settings, and the workflow itself.
+
+For pull requests, [paths-filter](https://github.com/dorny/paths-filter) reads
+the changed files through the GitHub API using `pull-requests: read`. Pushes
+use Git history: feature branches are compared with the merge base of the
+default branch, and pushes to the default branch use the preceding push
+commit. Renames out of documentation also count as code changes.
+
+Manual runs through `workflow_dispatch` always run the Rust jobs. If path
+detection fails, the Rust jobs still run and the workflow reports the detection
+failure. The workflow remains triggered for documentation changes, allowing
+skipped jobs to report their status instead of leaving the whole workflow
+pending.
+
 [Dependabot](../.github/dependabot.yml) checks Cargo and GitHub Actions
 dependencies weekly, grouping updates for each ecosystem.
