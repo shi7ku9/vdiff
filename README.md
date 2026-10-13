@@ -80,6 +80,61 @@ $ cargo run --release -- old.cpp new.cpp
 
 Requires a Rust toolchain (edition 2024). Git mode requires the `git` binary.
 
+## Development
+
+With Nix, enter the development shell, then install the Git hooks once per clone:
+
+```console
+$ nix develop
+$ pre-commit install
+```
+
+The shell includes Rust, rustfmt, Clippy, rust-analyzer, Git, and pre-commit.
+To load it automatically when entering the project, install
+[direnv](https://direnv.net/) and enable its
+[shell hook](https://direnv.net/docs/hook.html). For zsh, add
+`eval "$(direnv hook zsh)"` to `~/.zshrc` and restart the shell. Then run once
+from the project directory:
+
+```console
+$ direnv allow
+$ pre-commit install
+```
+
+The checked-in `.envrc` loads the flake's development shell and watches
+`Cargo.toml`, `Cargo.lock`, and `rust-toolchain.toml` for changes.
+[nix-direnv](https://github.com/nix-community/nix-direnv) is recommended to cache
+the shell environment. Local direnv files under `.direnv/` are ignored by Git.
+
+Without Nix, install [rustup](https://rustup.rs/), Git, and
+[pre-commit](https://pre-commit.com/#installation), then run `pre-commit install`.
+`rust-toolchain.toml` selects stable Rust and the required components automatically.
+Nix resolves that channel using the rust-overlay snapshot in `flake.lock`; rustup
+and GitHub Actions use the current stable release.
+
+The hooks check Rust formatting and run Clippy on Rust or Cargo changes.
+Formatting is checked without rewriting files; fix failures with `cargo fmt --all`
+and stage the changes again. Run the hooks manually with:
+
+```console
+$ pre-commit run --all-files
+```
+
+To run the same Rust checks as CI:
+
+```console
+$ cargo fmt --all -- --check
+$ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+$ cargo build --locked --workspace --all-targets --all-features
+$ cargo test --locked --workspace --all-features
+```
+
+GitHub Actions checks formatting and Clippy on Linux, and builds and tests on
+Linux, macOS, and Windows for pushes and pull requests. Tests also include
+doctests. Dependabot checks Cargo and GitHub Actions dependencies weekly.
+Nix users can run the build, test, Clippy, and formatting checks with `nix flake check`.
+When adding new files, stage them first so Nix includes them in the flake source.
+
 ## Fun facts
 
 - The diff engine is a classic LCS over columns, with common prefix/suffix trimmed first. Typical diffs only touch a handful of columns.
