@@ -785,8 +785,8 @@ mod tests {
     #[test]
     fn render_text_keeps_zero_width_clusters_intact() {
         // A ZWJ cell is width 0; padding it would insert a space into
-        // the 👨‍👩 emoji cluster and break it into separate glyphs.
-        let s = "👨\u{200D}👩\n";
+        // the 👩‍❤️‍👩 emoji cluster and break it into separate glyphs.
+        let s = "👩‍❤️‍👩\n";
         assert_eq!(render_text(&compute(s, s)), s);
     }
 
@@ -794,10 +794,10 @@ mod tests {
     fn render_text_keeps_zwj_cluster_intact_in_wide_column() {
         // A wide char in the ZWJ's column widens it to 2 cells; the
         // ZWJ must still get no pad, or the family splits apart.
-        let s = "👨\u{200D}👩\n中中\n";
+        let s = "👩‍❤️‍👩\n中中\n";
         let rendered = render_text(&compute(s, s));
         assert!(
-            rendered.contains("👨\u{200D}👩"),
+            rendered.contains("👩‍❤️‍👩"),
             "cluster must stay glued: {rendered:?}"
         );
     }
