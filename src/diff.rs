@@ -3,6 +3,7 @@
 //! The diff units are *columns*: the k-th grapheme of every line of a
 //! file, padded with spaces, emitted as a structured `DiffGrid`.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
@@ -17,22 +18,18 @@ pub enum StepKind {
 
 /// A grapheme column with implicit padding spaces and shared packed storage.
 /// Cloning a column shares its backing data rather than copying its cells.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Column {
     height: usize,
     data: Arc<ColumnData>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Hash)]
 struct ColumnData {
     text: String,
-    cells: Vec<CellEnd>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct CellEnd {
-    row: usize,
-    end: usize,
+    // Primitive slices support bulk equality instead of per-record scans.
+    rows: Vec<usize>,
+    ends: Vec<usize>,
 }
 
 impl ColumnData {
@@ -40,21 +37,36 @@ impl ColumnData {
         if cell == " " {
             return;
         }
-        debug_assert!(self.cells.last().is_none_or(|last| last.row < row));
+        debug_assert!(self.rows.last().is_none_or(|last| *last < row));
         self.text.push_str(cell);
-        self.cells.push(CellEnd {
-            row,
-            end: self.text.len(),
-        });
+        self.rows.push(row);
+        self.ends.push(self.text.len());
     }
 
     fn cell(&self, index: usize) -> &str {
-        let start = if index == 0 {
-            0
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        &self.text[start..self.ends[index]]
+    }
+}
+
+impl PartialEq for Column {
+    fn eq(&self, other: &Self) -> bool {
+        self.height == other.height
+            && (Arc::ptr_eq(&self.data, &other.data) || self.data == other.data)
+    }
+}
+
+impl Eq for Column {}
+
+/// Equal packed columns share one backing object before LCS. HashSet still
+/// checks exact text and row boundaries, so hash collisions cannot match edits.
+fn intern_columns(columns: &mut [Column], pool: &mut HashSet<Arc<ColumnData>>) {
+    for column in columns {
+        if let Some(existing) = pool.get(&column.data) {
+            column.data = Arc::clone(existing);
         } else {
-            self.cells[index - 1].end
-        };
-        &self.text[start..self.cells[index].end]
+            pool.insert(Arc::clone(&column.data));
+        }
     }
 }
 
@@ -73,22 +85,20 @@ impl Column {
         if row >= self.height {
             return None;
         }
-        Some(
-            match self.data.cells.binary_search_by_key(&row, |cell| cell.row) {
-                Ok(index) => self.data.cell(index),
-                Err(_) => " ",
-            },
-        )
+        Some(match self.data.rows.binary_search(&row) {
+            Ok(index) => self.data.cell(index),
+            Err(_) => " ",
+        })
     }
 
     /// Iterate all logical cells without allocating padding strings.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> {
         let mut index = 0;
         (0..self.height).map(move |row| {
-            while index < self.data.cells.len() && self.data.cells[index].row < row {
+            while index < self.data.rows.len() && self.data.rows[index] < row {
                 index += 1;
             }
-            if index < self.data.cells.len() && self.data.cells[index].row == row {
+            if index < self.data.rows.len() && self.data.rows[index] == row {
                 let cell = self.data.cell(index);
                 index += 1;
                 cell
@@ -100,11 +110,11 @@ impl Column {
 
     pub(crate) fn first_non_padding_row(&self) -> Option<usize> {
         self.data
-            .cells
+            .rows
             .iter()
             .enumerate()
             .find(|(index, _)| self.data.cell(*index).chars().any(|c| c != ' '))
-            .map(|(_, cell)| cell.row)
+            .map(|(_, row)| *row)
     }
 }
 
@@ -376,7 +386,9 @@ pub fn compute(a: &str, b: &str) -> DiffGrid {
     // A missing trailing newline is a real difference (git reports it
     // too); give it its own row and step so it stays visible.
     let height = a_lines.len().max(b_lines.len()) + usize::from(trailing_differs);
-    let a_cols = columns_padded(&a_lines, height);
+    let mut a_cols = columns_padded(&a_lines, height);
+    let mut pool = HashSet::new();
+    intern_columns(&mut a_cols, &mut pool);
     // Identical inputs are the common case; build the all-Match grid
     // straight from the columns instead of diffing (and keep the
     // memory down for very wide files).
@@ -390,7 +402,8 @@ pub fn compute(a: &str, b: &str) -> DiffGrid {
             .collect();
         return DiffGrid::from_parts(steps, height, false);
     }
-    let b_cols = columns_padded(&b_lines, height);
+    let mut b_cols = columns_padded(&b_lines, height);
+    intern_columns(&mut b_cols, &mut pool);
     let (mut steps, degraded) = diff_columns(&a_cols, &b_cols);
     if trailing_differs {
         // A column of spaces with a ↵ in the last row: the side that
@@ -424,7 +437,7 @@ fn op_prefix(kind: StepKind) -> char {
 pub(crate) fn step_width(step: &Step) -> usize {
     step.content
         .data
-        .cells
+        .rows
         .iter()
         .enumerate()
         .map(|(index, _)| UnicodeWidthStr::width(step.content.data.cell(index)))
@@ -539,7 +552,7 @@ mod tests {
         );
         assert_eq!(column.iter().nth(2), Some("👩‍❤️‍👩"));
         assert_eq!(column.iter().skip(3).collect::<Vec<_>>(), [" ", "x"]);
-        assert_eq!(column.data.cells.len(), 3);
+        assert_eq!(column.data.rows.len(), 3);
         let clone = column.clone();
         assert!(Arc::ptr_eq(&column.data, &clone.data));
         drop(column);
@@ -559,9 +572,56 @@ mod tests {
         assert_eq!(padded[0], combined);
         let blank = Column::from(vec![" ".to_owned(); 10]);
         assert_eq!(blank.len(), 10);
-        assert!(blank.data.cells.is_empty());
+        assert!(blank.data.rows.is_empty());
         assert!(blank.data.text.is_empty());
         assert!(blank.iter().all(|cell| cell == " "));
+    }
+
+    #[test]
+    fn canonical_columns_share_backing_across_both_inputs() {
+        let a = format!("x{}y\n", "a".repeat(254)).repeat(64);
+        let b = format!("p{}q\n", "a".repeat(254)).repeat(64);
+        let mut a_cols = columns_padded(&lines_with_trailing(&a), 64);
+        let mut b_cols = columns_padded(&lines_with_trailing(&b), 64);
+        let mut pool = HashSet::new();
+        intern_columns(&mut a_cols, &mut pool);
+        intern_columns(&mut b_cols, &mut pool);
+        assert_eq!(pool.len(), 5); // x, a, y, p, q
+        for col in 1..255 {
+            assert!(Arc::ptr_eq(&a_cols[1].data, &a_cols[col].data));
+            assert!(Arc::ptr_eq(&a_cols[1].data, &b_cols[col].data));
+        }
+        let grid = compute(&a, &b);
+        assert!(!grid.degraded);
+        let matches: Vec<_> = grid
+            .steps
+            .iter()
+            .filter(|step| step.kind == StepKind::Match)
+            .collect();
+        assert_eq!(matches.len(), 254);
+        for matched in &matches {
+            assert!(Arc::ptr_eq(&matches[0].content.data, &matched.content.data));
+        }
+        assert_eq!(grid.steps.len(), 258);
+    }
+
+    #[test]
+    fn canonicalization_keeps_row_boundaries_and_logical_height_distinct() {
+        let mut columns = [
+            Column::from(vec!["a".to_owned(), "\u{301}".to_owned()]),
+            Column::from(vec!["a\u{301}".to_owned(), " ".to_owned()]),
+            Column::from(vec![" ".to_owned(); 2]),
+            Column::from(vec![" ".to_owned(); 1]),
+        ];
+        let mut pool = HashSet::new();
+        intern_columns(&mut columns, &mut pool);
+        assert_eq!(columns[0].data.text, columns[1].data.text);
+        assert_ne!(columns[0], columns[1]);
+        assert!(!Arc::ptr_eq(&columns[0].data, &columns[1].data));
+        assert!(Arc::ptr_eq(&columns[2].data, &columns[3].data));
+        assert_ne!(columns[2], columns[3]);
+        assert_eq!(columns[2].iter().collect::<Vec<_>>(), [" ", " "]);
+        assert_eq!(columns[3].iter().collect::<Vec<_>>(), [" "]);
     }
 
     #[test]
@@ -582,7 +642,7 @@ mod tests {
         assert_eq!(
             grid.steps
                 .iter()
-                .map(|step| step.content.data.cells.len())
+                .map(|step| step.content.data.rows.len())
                 .sum::<usize>(),
             3999
         );
@@ -621,7 +681,7 @@ mod tests {
         assert_eq!(
             grid.steps
                 .iter()
-                .map(|step| step.content.data.cells.len())
+                .map(|step| step.content.data.rows.len())
                 .sum::<usize>(),
             5999
         );
@@ -630,7 +690,7 @@ mod tests {
         let newline = grid.steps.last().unwrap();
         assert_eq!(newline.kind, StepKind::Insert);
         assert_eq!(newline.content.len(), 2001);
-        assert_eq!(newline.content.data.cells.len(), 1);
+        assert_eq!(newline.content.data.rows.len(), 1);
         assert_eq!(newline.content.get(1999), Some(" "));
         assert_eq!(newline.content.get(2000), Some("↵"));
     }

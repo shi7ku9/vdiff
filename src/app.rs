@@ -13,6 +13,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
@@ -23,6 +24,7 @@ use unicode_segmentation::UnicodeSegmentation;
 /// display width), rows[i+1] is file line i. All rows share the same
 /// column boundaries. Each diff step is a complete grapheme column;
 /// narrower cells are padded after their complete grapheme.
+/// The TUI retains explicit cells rather than re-segmenting these joined strings.
 pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     build_display(grid).rows
 }
@@ -40,19 +42,28 @@ fn cell_style(kind: Option<StepKind>) -> Style {
 /// Cached display rows for the current grid, rebuilt once per reload.
 struct Display {
     rows: Vec<String>,
+    columns: Vec<DisplayColumn>,
     /// Shared diff kind per display cell; `None` denotes a separator.
     kinds: Vec<Option<StepKind>>,
     /// Actual end offsets, including the following separator if present.
     /// Change navigation uses the same layout as the displayed columns.
     group_end_offsets: Vec<usize>,
-    /// Rendered width, common to the marker and every content row.
+    /// Layout width shared by rows when cells are drawn independently.
     width: usize,
+}
+
+struct DisplayColumn {
+    start: usize,
+    width: usize,
+    /// A grid step, or None for a group separator.
+    step: Option<usize>,
 }
 
 fn build_display(grid: &DiffGrid) -> Display {
     let mut marker = String::new();
     let mut rows: Vec<String> = (0..grid.height).map(|_| String::new()).collect();
     let mut kinds = Vec::new();
+    let mut columns = Vec::new();
     let mut group_end_offsets = Vec::with_capacity(grid.groups.len());
     for group in &grid.groups {
         let kind = grid.steps[group.start].kind;
@@ -61,7 +72,8 @@ fn build_display(grid: &DiffGrid) -> Display {
             StepKind::Delete => '-',
             StepKind::Insert => '+',
         };
-        for step in &grid.steps[group.clone()] {
+        for step_index in group.clone() {
+            let step = &grid.steps[step_index];
             let cells: Vec<_> = step
                 .content
                 .iter()
@@ -75,6 +87,11 @@ fn build_display(grid: &DiffGrid) -> Display {
                 .collect();
             // Each step already owns one complete grapheme per row.
             let width = cells.iter().map(|(_, width)| *width).max().unwrap_or(0);
+            columns.push(DisplayColumn {
+                start: kinds.len(),
+                width,
+                step: Some(step_index),
+            });
             if width > 0 {
                 marker.push(mark);
                 marker.extend(std::iter::repeat_n(' ', width - 1));
@@ -86,6 +103,11 @@ fn build_display(grid: &DiffGrid) -> Display {
             }
         }
         if group.end < grid.steps.len() {
+            columns.push(DisplayColumn {
+                start: kinds.len(),
+                width: 1,
+                step: None,
+            });
             marker.push('|');
             kinds.push(None);
             for row in &mut rows {
@@ -99,6 +121,7 @@ fn build_display(grid: &DiffGrid) -> Display {
     let width = kinds.len();
     Display {
         rows: out,
+        columns,
         kinds,
         group_end_offsets,
         width,
@@ -108,7 +131,13 @@ fn build_display(grid: &DiffGrid) -> Display {
 /// Give standalone zero-width glyphs a base so they cannot attach to
 /// separators or padding. Filter controls only after raw layout boundaries
 /// have been recorded; control-only edits still need a visible indication.
-fn visible_block(text: &str, kind: StepKind) -> String {
+fn visible_block(text: &str, kind: StepKind) -> Cow<'_, str> {
+    let standalone = text
+        .graphemes(true)
+        .any(|grapheme| !grapheme.chars().any(char::is_control) && needs_display_base(grapheme));
+    if !standalone && (kind == StepKind::Match || rendered_width(text) > 0) {
+        return Cow::Borrowed(text);
+    }
     let mut visible = String::with_capacity(text.len());
     for grapheme in text.graphemes(true) {
         if grapheme.chars().any(char::is_control) {
@@ -117,7 +146,7 @@ fn visible_block(text: &str, kind: StepKind) -> String {
             visible.push_str(grapheme);
             continue;
         }
-        if Span::raw(grapheme).width() == 0 {
+        if needs_display_base(grapheme) {
             visible.push('◌');
         }
         visible.push_str(grapheme);
@@ -131,7 +160,27 @@ fn visible_block(text: &str, kind: StepKind) -> String {
             write!(visible, "U+{:04X}", u32::from(c)).unwrap();
         }
     }
-    visible
+    Cow::Owned(visible)
+}
+
+/// Leading extenders need a base even when the entire grapheme has width.
+/// Probe the first scalar against a dotted circle on the stack, so normal
+/// cells do not allocate and adjacent terminal writes cannot absorb the mark.
+fn needs_display_base(grapheme: &str) -> bool {
+    if Span::raw(grapheme).width() == 0 {
+        return true;
+    }
+    let Some(first) = grapheme.chars().next() else {
+        return false;
+    };
+    let mut bytes = [0_u8; 7]; // dotted circle (3 bytes) + one scalar (up to 4)
+    bytes[..3].copy_from_slice("◌".as_bytes());
+    let len = 3 + first.encode_utf8(&mut bytes[3..]).len();
+    std::str::from_utf8(&bytes[..len])
+        .unwrap()
+        .graphemes(true)
+        .count()
+        == 1
 }
 
 /// Use the same grapheme widths and control filtering as the renderer.
@@ -426,7 +475,7 @@ impl App {
                 if let Some(marker) = rows.first() {
                     self.draw_row(frame, inner, inner.y, marker, &disp.kinds);
                 }
-                for (i, row) in rows.iter().enumerate().skip(1) {
+                for (i, _) in rows.iter().enumerate().skip(1) {
                     let y = top.saturating_add(i).saturating_sub(self.scroll_y);
                     // Content rows live below the sticky marker row:
                     // y == top is the marker's row and must not be
@@ -437,7 +486,7 @@ impl App {
                     if y >= bottom || y >= usize::from(u16::MAX) {
                         break;
                     }
-                    self.draw_row(frame, inner, y as u16, row, &disp.kinds);
+                    self.draw_content_row(frame, inner, y as u16, i - 1, disp);
                 }
             }
             (None, Some(message)) => {
@@ -464,12 +513,46 @@ impl App {
         row: &str,
         kinds: &[Option<StepKind>],
     ) {
+        self.draw_cell(frame, inner, y, row, 0);
+        self.style_row(frame, inner, y, kinds);
+    }
+
+    fn draw_content_row(
+        &self,
+        frame: &mut Frame<'_>,
+        inner: Rect,
+        y: u16,
+        row: usize,
+        display: &Display,
+    ) {
+        let Some(grid) = &self.grid else { return };
+        let first = display
+            .columns
+            .partition_point(|column| column.start + column.width <= self.scroll_x);
+        let right = self.scroll_x + usize::from(inner.width);
+        for column in &display.columns[first..] {
+            if column.start >= right {
+                break;
+            }
+            let text = match column.step {
+                Some(index) => {
+                    let step = &grid.steps[index];
+                    visible_block(step.content.get(row).unwrap_or(" "), step.kind)
+                }
+                None => Cow::Borrowed("|"),
+            };
+            self.draw_cell(frame, inner, y, &text, column.start);
+        }
+        self.style_row(frame, inner, y, &display.kinds);
+    }
+
+    fn draw_cell(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, text: &str, start: usize) {
         let scroll_x = self.scroll_x;
         let right = scroll_x + usize::from(inner.width);
-        let mut pos = 0;
-        // Draw complete graphemes at their cached layout positions. Do not
-        // concatenate across filtered controls and re-segment the result.
-        for (grapheme, width) in rendered_graphemes(row) {
+        let mut pos = start;
+        // Segment each cell independently, so display substitutions cannot
+        // combine with extenders in the next cell and change its width.
+        for (grapheme, width) in rendered_graphemes(text) {
             let end = pos + width;
             if end > right {
                 break;
@@ -484,10 +567,13 @@ impl App {
             }
             pos = end;
         }
+    }
+
+    fn style_row(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, kinds: &[Option<StepKind>]) {
         // Restore styles in wide-glyph continuation and clipped cells.
         for (offset, kind) in kinds
             .iter()
-            .skip(scroll_x)
+            .skip(self.scroll_x)
             .take(usize::from(inner.width))
             .enumerate()
         {
@@ -939,6 +1025,59 @@ mod tests {
         }
         assert_eq!(buf[(7, 2)].symbol(), "|");
         assert_eq!(buf[(7, 2)].bg, Color::Reset);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn control_labels_keep_neighboring_extenders_in_their_own_cells() {
+        for extender in ["\u{fe0f}\u{903}", "\u{903}", "\u{301}"] {
+            let (mut app, a, b) = files_app(&format!("\u{7}{extender}x\n"), "Yx\n");
+            let marked = visible_block(extender, StepKind::Delete);
+            assert_eq!(marked, format!("◌{extender}"));
+            let separator_x = 7 + rendered_width(&marked) as u16;
+            let buf = draw_buffer(&mut app);
+            assert_column_backgrounds_align(&buf);
+            assert_eq!(buf[(6, 2)].symbol(), "7");
+            assert_eq!(buf[(7, 2)].symbol(), marked.as_ref());
+            assert_eq!(buf[(7, 2)].bg, Color::Red);
+            assert_eq!(buf[(separator_x, 1)].symbol(), "|");
+            assert_eq!(buf[(separator_x, 2)].symbol(), "|");
+            assert_eq!(buf[(separator_x, 2)].bg, Color::Reset);
+            assert_eq!(buf[(separator_x + 1, 1)].symbol(), "+");
+            assert_eq!(buf[(separator_x + 1, 2)].symbol(), "Y");
+            assert_eq!(buf[(separator_x + 1, 2)].bg, Color::Green);
+            assert_eq!(buf[(separator_x + 3, 2)].symbol(), "x");
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+        }
+    }
+
+    #[test]
+    fn control_label_boundaries_survive_scroll_and_resize() {
+        let extender = "\u{fe0f}\u{903}";
+        let marked = visible_block(extender, StepKind::Delete);
+        let width = rendered_width(&marked) as u16;
+        let (mut app, a, b) = files_app(&format!("\u{7}{extender}x\n"), "Yx\n");
+        let mut small = Terminal::new(TestBackend::new(7, 6)).unwrap();
+        app.scroll_x = 5;
+        let buf = small.draw(|frame| app.render(frame)).unwrap().buffer;
+        assert_eq!(app.scroll_x, 5);
+        assert_column_backgrounds_align(buf);
+        assert_eq!(buf[(1, 2)].symbol(), "7");
+        assert_eq!(buf[(2, 2)].symbol(), marked.as_ref());
+        assert_eq!(buf[(2 + width, 1)].symbol(), "|");
+        assert_eq!(buf[(2 + width, 2)].symbol(), "|");
+        assert_eq!(buf[(3 + width, 1)].symbol(), "+");
+        assert_eq!(buf[(3 + width, 2)].symbol(), "Y");
+        assert_eq!(buf[(3 + width, 2)].bg, Color::Green);
+        let buf = draw_buffer(&mut app);
+        assert_eq!(app.scroll_x, 0);
+        assert_column_backgrounds_align(&buf);
+        assert_eq!(buf[(6, 2)].symbol(), "7");
+        assert_eq!(buf[(7, 2)].symbol(), marked.as_ref());
+        assert_eq!(buf[(8 + width, 1)].symbol(), "+");
+        assert_eq!(buf[(8 + width, 2)].symbol(), "Y");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
