@@ -8,6 +8,31 @@ fn run_vdiff(args: &[&str]) -> Output {
         .expect("failed to run vdiff")
 }
 
+#[test]
+fn files_mode_uses_grapheme_columns_across_different_line_counts() {
+    let a = temp_file("grapheme-columns-a.txt", "a\u{301}x\n中bcx\n");
+    let b = temp_file("grapheme-columns-b.txt", "a\u{301}y\n");
+    let out = run_vdiff(&[a.to_str().unwrap(), b.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "- ---|++\na\u{301} x  |a\u{301}y\n中bcx|  \n"
+    );
+}
+
+#[test]
+fn files_mode_keeps_emoji_edits_in_complete_columns() {
+    let a = temp_file("grapheme-emoji-a.txt", "👩‍❤️‍👩x\n");
+    let b = temp_file("grapheme-emoji-b.txt", "👩‍❤️‍💋‍👩x\n");
+    let out = run_vdiff(&[a.to_str().unwrap(), b.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "- |+ |\n👩‍❤️‍👩|👩‍❤️‍💋‍👩|x\n");
+}
+
 fn temp_file(name: &str, contents: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("vdiff-cli-{}-{name}", std::process::id()));
     std::fs::write(&path, contents).unwrap();

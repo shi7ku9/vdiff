@@ -19,10 +19,10 @@ use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Display rows for the TUI: rows[0] is the marker row (one marker per
-/// display block, `|` between groups, padded to the full content
+/// grapheme column, `|` between groups, padded to the full content
 /// display width), rows[i+1] is file line i. All rows share the same
-/// column boundaries. Adjacent steps that belong to a grapheme in any
-/// row are kept together and padded after the complete grapheme.
+/// column boundaries. Each diff step is a complete grapheme column;
+/// narrower cells are padded after their complete grapheme.
 pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     build_display(grid).rows
 }
@@ -61,57 +61,27 @@ fn build_display(grid: &DiffGrid) -> Display {
             StepKind::Delete => '-',
             StepKind::Insert => '+',
         };
-        let mut group_rows: Vec<String> = (0..grid.height).map(|_| String::new()).collect();
-        for i in group.clone() {
-            for (r, c) in grid.steps[i].content.chars().enumerate() {
-                group_rows[r].push(c);
-            }
-        }
-
-        // A step boundary is usable only if it is a grapheme boundary in
-        // every row. Taking the union of all joined steps preserves both
-        // complete glyphs and one shared layout across unlike file lines.
-        let mut boundaries = vec![true; group.len() + 1];
-        for text in &group_rows {
-            let mut step = 0;
-            // Keep raw scalar offsets here: styled_graphemes filters
-            // controls, but row_chars below consumes the original text.
-            for grapheme in text.graphemes(true) {
-                let end = step + grapheme.chars().count();
-                boundaries[step + 1..end].fill(false);
-                step = end;
-            }
-        }
-        let mut row_chars: Vec<_> = group_rows.iter().map(|text| text.chars()).collect();
-        let mut start = 0;
-        for (end, &boundary) in boundaries.iter().enumerate().skip(1) {
-            if !boundary {
-                continue;
-            }
-            let blocks: Vec<_> = row_chars
-                .iter_mut()
-                .map(|chars| {
-                    let text: String = chars.by_ref().take(end - start).collect();
-                    let text = visible_block(&text, kind);
+        for step in &grid.steps[group.clone()] {
+            let cells: Vec<_> = (0..grid.height)
+                .map(|row| {
+                    let raw = step.content.get(row).map(String::as_str).unwrap_or(" ");
+                    let text = visible_block(raw, kind);
                     let width = rendered_width(&text);
                     (text, width)
                 })
                 .collect();
-            // Reserve only the widest rendered block across file lines.
-            // Combining marks and ZWJ scalars do not add phantom cells.
-            let width = blocks.iter().map(|(_, width)| *width).max().unwrap_or(0);
+            // Each step already owns one complete grapheme per row.
+            let width = cells.iter().map(|(_, width)| *width).max().unwrap_or(0);
             if width > 0 {
                 marker.push(mark);
                 marker.extend(std::iter::repeat_n(' ', width - 1));
             }
             kinds.extend(std::iter::repeat_n(Some(kind), width));
-            for (row, (text, actual_width)) in rows.iter_mut().zip(blocks) {
+            for (row, (text, actual_width)) in rows.iter_mut().zip(cells) {
                 row.push_str(&text);
                 row.extend(std::iter::repeat_n(' ', width - actual_width));
             }
-            start = end;
         }
-
         if group.end < grid.steps.len() {
             marker.push('|');
             kinds.push(None);
@@ -691,18 +661,14 @@ impl App {
     }
 }
 
-/// The first file line where any step in `group` has a non-padding
-/// char. Each step's string is scanned once: `char_indices().find`
-/// lands on the first non-space char, whose index is the row.
+/// The first file line where any cell in the group contains non-padding text.
 fn first_affected_row(grid: &DiffGrid, group: &std::ops::Range<usize>) -> Option<usize> {
     grid.steps[group.clone()]
         .iter()
-        .filter_map(|s| {
-            s.content
-                .char_indices()
-                .enumerate()
-                .find(|(_, (_, c))| *c != ' ')
-                .map(|(n, _)| n)
+        .filter_map(|step| {
+            step.content
+                .iter()
+                .position(|cell| cell.chars().any(|c| c != ' '))
         })
         .min()
 }
@@ -824,24 +790,22 @@ mod tests {
     }
 
     #[test]
-    fn combining_only_edits_keep_visible_markers_and_backgrounds() {
+    fn accent_edits_compare_complete_graphemes() {
         let grid = compute("e\u{301}\n", "e\u{308}\n");
         let display = build_display(&grid);
-        assert_eq!(display.rows, [" |-|+", "e|◌\u{301}|◌\u{308}"]);
-        assert_eq!(display.group_end_offsets, [2, 4, 5]);
+        assert_eq!(display.rows, ["-|+", "e\u{301}|e\u{308}"]);
+        assert_eq!(display.group_end_offsets, [2, 3]);
         let (mut app, a, b) = files_app("e\u{301}\n", "e\u{308}\n");
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
-        assert_eq!(buf[(3, 1)].symbol(), "-");
-        assert_eq!(buf[(3, 2)].symbol(), "◌\u{301}");
-        assert_eq!(buf[(3, 2)].bg, Color::Red);
-        assert_eq!(buf[(5, 1)].symbol(), "+");
-        assert_eq!(buf[(5, 2)].symbol(), "◌\u{308}");
-        assert_eq!(buf[(5, 2)].bg, Color::Green);
-        for x in [2, 4] {
-            assert_eq!(buf[(x, 2)].symbol(), "|");
-            assert_eq!(buf[(x, 2)].bg, Color::Reset);
-        }
+        assert_eq!(buf[(1, 1)].symbol(), "-");
+        assert_eq!(buf[(1, 2)].symbol(), "e\u{301}");
+        assert_eq!(buf[(1, 2)].bg, Color::Red);
+        assert_eq!(buf[(3, 1)].symbol(), "+");
+        assert_eq!(buf[(3, 2)].symbol(), "e\u{308}");
+        assert_eq!(buf[(3, 2)].bg, Color::Green);
+        assert_eq!(buf[(2, 2)].symbol(), "|");
+        assert_eq!(buf[(2, 2)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -857,7 +821,7 @@ mod tests {
         );
         assert_eq!(
             slice_by_width(&display.rows[1], 0, display.width).0,
-            "  a\u{301} x"
+            "  a\u{301}x "
         );
         assert_eq!(display.rows[2], "中bcx");
         for row in &display.rows {
@@ -890,18 +854,17 @@ mod tests {
 
     #[test]
     fn orphan_marks_are_visible_when_other_rows_have_nonzero_width() {
-        let (mut app, a, b) = files_app("e\u{301}\nex\n", "e\u{308}\ney\n");
+        let (mut app, a, b) = files_app("\u{301}\nx\n", "\u{308}\ny\n");
         let display = app.display.as_ref().unwrap();
-        assert_eq!(display.rows, [" |-|+", "e|◌\u{301}|◌\u{308}", "e|x|y"]);
+        assert_eq!(display.rows, ["-|+", "◌\u{301}|◌\u{308}", "x|y"]);
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
-        assert_eq!(buf[(3, 2)].symbol(), "◌\u{301}");
-        assert_eq!(buf[(5, 2)].symbol(), "◌\u{308}");
+        assert_eq!(buf[(1, 2)].symbol(), "◌\u{301}");
+        assert_eq!(buf[(3, 2)].symbol(), "◌\u{308}");
         for y in [2, 3] {
-            assert_eq!(buf[(3, y)].bg, Color::Red);
-            assert_eq!(buf[(5, y)].bg, Color::Green);
+            assert_eq!(buf[(1, y)].bg, Color::Red);
+            assert_eq!(buf[(3, y)].bg, Color::Green);
             assert_eq!(buf[(2, y)].symbol(), "|");
-            assert_eq!(buf[(4, y)].symbol(), "|");
         }
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -913,7 +876,7 @@ mod tests {
         let display = build_display(&compute(text, text));
         assert_eq!(
             slice_by_width(&display.rows[1], 0, display.width).0,
-            "   a\u{301} x"
+            "   a\u{301}x "
         );
         assert_eq!(display.rows[2], "中abcx");
         for row in &display.rows {
@@ -985,8 +948,8 @@ mod tests {
     fn dotted_circle_edits_survive_navigation_scrolling_and_resize() {
         let suffix = "z".repeat(40);
         let (mut app, a, b) = files_app(
-            &format!("e\u{301}{suffix}\n"),
-            &format!("e\u{308}{suffix}\n"),
+            &format!("q\r\u{301}{suffix}\n"),
+            &format!("q\r\u{308}{suffix}\n"),
         );
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert_eq!(app.scroll_x, 4);
@@ -1223,8 +1186,7 @@ mod tests {
 
     #[test]
     fn zwj_cluster_stays_glued_in_wide_column() {
-        // The ZWJ's column is 2 cells wide (the 中 line); a pad space
-        // after the ZWJ would push the following emoji apart.
+        // The complete emoji and 中 share a width-2 grapheme column.
         let s = "👩‍❤️‍👩\n中中\n";
         let (mut app, a, b) = files_app(s, s);
         let backend = draw(&mut app);
@@ -1297,7 +1259,7 @@ mod tests {
         let (mut app, a, b) = files_app("a\u{301}x\nabz\n", "a\u{301}y\nabz\n");
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
-        for (y, delete_x, insert_x, deleted, inserted) in [(2, 4, 6, "x", "y"), (3, 4, 6, "z", "z")]
+        for (y, delete_x, insert_x, deleted, inserted) in [(2, 3, 5, "x", "y"), (3, 3, 5, "b", "b")]
         {
             assert_eq!(buf[(delete_x, y)].symbol(), deleted);
             assert_eq!(buf[(delete_x, y)].bg, Color::Red);
@@ -1308,14 +1270,16 @@ mod tests {
             assert_eq!(buf[(insert_x + 1, y)].bg, Color::Reset);
         }
         // Blank rows retain the marker's full-height column bands.
-        assert_eq!(buf[(4, 21)].bg, Color::Red);
-        assert_eq!(buf[(6, 21)].bg, Color::Green);
+        assert_eq!(buf[(3, 21)].bg, Color::Red);
+        assert_eq!(buf[(5, 21)].bg, Color::Green);
+        assert_eq!(buf[(7, 3)].symbol(), "z");
+        assert_eq!(buf[(7, 3)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
 
     #[test]
-    fn shared_blocks_merge_overlapping_graphemes_across_rows() {
+    fn grapheme_columns_align_across_different_scalar_counts() {
         let grid = compute("a\u{301}bcx\nab\u{301}cx\n", "a\u{301}bcy\nab\u{301}cy\n");
         let display = build_display(&grid);
         assert_eq!(
@@ -1329,21 +1293,58 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_sample_aligns_x_with_b_and_keeps_inserted_text_compact() {
+        let (mut app, a, b) = files_app("a\u{301}x\n中bcx\n", "a\u{301}y\n");
+        let display = app.display.as_ref().unwrap();
+        assert_eq!(
+            display.rows,
+            ["- ---|++", "a\u{301} x  |a\u{301}y", "中bcx|  "]
+        );
+        assert_eq!(display.width, 8);
+        let buf = draw_buffer(&mut app);
+        assert_column_backgrounds_align(&buf);
+        assert_eq!(buf[(1, 2)].symbol(), "a\u{301}");
+        assert_eq!(buf[(1, 3)].symbol(), "中");
+        assert_eq!(buf[(3, 2)].symbol(), "x");
+        assert_eq!(buf[(3, 3)].symbol(), "b");
+        assert_eq!(buf[(3, 1)].symbol(), "-");
+        assert_eq!(buf[(4, 3)].symbol(), "c");
+        assert_eq!(buf[(5, 3)].symbol(), "x");
+        for y in [1, 2, 3] {
+            assert_eq!(buf[(6, y)].symbol(), "|");
+            assert_eq!(buf[(6, y)].bg, Color::Reset);
+        }
+        assert_eq!(buf[(7, 2)].symbol(), "a\u{301}");
+        assert_eq!(buf[(8, 2)].symbol(), "y");
+        assert_eq!(buf[(7, 2)].bg, Color::Green);
+        assert_eq!(buf[(8, 2)].bg, Color::Green);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
     fn mixed_width_rows_pad_after_complete_graphemes() {
-        for (old, new, prefix, delete_x) in [
-            ("a\u{301}x\n中bx\n", "a\u{301}y\n中by\n", "a\u{301}", 5),
-            ("👩‍❤️‍👩x\n中abx\n", "👩‍❤️‍👩y\n中aby\n", "👩‍❤️‍👩", 6),
+        for (old, new, prefix, delete_x, insert_x, second_cell) in [
+            (
+                "a\u{301}x\n中bx\n",
+                "a\u{301}y\n中by\n",
+                "a\u{301}",
+                4,
+                7,
+                "b",
+            ),
+            ("👩‍❤️‍👩x\n中abx\n", "👩‍❤️‍👩y\n中aby\n", "👩‍❤️‍👩", 4, 6, "a"),
         ] {
             let (mut app, a, b) = files_app(old, new);
             let buf = draw_buffer(&mut app);
             assert_column_backgrounds_align(&buf);
             assert_eq!(buf[(1, 2)].symbol(), prefix);
-            for y in [2, 3] {
-                assert_eq!(buf[(delete_x, y)].symbol(), "x");
-                assert_eq!(buf[(delete_x + 2, y)].symbol(), "y");
-                assert_eq!(buf[(delete_x - 1, y)].symbol(), "|");
-                assert_eq!(buf[(delete_x + 1, y)].symbol(), "|");
-            }
+            assert_eq!(buf[(delete_x, 2)].symbol(), "x");
+            assert_eq!(buf[(insert_x, 2)].symbol(), "y");
+            assert_eq!(buf[(delete_x, 3)].symbol(), second_cell);
+            assert_eq!(buf[(insert_x, 3)].symbol(), second_cell);
+            assert_eq!(buf[(delete_x, 1)].symbol(), "-");
+            assert_eq!(buf[(insert_x, 1)].symbol(), "+");
             let _ = std::fs::remove_file(&a);
             let _ = std::fs::remove_file(&b);
         }

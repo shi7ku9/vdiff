@@ -1,10 +1,11 @@
 //! Column-based (vertical) diff engine.
 //!
-//! The diff units are *columns*: the k-th character of every line of a
+//! The diff units are *columns*: the k-th grapheme of every line of a
 //! file, padded with spaces, emitted as a structured `DiffGrid`.
 
 use std::ops::Range;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
@@ -16,9 +17,8 @@ pub enum StepKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     pub kind: StepKind,
-    /// One char per file line, padded with spaces to `grid.height`.
-    /// A String (not Vec<char>) halves the allocations for wide files.
-    pub content: String,
+    /// One complete grapheme per file line, padded with spaces to `grid.height`.
+    pub content: Vec<String>,
 }
 
 /// One diff step per file column.
@@ -87,38 +87,39 @@ const TAB_STOP: usize = 8;
 fn expand_tabs(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut col = 0usize;
-    for c in input.chars() {
-        if c == '\t' {
+    for grapheme in input.graphemes(true) {
+        if grapheme == "\t" {
             let next = (col / TAB_STOP + 1) * TAB_STOP;
             for _ in col..next {
                 out.push(' ');
             }
             col = next;
-        } else if c == '\n' {
-            out.push(c);
+        } else if grapheme.ends_with('\n') {
+            out.push_str(grapheme);
             col = 0;
         } else {
-            out.push(c);
-            col += c.width().unwrap_or(1);
+            out.push_str(grapheme);
+            col += UnicodeWidthStr::width(grapheme);
         }
     }
     out
 }
 
-/// One column of a file: the k-th char of every line, missing chars
+/// One column of a file: the k-th grapheme of every line, missing cells
 /// padded with spaces. Every column is padded to `height`.
-fn columns_padded(lines: &[String], height: usize) -> Vec<String> {
-    let chars: Vec<Vec<char>> = lines.iter().map(|line| line.chars().collect()).collect();
-    let width = chars.iter().map(|line| line.len()).max().unwrap_or(0);
+fn columns_padded(lines: &[String], height: usize) -> Vec<Vec<String>> {
+    let cells: Vec<Vec<&str>> = lines
+        .iter()
+        .map(|line| line.graphemes(true).collect())
+        .collect();
+    let width = cells.iter().map(|line| line.len()).max().unwrap_or(0);
     (0..width)
         .map(|col| {
-            let mut column = String::new();
-            for line in &chars {
-                column.push(line.get(col).copied().unwrap_or(' '));
+            let mut column = Vec::with_capacity(height);
+            for line in &cells {
+                column.push(line.get(col).copied().unwrap_or(" ").to_owned());
             }
-            for _ in column.chars().count()..height {
-                column.push(' ');
-            }
+            column.resize(height, " ".to_owned());
             column
         })
         .collect()
@@ -128,7 +129,7 @@ fn columns_padded(lines: &[String], height: usize) -> Vec<String> {
 /// suffix first so the LCS table stays small. When the two middle
 /// widths exceed the threshold the LCS is skipped entirely (degraded
 /// mode) and the middle is one big Delete+Insert.
-fn diff_columns(a: &[String], b: &[String]) -> (Vec<Step>, bool) {
+fn diff_columns(a: &[Vec<String>], b: &[Vec<String>]) -> (Vec<Step>, bool) {
     let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
     let suffix = a[prefix..]
         .iter()
@@ -170,7 +171,7 @@ fn diff_columns(a: &[String], b: &[String]) -> (Vec<Step>, bool) {
 
 /// Classic LCS dynamic programming over the (trimmed) column lists,
 /// emitting the edit operations in order.
-fn lcs_ops(a: &[String], b: &[String], out: &mut Vec<Step>) {
+fn lcs_ops(a: &[Vec<String>], b: &[Vec<String>], out: &mut Vec<Step>) {
     let (n, m) = (a.len(), b.len());
     if n == 0 {
         out.extend(b.iter().map(|c| Step {
@@ -285,9 +286,8 @@ pub fn compute(a: &str, b: &str) -> DiffGrid {
     if trailing_differs {
         // A column of spaces with a ↵ in the last row: the side that
         // ends in a newline owns the mark, the kind says which one.
-        let mut content = " ".repeat(height);
-        content.pop();
-        content.push('↵');
+        let mut content = vec![" ".to_owned(); height];
+        *content.last_mut().unwrap() = "↵".to_owned();
         let kind = if a_has_trailing {
             StepKind::Delete
         } else {
@@ -306,123 +306,54 @@ fn op_prefix(kind: StepKind) -> char {
     }
 }
 
-fn transpose_grid(grid: &[String]) -> Vec<String> {
-    let chars: Vec<Vec<char>> = grid.iter().map(|line| line.chars().collect()).collect();
-    let width = chars.iter().map(|line| line.len()).max().unwrap_or(0);
-    (0..width)
-        .map(|row| {
-            let mut line = String::new();
-            for grid_line in &chars {
-                line.push(grid_line.get(row).copied().unwrap_or(' '));
-            }
-            line
-        })
-        .collect()
-}
-
-/// Display width of one step's column: the widest char in the column.
-/// Every rendered row (marker and content) pads its cells to this so
-/// the `|` separators line up. The marker row renders one char per
-/// step, so a column counts as cells, not chars; `max(1)` keeps
-/// all-zero-width columns (bare combining marks) at one cell instead
-/// of zero.
+/// Display width of a column: the widest complete grapheme across rows.
+/// Zero-width standalone cells still reserve a marker position.
 pub(crate) fn step_width(step: &Step) -> usize {
     step.content
-        .chars()
-        .map(|c| c.width().unwrap_or(0))
+        .iter()
+        .map(|cell| UnicodeWidthStr::width(cell.as_str()))
         .max()
         .unwrap_or(0)
         .max(1)
 }
 
-/// Pad count for one cell: `col_w` cells minus the char's own width.
-/// Zero-width chars (ZWJ, combining marks) get no pad: a space after
-/// them would break the grapheme cluster they belong to (the pad
-/// lands after the char, keeping the cell left-aligned).
-pub(crate) fn cell_pad(c: char, col_w: usize) -> usize {
-    match c.width() {
-        Some(0) => 0,
-        _ => col_w.saturating_sub(c.width().unwrap_or(1)),
-    }
+/// Pad only after a complete grapheme, never between its scalars.
+pub(crate) fn cell_pad(cell: &str, width: usize) -> usize {
+    width.saturating_sub(UnicodeWidthStr::width(cell))
 }
 
-/// Insert `|` after each step marked in `boundaries`, padding every
-/// cell to its step column's display width (`widths`), so each column
-/// occupies the same cells in every row and separators line up
-/// across rows. Each final row holds exactly one char per diff step
-/// (plus pad spaces), so steps map 1:1 to chars.
-fn separate_ops(row: &str, boundaries: &[bool], widths: &[usize]) -> String {
-    let mut out = String::with_capacity(row.len() * 2 + widths.len());
-    let len = row.chars().count();
-    for (i, c) in row.chars().enumerate() {
-        out.push(c);
-        let cell = widths.get(i).copied().unwrap_or(1);
-        for _ in 0..cell_pad(c, cell) {
-            out.push(' ');
-        }
-        // No trailing separator: a trimmed marker row may end before
-        // the last step.
-        if i + 1 < len && boundaries.get(i).copied().unwrap_or(false) {
-            // A zero-width cell before a boundary emits no pad, so
-            // this `|` can land inside a grapheme cluster on that row
-            // only; padding the cell would break the cluster instead.
+/// Plain-text rows built directly from complete grapheme cells.
+/// Trailing match markers are omitted; content keeps the full column grid.
+pub fn render_text(grid: &DiffGrid) -> String {
+    if grid.steps.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let marker_end = grid
+        .steps
+        .iter()
+        .rposition(|step| step.kind != StepKind::Match)
+        .map_or(0, |i| i + 1);
+    for (i, step) in grid.steps.iter().take(marker_end).enumerate() {
+        let marker = op_prefix(step.kind).to_string();
+        out.push_str(&marker);
+        out.extend(std::iter::repeat_n(' ', cell_pad(&marker, grid.widths[i])));
+        if grid.is_group_end[i] && i + 1 < grid.steps.len() {
             out.push('|');
         }
     }
-    out
-}
-
-/// The plain-text view: marker row (trailing match markers
-/// trimmed, trailing `|` kept) followed by the file lines with `|`
-/// separators between groups. Empty when the grid has no steps.
-pub fn render_text(grid: &DiffGrid) -> String {
-    let lines: Vec<String> = grid
-        .steps
-        .iter()
-        .map(|s| {
-            let mut line = String::with_capacity(grid.height + 1);
-            line.push(op_prefix(s.kind));
-            line.push_str(&s.content);
-            // content is a String; chars() gives the char count.
-            for _ in s.content.chars().count()..grid.height {
-                line.push(' ');
-            }
-            line
-        })
-        .collect();
-    let transposed = transpose_grid(&lines);
-    let boundaries: Vec<bool> = grid
-        .steps
-        .windows(2)
-        .map(|w| w[0].kind != w[1].kind)
-        .collect();
-    let widths = &grid.widths;
-
-    let mut rows = Vec::with_capacity(transposed.len());
-    for (i, row) in transposed.into_iter().enumerate() {
-        if i == 0 {
-            let trimmed = row.trim_end_matches(' ');
-            let mut marker = separate_ops(trimmed, &boundaries, widths);
-            // The marker drops trailing match markers (spaces); keep
-            // the `|` that separates the last change from the tail.
-            if !marker.is_empty() && trimmed.len() < row.len() {
-                marker.push('|');
-            }
-            rows.push(marker);
-        } else {
-            rows.push(separate_ops(&row, &boundaries, widths));
-        }
-    }
-
-    let mut out = String::new();
-    if let Some((first, rest)) = rows.split_first() {
-        if !first.is_empty() {
-            out.push_str(first);
-            out.push('\n');
-        }
-        out.push_str(&rest.join("\n"));
-    }
     if !out.is_empty() {
+        out.push('\n');
+    }
+    for row in 0..grid.height {
+        for (i, step) in grid.steps.iter().enumerate() {
+            let cell = step.content.get(row).map(String::as_str).unwrap_or(" ");
+            out.push_str(cell);
+            out.extend(std::iter::repeat_n(' ', cell_pad(cell, grid.widths[i])));
+            if grid.is_group_end[i] && i + 1 < grid.steps.len() {
+                out.push('|');
+            }
+        }
         out.push('\n');
     }
     out
@@ -442,7 +373,7 @@ mod tests {
                     StepKind::Delete => "-",
                     StepKind::Insert => "+",
                 };
-                (p, s.content.chars().collect())
+                (p, s.content.concat())
             })
             .collect()
     }
@@ -455,6 +386,13 @@ mod tests {
         pairs.iter().map(|(p, c)| (*p, c.to_string())).collect()
     }
 
+    fn test_columns(contents: &[&str]) -> Vec<Vec<String>> {
+        contents
+            .iter()
+            .map(|column| column.graphemes(true).map(str::to_owned).collect())
+            .collect()
+    }
+
     #[test]
     fn expand_tabs_reaches_next_tab_stop() {
         assert_eq!(expand_tabs("a\tb"), "a       b");
@@ -464,6 +402,9 @@ mod tests {
         // Wide chars count display columns: 中 (2) then the tab lands
         // at the same stop as in a terminal.
         assert_eq!(expand_tabs("中\tx"), "中      x");
+        assert_eq!(expand_tabs("a\u{301}\tx"), "a\u{301}       x");
+        assert_eq!(expand_tabs("👩‍❤️‍👩\tx"), "👩‍❤️‍👩      x");
+        assert_eq!(expand_tabs("👩‍❤️‍👩\r\na\tx"), "👩‍❤️‍👩\r\na       x");
     }
 
     #[test]
@@ -498,7 +439,7 @@ mod tests {
 
     #[test]
     fn diff_columns_all_equal() {
-        let cols = vec!["ab".to_string(), "cd".to_string()];
+        let cols = test_columns(&["ab", "cd"]);
         let (steps, _) = diff_columns(&cols, &cols);
         assert_eq!(
             ops_of(&DiffGrid::from_parts(steps, 2, false)),
@@ -508,8 +449,8 @@ mod tests {
 
     #[test]
     fn diff_columns_replaces_one() {
-        let a = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let b = vec!["a".to_string(), "x".to_string(), "c".to_string()];
+        let a = test_columns(&["a", "b", "c"]);
+        let b = test_columns(&["a", "x", "c"]);
         let (steps, _) = diff_columns(&a, &b);
         assert_eq!(
             ops_of(&DiffGrid::from_parts(steps, 1, false)),
@@ -519,15 +460,15 @@ mod tests {
 
     #[test]
     fn diff_columns_inserts_and_deletes() {
-        let a = vec!["a".to_string(), "c".to_string()];
-        let b = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let a = test_columns(&["a", "c"]);
+        let b = test_columns(&["a", "b", "c"]);
         let (steps, _) = diff_columns(&a, &b);
         assert_eq!(
             ops_of(&DiffGrid::from_parts(steps, 1, false)),
             exp(&[("=", "a"), ("+", "b"), ("=", "c")])
         );
-        let a = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let b = vec!["a".to_string(), "c".to_string()];
+        let a = test_columns(&["a", "b", "c"]);
+        let b = test_columns(&["a", "c"]);
         let (steps, _) = diff_columns(&a, &b);
         assert_eq!(
             ops_of(&DiffGrid::from_parts(steps, 1, false)),
@@ -538,12 +479,12 @@ mod tests {
     #[test]
     fn diff_columns_empty_sides() {
         assert!(diff_columns(&[], &[]).0.is_empty());
-        let (steps, _) = diff_columns(&[], &["x".to_string()]);
+        let (steps, _) = diff_columns(&[], &test_columns(&["x"]));
         assert_eq!(
             ops_of(&DiffGrid::from_parts(steps, 1, false)),
             exp(&[("+", "x")])
         );
-        let (steps, _) = diff_columns(&["x".to_string()], &[]);
+        let (steps, _) = diff_columns(&test_columns(&["x"]), &[]);
         assert_eq!(
             ops_of(&DiffGrid::from_parts(steps, 1, false)),
             exp(&[("-", "x")])
@@ -649,8 +590,83 @@ mod tests {
     }
 
     #[test]
-    fn compute_pads_multibyte_columns_by_chars() {
-        // "é" is 2 bytes but 1 char — the pad loop must count chars,
+    fn combining_graphemes_are_one_column_across_file_lines() {
+        let grid = compute("a\u{301}x\n中bcx\n", "a\u{301}y\n");
+        assert_eq!(
+            ops_of(&grid),
+            exp(&[
+                ("-", "a\u{301}中"),
+                ("-", "xb"),
+                ("-", " c"),
+                ("-", " x"),
+                ("+", "a\u{301} "),
+                ("+", "y "),
+            ])
+        );
+        let expected = [
+            ["a\u{301}", "中"],
+            ["x", "b"],
+            [" ", "c"],
+            [" ", "x"],
+            ["a\u{301}", " "],
+            ["y", " "],
+        ];
+        for (step, cells) in grid.steps.iter().zip(expected) {
+            assert_eq!(step.content, cells);
+        }
+        assert_eq!(grid.height, 2);
+        assert_eq!(grid.groups, [0..4, 4..6]);
+        assert_eq!(grid.widths, [2, 1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn emoji_edits_replace_whole_grapheme_columns() {
+        let grid = compute("👩‍❤️‍👩x\n", "👩‍❤️‍💋‍👩x\n");
+        assert_eq!(grid.steps.len(), 3);
+        assert_eq!(grid.steps[0].kind, StepKind::Delete);
+        assert_eq!(grid.steps[0].content, ["👩‍❤️‍👩"]);
+        assert_eq!(grid.steps[1].kind, StepKind::Insert);
+        assert_eq!(grid.steps[1].content, ["👩‍❤️‍💋‍👩"]);
+        assert_eq!(grid.steps[2].kind, StepKind::Match);
+        assert_eq!(grid.steps[2].content, ["x"]);
+        assert_eq!(grid.widths, [2, 2, 1]);
+        assert_eq!(render_text(&grid), "- |+ |\n👩‍❤️‍👩|👩‍❤️‍💋‍👩|x\n");
+    }
+
+    #[test]
+    fn grapheme_comparison_does_not_normalize_source_text() {
+        let grid = compute("é\n", "e\u{301}\n");
+        assert_eq!(grid.steps.len(), 2);
+        assert_eq!(grid.steps[0].kind, StepKind::Delete);
+        assert_eq!(grid.steps[0].content, ["é"]);
+        assert_eq!(grid.steps[1].kind, StepKind::Insert);
+        assert_eq!(grid.steps[1].content, ["e\u{301}"]);
+        assert_eq!(render_text(&grid), "-|+\né|e\u{301}\n");
+    }
+
+    #[test]
+    fn unicode_tabs_and_newline_markers_preserve_cell_boundaries() {
+        let grid = compute("👩‍❤️‍👩\tx", "👩‍❤️‍👩\ty\n");
+        assert_eq!(grid.steps.len(), 10);
+        assert!(
+            grid.steps[..7]
+                .iter()
+                .all(|step| step.kind == StepKind::Match)
+        );
+        assert_eq!(grid.steps[0].content, ["👩‍❤️‍👩", " "]);
+        assert_eq!(grid.steps[7].content, ["x", " "]);
+        assert_eq!(grid.steps[8].content, ["y", " "]);
+        assert_eq!(grid.steps[9].content, [" ", "↵"]);
+        assert_eq!(grid.steps[9].kind, StepKind::Insert);
+        assert_eq!(
+            render_text(&grid),
+            "        |-|++\n👩‍❤️‍👩      |x|y \n        | | ↵\n"
+        );
+    }
+
+    #[test]
+    fn compute_pads_multibyte_columns_by_cells() {
+        // "é" is 2 bytes but 1 cell — padding must count file rows,
         // or "é" vs "é " compares unequal and yields a spurious
         // Delete+Insert (the ASCII analog "a\n" vs "a\n \n" is a Match).
         let grid = compute("é\n", "é\n \n");
@@ -661,8 +677,8 @@ mod tests {
     fn degraded_skips_lcs_for_pathological_widths() {
         // diff_columns works on columns, not lines: a 5000-char single
         // line becomes 5000 one-char columns (see columns_padded).
-        let a = vec!["a".to_string(); 5_000];
-        let b = vec!["b".to_string(); 5_000];
+        let a = vec![vec!["a".to_string()]; 5_000];
+        let b = vec![vec!["b".to_string()]; 5_000];
         // 5000*5000 > 1_000_000 → degraded path: LCS skipped, so each
         // middle column is one Delete (from a) followed by one Insert (from b).
         let (steps, degraded) = diff_columns(&a, &b);
@@ -724,7 +740,7 @@ mod tests {
         assert_eq!(
             step_width(&Step {
                 kind: StepKind::Match,
-                content: "a中".to_string()
+                content: vec!["a".to_owned(), "中".to_owned()]
             }),
             2
         );
@@ -732,9 +748,16 @@ mod tests {
         assert_eq!(
             step_width(&Step {
                 kind: StepKind::Match,
-                content: "\u{0301}".to_string()
+                content: vec!["\u{0301}".to_owned()]
             }),
             1
+        );
+        assert_eq!(
+            step_width(&Step {
+                kind: StepKind::Match,
+                content: vec!["👩‍❤️‍👩".to_owned(), "a\u{301}".to_owned()],
+            }),
+            2
         );
     }
 
@@ -784,16 +807,14 @@ mod tests {
 
     #[test]
     fn render_text_keeps_zero_width_clusters_intact() {
-        // A ZWJ cell is width 0; padding it would insert a space into
-        // the 👩‍❤️‍👩 emoji cluster and break it into separate glyphs.
+        // The whole ZWJ emoji is one cell and must never be split.
         let s = "👩‍❤️‍👩\n";
         assert_eq!(render_text(&compute(s, s)), s);
     }
 
     #[test]
     fn render_text_keeps_zwj_cluster_intact_in_wide_column() {
-        // A wide char in the ZWJ's column widens it to 2 cells; the
-        // ZWJ must still get no pad, or the family splits apart.
+        // The emoji and 中 share column 0; the other 中 has its own column.
         let s = "👩‍❤️‍👩\n中中\n";
         let rendered = render_text(&compute(s, s));
         assert!(

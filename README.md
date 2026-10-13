@@ -2,7 +2,17 @@
 
 `vdiff` diffs files **column-by-column** instead of line-by-line.
 
-Normal diff tools ask *"which lines changed?"*; `vdiff` asks *"which columns changed?"*. Every character position across all lines is a diff unit: the k-th character of every line becomes one column, columns are compared, and the result is shown back as rows with a marker row on top, so you can see exactly which **column** of your file changed, with the old and new characters side by side.
+Normal diff tools ask *"which lines changed?"*; `vdiff` asks *"which columns changed?"*. Every grapheme position across all lines is a diff unit: the k-th complete character of every line becomes one column, columns are compared, and the result is shown back as rows with a marker row on top, so you can see exactly which **column** of your file changed, with the old and new characters side by side.
+
+A grapheme is a complete displayed character: `á` (a letter plus a combining
+accent) occupies one column, and a ZWJ emoji such as `👩‍❤️‍👩` also occupies one
+column. Each column uses its widest cell's display width, so a one-cell character
+is padded when it shares a column with a two-cell Chinese character. Padding
+comes after the complete grapheme. Original grapheme text is compared without
+Unicode normalization.
+
+Columns compare across every file line. Removing a line can therefore mark a
+whole column as changed even when some characters in that column are unchanged.
 
 Yes, this is counterintuitive. That's the point. It's a toy, a fun way to look at your files sideways.
 
@@ -49,8 +59,9 @@ file content, and empty space down to the bottom of the diff pane.
 Unchanged columns use the terminal's default
 colors, and group separators stay neutral.
 
+Accent changes such as `é` → `ë` compare the two complete graphemes.
 Standalone combining marks use a dotted circle as a display base (`◌́`, `◌̈`)
-so edits to accents remain visible. Changes consisting only of filtered control
+so marks without a base character remain visible. Changes consisting only of filtered control
 characters are shown as Unicode code points, such as `U+000D`. These are TUI
 representations; the source files are unchanged.
 
@@ -150,6 +161,6 @@ When adding new files, stage them first so Nix includes them in the flake source
 
 - The diff engine is a classic LCS over columns, with common prefix/suffix trimmed first. Typical diffs only touch a handful of columns.
 - Files that are very wide on both sides degrade gracefully: when the product of the two middle widths would exceed 1,000,000 columns, the LCS table is skipped and the middle columns are treated as one big change (the status bar tells you).
-- CRLF, UTF-8, and CJK characters are handled; multi-byte characters never get split mid-character. Tabs expand to the next tab stop (8) so columns line up, and a missing trailing newline shows as a `↵` column.
+- CRLF, UTF-8, and CJK characters are handled; combining sequences and ZWJ emoji stay in one column. Tabs expand to the next tab stop (8) using complete grapheme widths, and a missing trailing newline shows as a `↵` column.
 
 Enjoy looking at your diffs sideways.
