@@ -62,9 +62,12 @@ fn build_display(grid: &DiffGrid) -> Display {
             StepKind::Insert => '+',
         };
         for step in &grid.steps[group.clone()] {
-            let cells: Vec<_> = (0..grid.height)
-                .map(|row| {
-                    let raw = step.content.get(row).map(String::as_str).unwrap_or(" ");
+            let cells: Vec<_> = step
+                .content
+                .iter()
+                .chain(std::iter::repeat(" "))
+                .take(grid.height)
+                .map(|raw| {
                     let text = visible_block(raw, kind);
                     let width = rendered_width(&text);
                     (text, width)
@@ -665,11 +668,7 @@ impl App {
 fn first_affected_row(grid: &DiffGrid, group: &std::ops::Range<usize>) -> Option<usize> {
     grid.steps[group.clone()]
         .iter()
-        .filter_map(|step| {
-            step.content
-                .iter()
-                .position(|cell| cell.chars().any(|c| c != ' '))
-        })
+        .filter_map(|step| step.content.first_non_padding_row())
         .min()
 }
 
