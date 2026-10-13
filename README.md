@@ -43,6 +43,12 @@ in|au|t| main() {      |o main() -> int| |{|        |  |
 
 The first row is the **marker row**: `-`/`+` mark the columns that changed. The `|` separators group runs of changes; the one between `-` and `+` separates the delete run and insert run of the same changed column. Each following row is one line of the file, with the old and new characters of each changed column shown side by side.
 
+In the TUI, deleted columns have a red background and inserted columns have a
+green background, with black text. The color extends through the marker row,
+file content, and empty space down to the bottom of the diff pane.
+Unchanged columns use the terminal's default
+colors, and group separators stay neutral.
+
 ## Usage
 
 ```console

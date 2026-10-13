@@ -3,7 +3,7 @@
 //! The diff grid is rendered as display rows: `build_rows` turns a
 //! `DiffGrid` into full-width strings (marker row first), and
 //! `slice_by_width` implements width-aware horizontal scrolling so
-//! wide characters (CJK) are never split in half.
+//! grapheme clusters (CJK, combining marks, emoji) are never split.
 
 use crate::diff::{self, DiffGrid, StepKind, cell_pad};
 use crate::git::{self, ChangedFile, GitShell, RevSpec, Status};
@@ -15,83 +15,123 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use std::io;
 use std::path::PathBuf;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Display rows for the TUI: rows[0] is the marker row (one char per
 /// step, `|` between groups, padded with spaces to the full content
 /// display width), rows[i+1] is file line i. Every cell is padded to
-/// its step column's display width, so each column occupies the same
-/// cells in every row: separators line up vertically, and narrow
-/// chars in wide columns sit at their column's start (a.txt case:
-/// `a b c d ` under `你好啊！`).
+/// its step column's display width. Combining marks and ZWJ sequences
+/// stay attached to their graphemes, so those content rows can be
+/// narrower than the marker row.
 pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
-    let mut marker = String::new();
-    let mut rows: Vec<String> = (0..grid.height).map(|_| String::new()).collect();
+    build_display(grid)
+        .rows
+        .into_iter()
+        .map(|row| row.text)
+        .collect()
+}
+
+/// Cached text and diff kind per rendered display cell. `None` denotes
+/// a group separator.
+#[derive(Default)]
+struct DisplayRow {
+    text: String,
+    kinds: Vec<Option<StepKind>>,
+}
+
+impl DisplayRow {
+    /// Keep one kind per emitted scalar during construction so graphemes
+    /// can combine across adjacent diff columns before styles are laid out.
+    fn push(&mut self, c: char, kind: Option<StepKind>, width: usize) {
+        self.text.push(c);
+        self.kinds.push(kind);
+        for _ in 0..cell_pad(c, width) {
+            self.text.push(' ');
+            self.kinds.push(kind);
+        }
+    }
+
+    fn layout(mut self) -> Self {
+        let span = Span::raw(self.text.as_str());
+        let mut scalar_kinds = self.kinds.into_iter();
+        let mut cells = Vec::new();
+        for grapheme in span.styled_graphemes(Style::default()) {
+            let mut kind = scalar_kinds.next().unwrap();
+            for _ in grapheme.symbol.chars().skip(1) {
+                let next = scalar_kinds.next().unwrap();
+                // A changed combining mark colors the complete grapheme;
+                // its scalars cannot be styled independently.
+                if !matches!(kind, Some(StepKind::Delete | StepKind::Insert))
+                    && matches!(next, Some(StepKind::Delete | StepKind::Insert))
+                {
+                    kind = next;
+                }
+            }
+            // Match ratatui's segmentation, widths, and control filtering.
+            if !grapheme.symbol.chars().any(char::is_control) {
+                cells.extend(std::iter::repeat_n(
+                    kind,
+                    Span::raw(grapheme.symbol).width(),
+                ));
+            }
+        }
+        self.kinds = cells;
+        self
+    }
+}
+
+fn cell_style(kind: Option<StepKind>) -> Style {
+    let neutral = Style::default().fg(Color::Reset).bg(Color::Reset);
+    match kind {
+        Some(StepKind::Match) => neutral,
+        Some(StepKind::Delete) => neutral.fg(Color::Black).bg(Color::Red),
+        Some(StepKind::Insert) => neutral.fg(Color::Black).bg(Color::Green),
+        None => neutral.fg(Color::DarkGray),
+    }
+}
+
+/// Cached display rows for the current grid, rebuilt once per reload.
+struct Display {
+    rows: Vec<DisplayRow>,
+    /// Maximum rendered width; grapheme clusters can shorten content rows.
+    width: usize,
+}
+
+fn build_display(grid: &DiffGrid) -> Display {
+    let mut marker = DisplayRow::default();
+    let mut rows: Vec<DisplayRow> = (0..grid.height).map(|_| DisplayRow::default()).collect();
     for (i, step) in grid.steps.iter().enumerate() {
         let col_w = grid.widths[i];
         for (r, c) in step.content.chars().enumerate() {
-            rows[r].push(c);
-            // Pad every cell to its step column's display width so
-            // wide (CJK) cells don't shift the `|` separators.
-            for _ in 0..cell_pad(c, col_w) {
-                rows[r].push(' ');
-            }
+            rows[r].push(c, Some(step.kind), col_w);
         }
         let mark = match step.kind {
             StepKind::Match => ' ',
             StepKind::Delete => '-',
             StepKind::Insert => '+',
         };
-        marker.push(mark);
-        // Marker glyphs are 1 cell wide, so the general cell rule
-        // pads them to col_w - 1.
-        for _ in 0..cell_pad(mark, col_w) {
-            marker.push(' ');
-        }
+        marker.push(mark, Some(step.kind), col_w);
         // Precomputed group-end flags: O(1) per step instead of
         // scanning every group for each step.
         let ends_group = grid.is_group_end[i] && i + 1 < grid.steps.len();
         if ends_group {
-            marker.push('|');
+            marker.push('|', None, 1);
             for row in &mut rows {
-                row.push('|');
+                row.push('|', None, 1);
             }
         }
     }
-    // Every row already has the same display width (cells padded to
-    // their step column's width), so this is a no-op safety net.
     let content_width = rows
         .iter()
-        .map(|r| UnicodeWidthStr::width(r.as_str()))
+        .map(|row| Span::raw(row.text.as_str()).width())
         .max()
         .unwrap_or(0);
-    while UnicodeWidthStr::width(marker.as_str()) < content_width {
-        marker.push(' ');
+    while Span::raw(marker.text.as_str()).width() < content_width {
+        marker.push(' ', Some(StepKind::Match), 1);
     }
     let mut out = vec![marker];
     out.extend(rows);
-    out
-}
-
-/// Cached display rows for the current grid. Rows depend only on the
-/// `DiffGrid`, so they are built once per reload instead of
-/// re-serializing the whole grid on every frame (which used to happen
-/// ~3× per keypress).
-struct Display {
-    rows: Vec<String>,
-    /// Content display width (cells), i.e. the common row width.
-    width: usize,
-}
-
-/// Build the display rows for a grid (marker row + one row per file
-/// line) and their display width.
-fn build_display(grid: &DiffGrid) -> Display {
-    let rows = build_rows(grid);
-    let width = rows
-        .iter()
-        .map(|r| UnicodeWidthStr::width(r.as_str()))
-        .max()
-        .unwrap_or(0);
+    let rows: Vec<_> = out.into_iter().map(DisplayRow::layout).collect();
+    let width = rows.iter().map(|row| row.kinds.len()).max().unwrap_or(0);
     Display { rows, width }
 }
 
@@ -350,6 +390,21 @@ impl App {
                 let Some(disp) = &self.display else {
                     return;
                 };
+                // Color the full visible column, including the empty area
+                // below the file. Row drawing restores continuation-cell
+                // styles after ratatui writes wide characters.
+                for (offset, kind) in disp.rows[0]
+                    .kinds
+                    .iter()
+                    .skip(self.scroll_x)
+                    .take(usize::from(inner.width))
+                    .enumerate()
+                {
+                    frame.buffer_mut().set_style(
+                        Rect::new(inner.x + offset as u16, inner.y, 1, inner.height),
+                        cell_style(*kind),
+                    );
+                }
                 let rows = &disp.rows;
                 // Row windows are computed in usize: u16 would wrap
                 // around for diffs taller than 65535 rows and blank
@@ -358,7 +413,7 @@ impl App {
                 let top = usize::from(inner.y);
                 let bottom = top + usize::from(inner.height);
                 if let Some(marker) = rows.first() {
-                    self.draw_marker_row(frame, inner, inner.y, marker);
+                    self.draw_row(frame, inner, inner.y, marker);
                 }
                 for (i, row) in rows.iter().enumerate().skip(1) {
                     let y = top.saturating_add(i).saturating_sub(self.scroll_y);
@@ -371,7 +426,7 @@ impl App {
                     if y >= bottom || y >= usize::from(u16::MAX) {
                         break;
                     }
-                    self.draw_content_row(frame, inner, y as u16, row);
+                    self.draw_row(frame, inner, y as u16, row);
                 }
             }
             (None, Some(message)) => {
@@ -390,63 +445,35 @@ impl App {
         }
     }
 
-    fn draw_row(
-        &self,
-        frame: &mut Frame<'_>,
-        inner: Rect,
-        y: u16,
-        row: &str,
-        scroll_x: usize,
-        style_for: impl Fn(char) -> Style,
-    ) {
-        let (visible, first_cell) = slice_by_width(row, scroll_x, inner.width as usize);
+    fn draw_row(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, row: &DisplayRow) {
+        let scroll_x = self.scroll_x;
+        let (visible, first_cell) = slice_by_width(&row.text, scroll_x, inner.width as usize);
         // A wide char straddling the scroll boundary is skipped whole,
         // so the first drawn char may sit past the viewport start; the
         // offset keeps this row's grid cells under the same viewport
         // columns as the (all-width-1) marker row.
-        let mut x = inner.x + (first_cell - scroll_x) as u16;
-        // Group consecutive equally-styled chars into runs and write each
-        // run with one set_string — avoids allocating a String per char.
-        let mut run = String::new();
-        let mut run_style = Style::default();
-        let mut in_run = false;
-        for c in visible.chars() {
-            let style = style_for(c);
-            if !in_run {
-                run.push(c);
-                run_style = style;
-                in_run = true;
-            } else if run_style == style {
-                run.push(c);
-            } else {
-                set_run(frame, &mut x, y, &run, run_style);
-                run.clear();
-                run.push(c);
-                run_style = style;
-            }
+        let x = inner.x + (first_cell - scroll_x) as u16;
+        // Content rows can be shorter than the marker. Clear the inherited
+        // column styles before applying this row's actual grapheme layout.
+        frame.buffer_mut().set_style(
+            Rect::new(inner.x, y, inner.width, 1),
+            cell_style(Some(StepKind::Match)),
+        );
+        // Draw the text together to preserve grapheme clusters, then style
+        // display cells. This also colors wide-character continuation cells
+        // and blank cells where a wide character was clipped at either edge.
+        frame
+            .buffer_mut()
+            .set_string(x, y, &visible, Style::default());
+        for (offset, kind) in row
+            .kinds
+            .iter()
+            .skip(scroll_x)
+            .take(usize::from(inner.width))
+            .enumerate()
+        {
+            frame.buffer_mut()[(inner.x + offset as u16, y)].set_style(cell_style(*kind));
         }
-        if in_run {
-            set_run(frame, &mut x, y, &run, run_style);
-        }
-    }
-
-    fn draw_marker_row(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, row: &str) {
-        self.draw_row(frame, inner, y, row, self.scroll_x, |c| match c {
-            '-' => Style::default().fg(Color::Red),
-            '+' => Style::default().fg(Color::Green),
-            '|' => Style::default().fg(Color::DarkGray),
-            _ => Style::default(),
-        });
-    }
-
-    fn draw_content_row(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, row: &str) {
-        self.draw_row(frame, inner, y, row, self.scroll_x, |c| {
-            if c == '|' {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            }
-        });
     }
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -688,27 +715,26 @@ pub fn run_tui_app(app: &mut App) -> io::Result<()> {
     result
 }
 
-/// Write `run` at `(x, y)` with `style` and advance `x` by the run's
-/// display width. Wide chars are handled by ratatui's `set_string`.
-fn set_run(frame: &mut Frame<'_>, x: &mut u16, y: u16, run: &str, style: Style) {
-    frame.buffer_mut().set_string(*x, y, run, style);
-    *x += UnicodeWidthStr::width(run) as u16;
-}
-
 /// Slice `s` by display width: skip the first `start` cells, keep at
-/// most `max_width` cells. A wide char that straddles a boundary is
-/// skipped whole (its width still consumes the cells up to the
-/// boundary), so output never contains a partial wide char. Returns
-/// the drawn text plus the grid cell index of its first char. That
-/// index sits past `start` when a straddling wide char was skipped,
+/// most `max_width` cells. A grapheme that straddles a boundary is
+/// skipped whole, so output never contains a partial grapheme. Returns
+/// the drawn text plus the display cell index of its first grapheme. That
+/// index sits past `start` when a straddling wide grapheme was skipped,
 /// so the caller can keep rows aligned under the same viewport
 /// columns.
 pub fn slice_by_width(s: &str, start: usize, max_width: usize) -> (String, usize) {
     let mut out = String::new();
     let mut first = start;
     let mut pos = 0usize;
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
+    let span = Span::raw(s);
+    for grapheme in span.styled_graphemes(Style::default()) {
+        if grapheme.symbol.chars().any(char::is_control) {
+            continue;
+        }
+        let w = Span::raw(grapheme.symbol).width();
+        if w == 0 {
+            continue;
+        }
         if pos + w <= start {
             pos += w;
             continue;
@@ -722,7 +748,7 @@ pub fn slice_by_width(s: &str, start: usize, max_width: usize) -> (String, usize
             if out.is_empty() {
                 first = pos;
             }
-            out.push(c);
+            out.push_str(grapheme.symbol);
             pos += w;
         } else {
             break;
@@ -801,6 +827,18 @@ mod tests {
         assert_eq!(slice_by_width("", 0, 5), (String::new(), 0));
     }
 
+    #[test]
+    fn slice_keeps_combining_and_zwj_graphemes_whole() {
+        assert_eq!(slice_by_width("a\u{301}x", 0, 1), ("a\u{301}".into(), 0));
+        assert_eq!(slice_by_width("a\u{301}x", 1, 1), ("x".into(), 1));
+        let family = "👨\u{200D}👩";
+        let text = format!("{family}x");
+        assert_eq!(slice_by_width(&text, 0, 2), (family.into(), 0));
+        assert_eq!(slice_by_width(&text, 0, 1), (String::new(), 0));
+        assert_eq!(slice_by_width(&text, 1, 2), ("x".into(), 2));
+        assert_eq!(slice_by_width(&text, 2, 1), ("x".into(), 2));
+    }
+
     use crate::git::{ChangedFile, FakeGit, RevSpec, Source, Status};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -870,6 +908,17 @@ mod tests {
         terminal.backend().clone()
     }
 
+    // The backend skips wide-character continuation cells. Inspect the
+    // completed frame to check their styles as well as the printed glyphs.
+    fn draw_buffer(app: &mut App) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| app.render(frame))
+            .unwrap()
+            .buffer
+            .clone()
+    }
+
     #[test]
     fn renders_marker_row_with_colors() {
         let (mut app, a, b) = files_app("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
@@ -879,10 +928,31 @@ mod tests {
         // border at y=0, marker row at y=1 from x=1.
         // Marker: "    |-|+...": '|' at col 5, '-' at col 6, '+' at col 8.
         assert_eq!(buf[(6, 1)].symbol(), "-");
-        assert_eq!(buf[(6, 1)].fg, ratatui::style::Color::Red);
+        assert_eq!(buf[(6, 1)].fg, Color::Black);
+        assert_eq!(buf[(6, 1)].bg, Color::Red);
         assert_eq!(buf[(8, 1)].symbol(), "+");
-        assert_eq!(buf[(8, 1)].fg, ratatui::style::Color::Green);
+        assert_eq!(buf[(8, 1)].fg, Color::Black);
+        assert_eq!(buf[(8, 1)].bg, Color::Green);
         assert_eq!(buf[(5, 1)].symbol(), "|");
+        for y in 2..=4 {
+            assert_eq!(buf[(6, y)].bg, Color::Red);
+            assert_eq!(buf[(8, y)].bg, Color::Green);
+            assert_eq!(buf[(6, y)].fg, Color::Black);
+            assert_eq!(buf[(8, y)].fg, Color::Black);
+            assert_eq!(buf[(1, y)].bg, Color::Reset);
+            assert_eq!(buf[(5, y)].bg, Color::Reset);
+            assert_eq!(buf[(5, y)].fg, Color::DarkGray);
+        }
+        for y in 5..=21 {
+            assert_eq!(buf[(6, y)].bg, Color::Red);
+            assert_eq!(buf[(8, y)].bg, Color::Green);
+            assert_eq!(buf[(5, y)].bg, Color::Reset);
+            assert_eq!(buf[(12, y)].bg, Color::Reset);
+        }
+        assert_eq!(buf[(6, 22)].bg, Color::Reset); // bottom border
+        assert_eq!(buf[(6, 22)].symbol(), "─");
+        assert_eq!(buf[(6, 23)].bg, Color::Reset); // status bar
+        assert_eq!(buf[(12, 2)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -890,8 +960,7 @@ mod tests {
     #[test]
     fn cjk_separators_align_in_tui() {
         let (mut app, a, b) = files_app("中文abc\n", "中日abc\n");
-        let backend = draw(&mut app);
-        let buf = backend.buffer();
+        let buf = draw_buffer(&mut app);
         // Marker "  |- |+ |   " and content "中|文|日|abc" both place
         // the `|`s at display cells 2, 5, 8. In buffer coords (inner
         // starts at (1,1)) those are x = 3, 6, 9 on the marker row
@@ -908,6 +977,14 @@ mod tests {
         assert_eq!(buf[(7, 1)].symbol(), "+");
         assert_eq!(buf[(4, 2)].symbol(), "文");
         assert_eq!(buf[(7, 2)].symbol(), "日");
+        for y in 1..=2 {
+            for x in [4, 5] {
+                assert_eq!(buf[(x, y)].bg, Color::Red);
+            }
+            for x in [7, 8] {
+                assert_eq!(buf[(x, y)].bg, Color::Green);
+            }
+        }
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -926,6 +1003,194 @@ mod tests {
         assert_eq!(buf[(1, 2)].symbol(), "👨\u{200D}👩");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn colors_padding_in_wide_changed_columns() {
+        let (mut app, a, b) = files_app("中文\na文\n", "中文\nb文\n");
+        let buf = draw_buffer(&mut app);
+        for y in 1..=3 {
+            for x in [1, 2] {
+                assert_eq!(buf[(x, y)].bg, Color::Red);
+            }
+            for x in [4, 5] {
+                assert_eq!(buf[(x, y)].bg, Color::Green);
+            }
+            for x in [3, 6, 7, 8] {
+                assert_eq!(buf[(x, y)].bg, Color::Reset);
+            }
+        }
+        assert_eq!(buf[(2, 3)].symbol(), " ");
+        assert_eq!(buf[(5, 3)].symbol(), " ");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn colors_changes_after_combining_marks_and_zwj_graphemes() {
+        for (prefix, prefix_width) in [("a\u{301}", 1), ("👨\u{200D}👩", 2)] {
+            let (mut app, a, b) = files_app(&format!("{prefix}x\n"), &format!("{prefix}y\n"));
+            let buf = draw_buffer(&mut app);
+            assert_eq!(buf[(1, 2)].symbol(), prefix);
+            for x in 1..=prefix_width {
+                assert_eq!(buf[(x, 2)].bg, Color::Reset);
+            }
+            let delete_x = prefix_width + 2;
+            let insert_x = prefix_width + 4;
+            assert_eq!(buf[(delete_x, 2)].symbol(), "x");
+            assert_eq!(buf[(delete_x, 2)].bg, Color::Red);
+            assert_eq!(buf[(insert_x, 2)].symbol(), "y");
+            assert_eq!(buf[(insert_x, 2)].bg, Color::Green);
+            for x in [prefix_width + 1, prefix_width + 3] {
+                assert_eq!(buf[(x, 2)].symbol(), "|");
+                assert_eq!(buf[(x, 2)].fg, Color::DarkGray);
+                assert_eq!(buf[(x, 2)].bg, Color::Reset);
+            }
+            assert_eq!(buf[(insert_x + 1, 2)].bg, Color::Reset);
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+        }
+    }
+
+    #[test]
+    fn content_rows_use_their_own_grapheme_layouts() {
+        let (mut app, a, b) = files_app("a\u{301}x\nabz\n", "a\u{301}y\nabz\n");
+        let buf = draw_buffer(&mut app);
+        for (y, delete_x, insert_x, deleted, inserted) in [(2, 3, 5, "x", "y"), (3, 4, 6, "z", "z")]
+        {
+            assert_eq!(buf[(delete_x, y)].symbol(), deleted);
+            assert_eq!(buf[(delete_x, y)].bg, Color::Red);
+            assert_eq!(buf[(insert_x, y)].symbol(), inserted);
+            assert_eq!(buf[(insert_x, y)].bg, Color::Green);
+            assert_eq!(buf[(delete_x - 1, y)].bg, Color::Reset);
+            assert_eq!(buf[(delete_x + 1, y)].bg, Color::Reset);
+            assert_eq!(buf[(insert_x + 1, y)].bg, Color::Reset);
+        }
+        // Blank rows retain the marker's full-height column bands.
+        assert_eq!(buf[(4, 21)].bg, Color::Red);
+        assert_eq!(buf[(6, 21)].bg, Color::Green);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn scrolled_unicode_changes_keep_their_backgrounds() {
+        for (prefix, width, deleted_x, inserted_x) in
+            [("a\u{301}", 6, 2, 4), ("👨\u{200D}👩", 7, 3, 5)]
+        {
+            let (mut app, a, b) = files_app(&format!("{prefix}x\n"), &format!("{prefix}y\n"));
+            let mut terminal = Terminal::new(TestBackend::new(width, 6)).unwrap();
+            app.scroll_x = 1;
+            let buf = terminal.draw(|frame| app.render(frame)).unwrap().buffer;
+            assert_eq!(app.scroll_x, 1);
+            assert_eq!(buf[(deleted_x, 2)].symbol(), "x");
+            assert_eq!(buf[(deleted_x, 2)].bg, Color::Red);
+            assert_eq!(buf[(inserted_x, 2)].symbol(), "y");
+            assert_eq!(buf[(inserted_x, 2)].bg, Color::Green);
+            for x in [deleted_x - 1, deleted_x + 1] {
+                assert_eq!(buf[(x, 2)].symbol(), "|");
+                assert_eq!(buf[(x, 2)].fg, Color::DarkGray);
+                assert_eq!(buf[(x, 2)].bg, Color::Reset);
+            }
+            if width == 7 {
+                assert_eq!(buf[(1, 2)].symbol(), " ");
+                assert_eq!(buf[(1, 2)].bg, Color::Reset);
+            }
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+        }
+    }
+
+    #[test]
+    fn literal_pipe_uses_its_column_style() {
+        for (old, new, color) in [("|\n", "x\n", Color::Red), ("x\n", "|\n", Color::Green)] {
+            let (mut app, a, b) = files_app(old, new);
+            let backend = draw(&mut app);
+            let buf = backend.buffer();
+            let x = if color == Color::Red { 1 } else { 3 };
+            assert_eq!(buf[(x, 2)].symbol(), "|");
+            assert_eq!(buf[(x, 2)].bg, color);
+            assert_eq!(buf[(x, 2)].fg, Color::Black);
+            assert_eq!(buf[(2, 2)].bg, Color::Reset);
+            assert_eq!(buf[(2, 2)].fg, Color::DarkGray);
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+        }
+        let (mut app, a, b) = files_app("|\n", "|\n");
+        let backend = draw(&mut app);
+        assert_eq!(backend.buffer()[(1, 2)].fg, Color::Reset);
+        assert_eq!(backend.buffer()[(1, 2)].bg, Color::Reset);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn colors_pure_additions_and_deletions() {
+        for (old, new, color) in [("", "中\na\n", Color::Green), ("中\na\n", "", Color::Red)] {
+            let (mut app, a, b) = files_app(old, new);
+            let buf = draw_buffer(&mut app);
+            let width = app.display.as_ref().unwrap().width as u16;
+            for y in 1..=21 {
+                for x in 1..=width {
+                    assert_eq!(buf[(x, y)].bg, color);
+                    assert_eq!(buf[(x, y)].fg, Color::Black);
+                }
+                assert_eq!(buf[(width + 1, y)].bg, Color::Reset);
+            }
+            assert_eq!(buf[(1, 22)].bg, Color::Reset); // bottom border
+            assert_eq!(buf[(1, 23)].bg, Color::Reset); // status bar
+            assert_eq!(buf[(1, 0)].bg, Color::Reset); // top border
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+        }
+    }
+
+    #[test]
+    fn colors_wide_characters_clipped_at_viewport_edges() {
+        let (mut app, a, b) = files_app(
+            &format!("{}\n", "中文abc".repeat(10)),
+            &format!("{}\n", "中日abc".repeat(10)),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(6, 6)).unwrap();
+        for (scroll, colors) in [
+            (3, [Color::Red, Color::Red, Color::Reset, Color::Green]),
+            (4, [Color::Red, Color::Reset, Color::Green, Color::Green]),
+            (7, [Color::Green, Color::Reset, Color::Reset, Color::Reset]),
+        ] {
+            app.scroll_x = scroll;
+            let buf = terminal.draw(|frame| app.render(frame)).unwrap().buffer;
+            for y in [1, 2, 3] {
+                for (offset, color) in colors.into_iter().enumerate() {
+                    assert_eq!(
+                        buf[(offset as u16 + 1, y)].bg,
+                        color,
+                        "scroll={scroll}, y={y}"
+                    );
+                }
+            }
+            let clipped_x = if scroll == 3 { 4 } else { 1 };
+            assert_eq!(buf[(clipped_x, 2)].symbol(), " ");
+        }
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn switching_files_clears_previous_backgrounds() {
+        let mut app = git_app(vec![("a\n", "b\n"), ("same\n", "same\n")]);
+        app.show_sidebar = false;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(1, 2)].bg, Color::Red);
+        assert_eq!(terminal.backend().buffer()[(3, 2)].bg, Color::Green);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(app.selection, 1);
+        for y in 1..=21 {
+            for x in 1..=4 {
+                assert_eq!(terminal.backend().buffer()[(x, y)].bg, Color::Reset);
+            }
+        }
     }
 
     #[test]
@@ -984,6 +1249,10 @@ mod tests {
         // after vertical scroll.
         assert_eq!(buf[(1, 1)].symbol(), "-");
         assert_eq!(buf[(3, 1)].symbol(), "+");
+        for y in [1, 2, 21] {
+            assert_eq!(buf[(1, y)].bg, Color::Red);
+            assert_eq!(buf[(3, y)].bg, Color::Green);
+        }
         assert_eq!(app.scroll_y, 10, "clamp must keep a valid scroll");
         // Line 30 sits on the pane's bottom row: '3' at col 0, '0' at
         // col 5 (delete|insert cells, then the '0' of "30").
