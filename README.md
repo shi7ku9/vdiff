@@ -45,7 +45,8 @@ The first row is the **marker row**: `-`/`+` mark the columns that changed. The 
 
 In the TUI, deleted columns have a red background and inserted columns have a
 green background, with black text. The color extends through the marker row,
-file content, and padding spaces. Unchanged columns use the terminal's default
+file content, and empty space down to the bottom of the diff pane.
+Unchanged columns use the terminal's default
 colors, and group separators stay neutral.
 
 ## Usage

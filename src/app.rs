@@ -369,6 +369,21 @@ impl App {
                 let Some(disp) = &self.display else {
                     return;
                 };
+                // Color the full visible column, including the empty area
+                // below the file. Row drawing restores continuation-cell
+                // styles after ratatui writes wide characters.
+                for (offset, style) in disp
+                    .styles
+                    .iter()
+                    .skip(self.scroll_x)
+                    .take(usize::from(inner.width))
+                    .enumerate()
+                {
+                    frame.buffer_mut().set_style(
+                        Rect::new(inner.x + offset as u16, inner.y, 1, inner.height),
+                        *style,
+                    );
+                }
                 let rows = &disp.rows;
                 // Row windows are computed in usize: u16 would wrap
                 // around for diffs taller than 65535 rows and blank
@@ -892,7 +907,15 @@ mod tests {
             assert_eq!(buf[(5, y)].bg, Color::Reset);
             assert_eq!(buf[(5, y)].fg, Color::DarkGray);
         }
-        assert_eq!(buf[(6, 5)].bg, Color::Reset);
+        for y in 5..=21 {
+            assert_eq!(buf[(6, y)].bg, Color::Red);
+            assert_eq!(buf[(8, y)].bg, Color::Green);
+            assert_eq!(buf[(5, y)].bg, Color::Reset);
+            assert_eq!(buf[(12, y)].bg, Color::Reset);
+        }
+        assert_eq!(buf[(6, 22)].bg, Color::Reset); // bottom border
+        assert_eq!(buf[(6, 22)].symbol(), "─");
+        assert_eq!(buf[(6, 23)].bg, Color::Reset); // status bar
         assert_eq!(buf[(12, 2)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -996,14 +1019,16 @@ mod tests {
             let (mut app, a, b) = files_app(old, new);
             let buf = draw_buffer(&mut app);
             let width = app.display.as_ref().unwrap().width as u16;
-            for y in 1..=4 {
+            for y in 1..=21 {
                 for x in 1..=width {
                     assert_eq!(buf[(x, y)].bg, color);
                     assert_eq!(buf[(x, y)].fg, Color::Black);
                 }
                 assert_eq!(buf[(width + 1, y)].bg, Color::Reset);
             }
-            assert_eq!(buf[(1, 5)].bg, Color::Reset);
+            assert_eq!(buf[(1, 22)].bg, Color::Reset); // bottom border
+            assert_eq!(buf[(1, 23)].bg, Color::Reset); // status bar
+            assert_eq!(buf[(1, 0)].bg, Color::Reset); // top border
             let _ = std::fs::remove_file(&a);
             let _ = std::fs::remove_file(&b);
         }
@@ -1015,7 +1040,7 @@ mod tests {
             &format!("{}\n", "中文abc".repeat(10)),
             &format!("{}\n", "中日abc".repeat(10)),
         );
-        let mut terminal = Terminal::new(TestBackend::new(6, 5)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(6, 6)).unwrap();
         for (scroll, colors) in [
             (3, [Color::Red, Color::Red, Color::Reset, Color::Green]),
             (4, [Color::Red, Color::Reset, Color::Green, Color::Green]),
@@ -1023,7 +1048,7 @@ mod tests {
         ] {
             app.scroll_x = scroll;
             let buf = terminal.draw(|frame| app.render(frame)).unwrap().buffer;
-            for y in [1, 2] {
+            for y in [1, 2, 3] {
                 for (offset, color) in colors.into_iter().enumerate() {
                     assert_eq!(
                         buf[(offset as u16 + 1, y)].bg,
@@ -1050,7 +1075,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         terminal.draw(|frame| app.render(frame)).unwrap();
         assert_eq!(app.selection, 1);
-        for y in 1..=3 {
+        for y in 1..=21 {
             for x in 1..=4 {
                 assert_eq!(terminal.backend().buffer()[(x, y)].bg, Color::Reset);
             }
