@@ -1,0 +1,18 @@
+minimum_pre_commit_version: '3.2.0'
+default_install_hook_types: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        files: '(\.rs$|(^|/)Cargo\.toml$|(^|/)\.?rustfmt\.toml$|^rust-toolchain\.toml$)'
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+        language: system
+        files: '(\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|(^|/)\.?clippy\.toml$)'
+        pass_filenames: false

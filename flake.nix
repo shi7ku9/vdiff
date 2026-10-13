@@ -16,7 +16,7 @@
 
       perSystem = { pkgs, final, ... }:
         let
-          toolchain = final.rust-bin.stable.latest.default;
+          toolchain = final.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           rustPlatform = pkgs.makeRustPlatform {
             cargo = toolchain;
             rustc = toolchain;
@@ -40,7 +40,7 @@
           overlayAttrs = inputs.rust-overlay.overlays.default final pkgs;
 
           devShells.default = pkgs.mkShell {
-            packages = [ toolchain pkgs.git ];
+            packages = [ toolchain pkgs.git pkgs.pre-commit ];
           };
 
           packages.default = rustPlatform.buildRustPackage {
@@ -57,7 +57,7 @@
               cp -r ${src} src
               chmod -R +w src
               cd src
-              cargo build --offline --all-features --all-targets
+              cargo build --offline --locked --workspace --all-features --all-targets
               mkdir $out
             '';
             test = pkgs.runCommand "vdiff-test"
@@ -66,7 +66,7 @@
               cp -r ${src} src
               chmod -R +w src
               cd src
-              cargo test --offline --all-features
+              cargo test --offline --locked --workspace --all-features
               mkdir $out
             '';
             clippy = pkgs.runCommand "vdiff-clippy"
@@ -75,7 +75,7 @@
               cp -r ${src} src
               chmod -R +w src
               cd src
-              cargo clippy --offline --all-targets -- -D warnings
+              cargo clippy --offline --locked --workspace --all-targets --all-features -- -D warnings
               mkdir $out
             '';
             fmt = pkgs.runCommand "vdiff-fmt"
@@ -83,7 +83,7 @@
               cp -r ${src} src
               chmod -R +w src
               cd src
-              cargo fmt --check
+              cargo fmt --all -- --check
               mkdir $out
             '';
           };
