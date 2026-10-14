@@ -109,16 +109,11 @@ impl Column {
     }
 
     pub(crate) fn first_non_padding_row(&self) -> Option<usize> {
-        self.non_padding_rows().next()
-    }
-
-    /// Rows whose cell holds something other than spaces, in order.
-    pub(crate) fn non_padding_rows(&self) -> impl Iterator<Item = usize> + '_ {
         self.data
             .rows
             .iter()
             .enumerate()
-            .filter(|(index, _)| self.data.cell(*index).chars().any(|c| c != ' '))
+            .find(|(index, _)| self.data.cell(*index).chars().any(|c| c != ' '))
             .map(|(_, row)| *row)
     }
 }

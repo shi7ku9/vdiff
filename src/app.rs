@@ -39,33 +39,31 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     build_display(grid).rows
 }
 
-/// How a diff cell is drawn.
+/// Where a cell sits in its column.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CellRole {
-    /// On the sticky marker row.
-    Tab,
-    /// On a file row the cell's change leaves alone, or below the file.
-    Lane,
-    /// On a file row where the cell's change reads differently in the
-    /// old and new file.
-    Strong,
+enum RowRole {
+    /// The sticky marker row.
+    Marker,
+    /// A file line.
+    File,
+    /// Below the last file line.
+    Below,
 }
 
 /// The style of a diff cell; `kind` is `None` for a group separator.
-/// A changed column is a tab on the marker row, a faint lane down to
-/// the bottom of the pane, and strong cells on the rows its change
-/// alters. Separators are blank gaps between the tabs and thin rules
-/// between the cells.
-fn diff_style(theme: &Theme, role: CellRole, kind: Option<StepKind>) -> Style {
+/// A changed column is a tab on the marker row, a tinted cell on file
+/// rows, and a fainter fill below the file. Separators are blank gaps
+/// between the tabs and thin rules between the file cells.
+fn diff_style(theme: &Theme, role: RowRole, kind: Option<StepKind>) -> Style {
     match (kind, role) {
-        (Some(StepKind::Match), _) | (None, CellRole::Tab) => theme.plain,
+        (Some(StepKind::Match), _) | (None, RowRole::Marker) => theme.plain,
         (None, _) => theme.separator,
-        (Some(StepKind::Delete), CellRole::Tab) => theme.delete_tab,
-        (Some(StepKind::Delete), CellRole::Lane) => theme.delete_lane,
-        (Some(StepKind::Delete), CellRole::Strong) => theme.delete_strong,
-        (Some(StepKind::Insert), CellRole::Tab) => theme.insert_tab,
-        (Some(StepKind::Insert), CellRole::Lane) => theme.insert_lane,
-        (Some(StepKind::Insert), CellRole::Strong) => theme.insert_strong,
+        (Some(StepKind::Delete), RowRole::Marker) => theme.delete_tab,
+        (Some(StepKind::Delete), RowRole::File) => theme.delete,
+        (Some(StepKind::Delete), RowRole::Below) => theme.delete_fill,
+        (Some(StepKind::Insert), RowRole::Marker) => theme.insert_tab,
+        (Some(StepKind::Insert), RowRole::File) => theme.insert,
+        (Some(StepKind::Insert), RowRole::Below) => theme.insert_fill,
     }
 }
 
@@ -82,45 +80,7 @@ struct Display {
     width: usize,
     /// Changes in display order.
     changes: Vec<Change>,
-    /// Per file row, the number of old and new columns up to the line's
-    /// last non-space character. Cells past it are padding.
-    old_ends: Vec<usize>,
-    new_ends: Vec<usize>,
     stats: DiffStats,
-}
-
-impl Display {
-    /// Whether `change` reads differently on `row` in the old and the
-    /// new file. Spaces past the end of a line are padding and do not
-    /// count; spaces before its last character do.
-    fn differs(&self, grid: &DiffGrid, change: &Change, row: usize) -> bool {
-        let old = run_text(grid, change.delete.as_ref(), self.old_ends[row], row);
-        let new = run_text(grid, change.insert.as_ref(), self.new_ends[row], row);
-        !old.eq(new)
-    }
-
-    /// Whether any change reads differently on `row`.
-    fn line_changed(&self, grid: &DiffGrid, row: usize) -> bool {
-        self.changes
-            .iter()
-            .any(|change| self.differs(grid, change, row))
-    }
-}
-
-/// The cells of `run` on `row` before the line ends at column `end`.
-fn run_text<'a>(
-    grid: &'a DiffGrid,
-    run: Option<&'a Run>,
-    end: usize,
-    row: usize,
-) -> impl Iterator<Item = &'a str> + 'a {
-    run.into_iter().flat_map(move |run| {
-        let significant = end.saturating_sub(run.column).min(run.steps.len());
-        run.steps
-            .clone()
-            .take(significant)
-            .map(move |step| grid.steps[step].content.get(row).unwrap_or(" "))
-    })
 }
 
 /// A run of deleted or inserted columns.
@@ -193,8 +153,6 @@ fn build_display(grid: &DiffGrid) -> Display {
     let mut changes = Vec::new();
     // A delete run waits here for an insert run right after it.
     let mut pending: Option<Run> = None;
-    let mut old_ends = vec![0; grid.height];
-    let mut new_ends = vec![0; grid.height];
     let (mut old_column, mut new_column) = (0, 0);
     for group in &grid.groups {
         let kind = grid.steps[group.start].kind;
@@ -237,14 +195,6 @@ fn build_display(grid: &DiffGrid) -> Display {
             for (row, (text, actual_width)) in rows.iter_mut().zip(cells) {
                 row.push_str(&text);
                 row.extend(std::iter::repeat_n(' ', width - actual_width));
-            }
-            for row in step.content.non_padding_rows() {
-                if kind != StepKind::Insert {
-                    old_ends[row] = old_column + 1;
-                }
-                if kind != StepKind::Delete {
-                    new_ends[row] = new_column + 1;
-                }
             }
             if kind != StepKind::Insert {
                 old_column += 1;
@@ -298,8 +248,6 @@ fn build_display(grid: &DiffGrid) -> Display {
         group_end_offsets,
         width,
         changes,
-        old_ends,
-        new_ends,
         stats,
     }
 }
@@ -687,9 +635,8 @@ impl App {
     }
 
     /// Line numbers beside the visible file rows, `~` below the file.
-    /// Lines that read differently in the two files are brighter.
     fn render_gutter(&self, frame: &mut Frame<'_>, area: Rect) {
-        let (Some(grid), Some(display)) = (&self.grid, &self.display) else {
+        let Some(grid) = &self.grid else {
             return;
         };
         if area.width < 3 || area.height < 2 {
@@ -700,12 +647,7 @@ impl App {
         for (offset, y) in (area.y + 1..area.bottom()).enumerate() {
             let row = self.scroll_y + offset;
             let (text, style) = if row < grid.height {
-                let style = if display.line_changed(grid, row) {
-                    self.theme.plain
-                } else {
-                    self.theme.muted
-                };
-                (format!("{:>digits$}", row + 1), style)
+                (format!("{:>digits$}", row + 1), self.theme.muted)
             } else {
                 (format!("{:>digits$}", "~"), self.theme.rule)
             };
@@ -737,7 +679,7 @@ impl App {
                 {
                     frame.buffer_mut().set_style(
                         Rect::new(inner.x + offset as u16, inner.y, 1, inner.height),
-                        diff_style(&self.theme, CellRole::Lane, *kind),
+                        diff_style(&self.theme, RowRole::Below, *kind),
                     );
                 }
                 let rows = &disp.rows;
@@ -793,26 +735,14 @@ impl App {
             };
             self.draw_cell(frame, inner, y, &text, column.start);
         }
-        // Lanes first, then the changes that alter this row.
-        self.style_row(frame, inner, y, &display.kinds, CellRole::Lane);
-        let left = self.scroll_x;
-        for change in visible_changes(display, left, right) {
-            if !display.differs(grid, change, row) {
-                continue;
-            }
-            let cells = change.cells();
-            for cell in cells.start.max(left)..cells.end.min(right) {
-                let style = diff_style(&self.theme, CellRole::Strong, display.kinds[cell]);
-                frame.buffer_mut()[(inner.x + (cell - left) as u16, y)].set_style(style);
-            }
-        }
+        self.style_row(frame, inner, y, &display.kinds, RowRole::File);
     }
 
     /// The marker row: a tab over each changed run, labelled with where
     /// the run starts in its file and how many columns it spans. A run
     /// scrolled partly out of view keeps its label at the pane's edge.
     fn draw_tabs(&self, frame: &mut Frame<'_>, inner: Rect, display: &Display) {
-        self.style_row(frame, inner, inner.y, &display.kinds, CellRole::Tab);
+        self.style_row(frame, inner, inner.y, &display.kinds, RowRole::Marker);
         let left = self.scroll_x;
         let right = left + usize::from(inner.width);
         for change in visible_changes(display, left, right) {
@@ -859,7 +789,7 @@ impl App {
         inner: Rect,
         y: u16,
         kinds: &[Option<StepKind>],
-        role: CellRole,
+        role: RowRole,
     ) {
         // Restore styles in wide-glyph continuation and clipped cells.
         for (offset, kind) in kinds
@@ -2495,47 +2425,6 @@ mod tests {
         );
         assert_eq!(display.changes[1].cells(), 8..39);
         assert_eq!(display.changes[2].cells(), 42..43);
-        // Line ends, in columns: "#include <cstdio>" has 17.
-        assert_eq!(display.old_ends, [17, 0, 12, 32, 11, 1]);
-        assert_eq!(display.new_ends, [16, 0, 20, 31, 11, 1]);
-    }
-
-    #[test]
-    fn differs_compares_the_text_a_change_leaves_on_a_row() {
-        let grid = compute(OLD_CPP, NEW_CPP);
-        let display = build_display(&grid);
-        let rows = |change: usize| -> Vec<usize> {
-            (0..grid.height)
-                .filter(|&row| display.differs(&grid, &display.changes[change], row))
-                .collect()
-        };
-        assert_eq!(rows(0), [2]); // "in" → "au"
-        assert_eq!(rows(1), [0, 2, 3]);
-        assert_eq!(rows(2), [2, 3]); // "{" and "l"
-        assert_eq!(rows(3), [3]); // "\n"
-        let changed: Vec<_> = (0..grid.height)
-            .map(|row| display.line_changed(&grid, row))
-            .collect();
-        assert_eq!(changed, [true, false, true, true, false, false]);
-    }
-
-    #[test]
-    fn differs_ignores_padding_but_not_inner_spaces() {
-        // Dropping a trailing space is invisible; dropping an inner one
-        // is not.
-        for (old, new, changed) in [("x \n", "x\n", false), ("x b\n", "xb\n", true)] {
-            let grid = compute(old, new);
-            let display = build_display(&grid);
-            assert_eq!(display.changes.len(), 1, "{old:?}");
-            assert_eq!(display.differs(&grid, &display.changes[0], 0), changed);
-            assert_eq!(display.line_changed(&grid, 0), changed);
-        }
-        // A wider run on one side differs only where the text does.
-        let grid = compute("ab\nxy\n", "c\nxy\n");
-        let display = build_display(&grid);
-        let change = &display.changes[0];
-        assert!(display.differs(&grid, change, 0));
-        assert!(!display.line_changed(&grid, 1));
     }
 
     #[test]
@@ -2554,22 +2443,25 @@ mod tests {
     }
 
     #[test]
-    fn true_color_separates_tabs_lanes_and_strong_cells() {
+    fn true_color_separates_tabs_cells_and_fill() {
         let theme = Theme::new(ColorDepth::TrueColor);
         let (mut app, a, b) = files_app_with("foo\nbar baz\n", "foo\nbar qaz\n", theme.clone());
         let buf = draw_buffer(&mut app);
         // The gutter takes x=0..=3. Marker row y=1, file rows y=2..=3,
-        // lanes below down to y=22. Only row 2 of the file ("bar") differs.
-        for (x, tab, strong, lane) in [
-            (9, theme.delete_tab, theme.delete_strong, theme.delete_lane),
-            (11, theme.insert_tab, theme.insert_strong, theme.insert_lane),
+        // fill below down to y=22. Every file row of a changed column
+        // gets the same tint.
+        for (x, tab, cell, fill) in [
+            (9, theme.delete_tab, theme.delete, theme.delete_fill),
+            (11, theme.insert_tab, theme.insert, theme.insert_fill),
         ] {
             assert_eq!(buf[(x, 1)].bg, tab.bg.unwrap());
             assert_eq!(buf[(x, 1)].fg, tab.fg.unwrap());
-            assert_eq!(buf[(x, 3)].bg, strong.bg.unwrap());
-            assert_eq!(buf[(x, 3)].fg, strong.fg.unwrap());
-            for y in [2].into_iter().chain(4..=22) {
-                assert_eq!(buf[(x, y)].bg, lane.bg.unwrap(), "y={y}");
+            for y in [2, 3] {
+                assert_eq!(buf[(x, y)].bg, cell.bg.unwrap());
+                assert_eq!(buf[(x, y)].fg, cell.fg.unwrap());
+            }
+            for y in 4..=22 {
+                assert_eq!(buf[(x, y)].bg, fill.bg.unwrap());
             }
         }
         assert_eq!(buf[(9, 3)].symbol(), "b");
@@ -2581,12 +2473,12 @@ mod tests {
         assert_eq!(buf[(10, 3)].fg, theme.separator.fg.unwrap());
         assert_eq!(buf[(10, 3)].bg, Color::Reset);
         assert_eq!(buf[(4, 3)].bg, Color::Reset);
-        // Line numbers: the changed line is brighter.
-        assert_eq!(row_text(&buf, 2, 0..4), "  1 ");
+        // Line numbers all look alike: they number rows, not changes.
+        for (y, text) in [(2, "  1 "), (3, "  2 "), (4, "  ~ ")] {
+            assert_eq!(row_text(&buf, y, 0..4), text);
+        }
         assert_eq!(buf[(2, 2)].fg, theme.muted.fg.unwrap());
-        assert_eq!(row_text(&buf, 3, 0..4), "  2 ");
-        assert_eq!(buf[(2, 3)].fg, Color::Reset);
-        assert_eq!(row_text(&buf, 4, 0..4), "  ~ ");
+        assert_eq!(buf[(2, 3)].fg, theme.muted.fg.unwrap());
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -2600,8 +2492,8 @@ mod tests {
         assert_eq!(row_text(&buf, 1, 0..4), "    ");
         assert_eq!(row_text(&buf, 2, 0..5), "  1 a");
         assert_eq!(row_text(&buf, 3, 0..4), "  2 ");
-        assert_eq!(buf[(2, 2)].fg, Color::DarkGray, "line 1 reads the same");
-        assert_eq!(buf[(2, 3)].fg, Color::Reset, "line 2 differs");
+        assert_eq!(buf[(2, 2)].fg, Color::DarkGray);
+        assert_eq!(buf[(2, 3)].fg, Color::DarkGray);
         assert_eq!(row_text(&buf, 4, 0..4), "  ~ ");
         // A diff area under 20 columns keeps them all for the diff.
         let mut narrow = Terminal::new(TestBackend::new(19, 6)).unwrap();
@@ -2651,19 +2543,6 @@ mod tests {
     }
 
     #[test]
-    fn ansi16_underlines_strong_cells() {
-        let (mut app, a, b) = files_app("foo\nbar baz\n", "foo\nbar qaz\n");
-        let buf = draw_buffer(&mut app);
-        for x in [6 + G, 8 + G] {
-            assert!(!buf[(x, 2)].modifier.contains(Modifier::UNDERLINED));
-            assert!(buf[(x, 3)].modifier.contains(Modifier::UNDERLINED));
-            assert_eq!(buf[(x, 2)].bg, buf[(x, 3)].bg);
-        }
-        let _ = std::fs::remove_file(&a);
-        let _ = std::fs::remove_file(&b);
-    }
-
-    #[test]
     fn no_color_marks_changes_without_colors() {
         let (mut app, a, b) = files_app_with(
             "foo\nbar baz\n",
@@ -2679,10 +2558,12 @@ mod tests {
         }
         assert_eq!(buf[(6 + G, 1)].symbol(), "-");
         assert_eq!(buf[(8 + G, 1)].symbol(), "+");
-        // Only the row that differs ("bar") is reversed.
+        // File cells of changed columns are reversed; the space below
+        // the file is not.
         for x in [6, 8] {
-            assert!(!buf[(x + G, 2)].modifier.contains(Modifier::REVERSED));
-            assert!(buf[(x + G, 3)].modifier.contains(Modifier::REVERSED));
+            for y in [2, 3] {
+                assert!(buf[(x + G, y)].modifier.contains(Modifier::REVERSED));
+            }
             assert!(!buf[(x + G, 4)].modifier.contains(Modifier::REVERSED));
         }
         assert!(!buf[(1 + G, 3)].modifier.contains(Modifier::REVERSED));
