@@ -16,12 +16,14 @@ use crossterm::event::{
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::Frame;
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Span;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io;
+use std::num::NonZeroU16;
 use std::ops::Range;
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
@@ -773,6 +775,7 @@ impl App {
         if self.help {
             self.render_help(frame, area);
         }
+        pin_emoji_widths(frame.buffer_mut());
     }
 
     /// Width of the line-number gutter: a blank cell, the numbers (at
@@ -1343,6 +1346,23 @@ impl App {
         };
         if let Some(x) = target {
             self.scroll_x = x;
+        }
+    }
+}
+
+/// For a wide emoji with U+FE0F (`❤️`), ratatui's diff also rewrites
+/// the cell the emoji covers, and the crossterm backend prints that cell
+/// without moving the cursor, so it lands one cell further right and
+/// shifts the rest of the row on screen. A forced width makes the diff
+/// skip the covered cell, as it does for any other wide character.
+fn pin_emoji_widths(buffer: &mut Buffer) {
+    for cell in &mut buffer.content {
+        let symbol = cell.symbol();
+        if symbol.contains('\u{fe0f}')
+            && let Some(width) = NonZeroU16::new(Span::raw(symbol).width() as u16)
+            && width.get() > 1
+        {
+            cell.set_diff_option(CellDiffOption::ForcedWidth(width));
         }
     }
 }
@@ -2249,6 +2269,35 @@ mod tests {
         assert_eq!(buf[(6, 2)].bg, Color::Green);
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
         assert_eq!(app.scroll_x, 0);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn redraws_never_write_into_the_cell_an_emoji_covers() {
+        // ❤️ carries U+FE0F. Ratatui's diff used to rewrite the cell the
+        // emoji covers, and the backend printed it after the emoji without
+        // moving the cursor, one cell too far right, shifting the rest of
+        // the row on screen (`accent` came out as `accnnt`).
+        let emoji = "👩\u{200d}❤\u{fe0f}\u{200d}👩";
+        let tail = "z".repeat(100);
+        let (mut app, a, b) = files_app(
+            &format!("ab{emoji}c{tail}x\n"),
+            &format!("ab{emoji}c{tail}y\n"),
+        );
+        app.scroll_x = 1;
+        let before = draw_buffer(&mut app);
+        app.scroll_x = 0;
+        let after = draw_buffer(&mut app);
+        assert_eq!(after[(3 + G, 2)].symbol(), emoji);
+        for (x, y, _) in before.diff(&after) {
+            let left = &after[(x.saturating_sub(1), y)];
+            assert!(
+                x == 0 || left.symbol().width() < 2,
+                "the diff writes ({x}, {y}), covered by {:?}",
+                left.symbol()
+            );
+        }
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
