@@ -70,7 +70,7 @@ tabs and a thin `│` rule between file cells; the plain-text renderer keeps
 its `|`. Horizontal clipping omits a grapheme that straddles a viewport edge
 instead of drawing only part of it.
 
-### Changes and emphasis
+### Changes and tabs
 
 A change is a delete run, an insert run, or a delete run directly followed
 by an insert run. Each run is a tab on the marker row, labelled like a git
@@ -78,22 +78,18 @@ hunk header: the run's first column in its own file and its column count,
 `-4,15`, shortened to `-4` and then `-` when the tab is narrower. A run
 scrolled partly out of view keeps its label at the pane's edge.
 
-Below the tabs, a changed column is a faint lane down to the bottom of the
-diff pane. On each file row, the change's old text (its delete run) and new
-text (its insert run) are compared; where they differ, the change's cells on
-that row are strong. Missing cells and spaces both read as spaces, so spaces
-past a line's last character are padding and do not count, while spaces
-before it do: dropping a trailing space leaves the row faint, dropping an
-inner space does not. The comparison runs for the visible rows when the
-pane is drawn.
+Below its tab, a changed column is tinted on every file row, and a fainter
+fill continues from the end of the file down to the bottom of the diff pane.
+The tint marks the column as a whole; the TUI does not mark which lines
+changed.
 
 ### Line numbers
 
 A gutter left of the diff numbers the file rows: a blank cell, the numbers
 right-aligned in at least two digits, and a blank cell. It stays in place
-while the diff scrolls sideways. A number is bright when any change differs
-on its row and muted otherwise, and `~` marks the rows below the file. Diff
-areas narrower than 20 columns leave out the gutter.
+while the diff scrolls sideways. The numbers are muted, and `~` marks the
+rows below the file. Diff areas narrower than 20 columns leave out the
+gutter.
 
 ### Screen layout
 
@@ -115,18 +111,17 @@ overrides that choice either way.
 ### Colors
 
 [src/theme.rs](../src/theme.rs) holds every style the TUI draws, by role:
-the tab, lane, and strong styles per change kind, separators, muted text,
+the tab, cell, and fill styles per change kind, separators, muted text,
 badges, and the sidebar selection. The theme is chosen by color depth:
 
 - 24-bit color when `COLORTERM` is `truecolor` or `24bit`, or in Windows
   Terminal (`WT_SESSION`).
-- The 256-color palette when `TERM` contains `256color`. Lanes use its
-  darkest red and green (52, 22); strong cells step up to 88 and 28, as
-  delta does.
+- The 256-color palette when `TERM` contains `256color`. Its darkest red and
+  green are the only tints dark enough for light text, so file cells and the
+  fill share them.
 - Otherwise the 16 basic colors: black text on red and green for every row
-  of a changed column, the TUI's original look. With one red and one green,
-  strong cells are underlined instead.
-- A non-empty `NO_COLOR` turns colors off. Strong cells use reverse video,
+  of a changed column, the TUI's original look.
+- A non-empty `NO_COLOR` turns colors off. Changed cells use reverse video,
   and the marker row and separators keep changes readable.
 
 Every style that sets a background also sets the text color, so tinted cells
