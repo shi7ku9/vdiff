@@ -12,8 +12,8 @@ use crate::diff::{self, DiffGrid, StepKind};
 use crate::git::{self, ChangedFile, GitShell, RevSpec};
 use crate::theme::Theme;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -1036,6 +1036,13 @@ impl App {
     /// whether the visible state changed (only then must the screen be
     /// redrawn).
     pub fn handle_key(&mut self, key: KeyEvent) -> KeyResult {
+        // Windows reports key releases too; act only on presses and repeats.
+        if key.kind == KeyEventKind::Release {
+            return KeyResult {
+                quit: false,
+                changed: false,
+            };
+        }
         // Uppercase C too: some terminals report Ctrl+Shift+C as
         // Char('C') + CONTROL|SHIFT (kitty protocol).
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -2645,6 +2652,46 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn key_release(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Release)
+    }
+
+    #[test]
+    fn key_releases_are_ignored_but_repeats_scroll() {
+        let tall = "a\n".repeat(50);
+        let mut app = git_app(vec![(&tall, &tall), ("b\n", "c\n")]);
+        let _ = draw(&mut app);
+        let before = app.view_state();
+        for mut event in [
+            key(KeyCode::Char('q')),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            key(KeyCode::Char('i')),
+            key(KeyCode::Char('?')),
+            key(KeyCode::Char('j')),
+            key(KeyCode::Tab),
+        ] {
+            event.kind = KeyEventKind::Release;
+            let r = app.handle_key(event);
+            assert!(!r.quit && !r.changed, "release must do nothing: {event:?}");
+            assert_eq!(app.view_state(), before);
+        }
+        assert!(app.handle_key(key(KeyCode::Char('j'))).changed);
+        let r = app.handle_key(key_release(KeyCode::Char('j')));
+        assert!(!r.quit && !r.changed);
+        assert_eq!(app.scroll_y, 1);
+        let r = app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert!(!r.quit && r.changed);
+        assert_eq!(app.scroll_y, 2);
+    }
+
     #[test]
     fn q_and_ctrl_c_quit() {
         let (mut app, a, b) = files_app("a\n", "b\n");
@@ -3144,6 +3191,26 @@ mod tests {
     }
 
     #[test]
+    fn inspection_ignores_key_releases() {
+        let mut app = git_app(vec![("abc\nabc\n", "abd\nabd\n")]);
+        let _ = draw(&mut app);
+        for (code, cursor) in [
+            (KeyCode::Char('i'), Some(Cursor { row: 0, step: 0 })),
+            (KeyCode::Char('l'), Some(Cursor { row: 0, step: 1 })),
+            (KeyCode::Char('j'), Some(Cursor { row: 1, step: 1 })),
+            (KeyCode::Char('i'), None),
+        ] {
+            let r = app.handle_key(key(code));
+            assert!(!r.quit && r.changed);
+            assert_eq!(app.inspect, cursor);
+            let before = app.view_state();
+            let r = app.handle_key(key_release(code));
+            assert!(!r.quit && !r.changed);
+            assert_eq!(app.view_state(), before);
+        }
+    }
+
+    #[test]
     fn inspecting_shows_what_a_cell_holds() {
         // "é" as one code point in the old file, as e + U+0301 in the new.
         let (mut app, a, b) = files_app("caf\u{e9}\n", "cafe\u{301}\n");
@@ -3471,6 +3538,27 @@ mod tests {
         let mut empty = git_app(vec![]);
         let bar = row_text(&draw_buffer(&mut empty), 23, 0..80);
         assert_eq!(bar, format!(" GIT {}? help ", " ".repeat(68)));
+    }
+
+    #[test]
+    fn help_ignores_key_releases() {
+        let mut app = git_app(vec![("a\n", "b\n")]);
+        for close in [KeyCode::Char('q'), KeyCode::Char('?'), KeyCode::Esc] {
+            let r = app.handle_key(key(KeyCode::Char('?')));
+            assert!(!r.quit && r.changed && app.help);
+            let before = app.view_state();
+            let r = app.handle_key(key_release(KeyCode::Char('?')));
+            assert!(!r.quit && !r.changed);
+            assert_eq!(app.view_state(), before);
+
+            let r = app.handle_key(key(close));
+            assert!(!r.quit && r.changed && !app.help);
+            let before = app.view_state();
+            let r = app.handle_key(key_release(close));
+            assert!(!r.quit && !r.changed);
+            assert_eq!(app.view_state(), before);
+        }
+        assert!(app.handle_key(key(KeyCode::Char('q'))).quit);
     }
 
     #[test]
