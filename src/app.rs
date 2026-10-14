@@ -4,20 +4,26 @@
 //! `DiffGrid` into full-width strings (marker row first), and
 //! `slice_by_width` implements width-aware horizontal scrolling so
 //! grapheme clusters (CJK, combining marks, emoji) are never split.
+//! The bars, sidebar, and help popup around the diff live in `chrome`.
+
+mod chrome;
 
 use crate::diff::{self, DiffGrid, StepKind};
-use crate::git::{self, ChangedFile, GitShell, RevSpec, Status};
+use crate::git::{self, ChangedFile, GitShell, RevSpec};
+use crate::theme::Theme;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
+use ratatui::style::Style;
+use ratatui::text::Span;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
+
+/// Below this terminal width the file sidebar starts hidden.
+const SIDEBAR_MIN_FRAME_WIDTH: u16 = 80;
 
 /// Display rows for the TUI: rows[0] is the marker row (one marker per
 /// grapheme column, `|` between groups, padded to the full content
@@ -29,13 +35,31 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     build_display(grid).rows
 }
 
-fn cell_style(kind: Option<StepKind>) -> Style {
-    let neutral = Style::default().fg(Color::Reset).bg(Color::Reset);
-    match kind {
-        Some(StepKind::Match) => neutral,
-        Some(StepKind::Delete) => neutral.fg(Color::Black).bg(Color::Red),
-        Some(StepKind::Insert) => neutral.fg(Color::Black).bg(Color::Green),
-        None => neutral.fg(Color::DarkGray),
+/// Where a cell sits in its column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowRole {
+    /// The sticky marker row.
+    Marker,
+    /// A file line.
+    File,
+    /// Below the last file line.
+    Below,
+}
+
+/// The style of a diff cell; `kind` is `None` for a group separator.
+/// A changed column is a tab on the marker row, a tinted cell on file
+/// rows, and a fainter fill below the file. Separators are blank gaps
+/// between the tabs and thin rules between the file cells.
+fn diff_style(theme: &Theme, role: RowRole, kind: Option<StepKind>) -> Style {
+    match (kind, role) {
+        (Some(StepKind::Match), _) | (None, RowRole::Marker) => theme.plain,
+        (None, _) => theme.separator,
+        (Some(StepKind::Delete), RowRole::Marker) => theme.delete_tab,
+        (Some(StepKind::Delete), RowRole::File) => theme.delete,
+        (Some(StepKind::Delete), RowRole::Below) => theme.delete_fill,
+        (Some(StepKind::Insert), RowRole::Marker) => theme.insert_tab,
+        (Some(StepKind::Insert), RowRole::File) => theme.insert,
+        (Some(StepKind::Insert), RowRole::Below) => theme.insert_fill,
     }
 }
 
@@ -50,6 +74,39 @@ struct Display {
     group_end_offsets: Vec<usize>,
     /// Layout width shared by rows when cells are drawn independently.
     width: usize,
+    stats: DiffStats,
+}
+
+/// Change counts for the top bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DiffStats {
+    /// Delete runs and insert runs, where a delete run directly
+    /// followed by an insert run counts once.
+    changes: usize,
+    /// Deleted and inserted grapheme columns.
+    deleted: usize,
+    inserted: usize,
+}
+
+impl DiffStats {
+    fn of(grid: &DiffGrid) -> DiffStats {
+        let mut stats = DiffStats::default();
+        let mut previous = StepKind::Match;
+        for group in &grid.groups {
+            let kind = grid.steps[group.start].kind;
+            match kind {
+                StepKind::Match => {}
+                StepKind::Delete => stats.deleted += group.len(),
+                StepKind::Insert => stats.inserted += group.len(),
+            }
+            let pairs_with_previous = kind == StepKind::Insert && previous == StepKind::Delete;
+            if kind != StepKind::Match && !pairs_with_previous {
+                stats.changes += 1;
+            }
+            previous = kind;
+        }
+        stats
+    }
 }
 
 struct DisplayColumn {
@@ -125,6 +182,7 @@ fn build_display(grid: &DiffGrid) -> Display {
         kinds,
         group_end_offsets,
         width,
+        stats: DiffStats::of(grid),
     }
 }
 
@@ -241,25 +299,42 @@ pub struct KeyResult {
     pub changed: bool,
 }
 
+/// Shown in place of the diff when there is nothing to draw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub title: String,
+    pub detail: Option<String>,
+}
+
 pub struct App {
     pub source: DiffSource,
     pub selection: usize,
-    pub show_sidebar: bool,
+    /// Sidebar visibility chosen with `e`. `None` follows the terminal
+    /// width: shown from `SIDEBAR_MIN_FRAME_WIDTH` columns up.
+    pub sidebar: Option<bool>,
+    /// Whether the key help popup is open.
+    pub help: bool,
     pub scroll_y: usize,
     pub scroll_x: usize,
     pub grid: Option<DiffGrid>,
     /// Cached display rows for the current grid (see `Display`);
     /// rebuilt in `reload`.
     display: Option<Display>,
-    pub message: Option<String>,
+    pub notice: Option<Notice>,
     pub degraded: bool,
     pub labels: (String, String),
+    theme: Theme,
+    /// Inner size of the diff pane, marker row included.
     pane_width: usize,
     pane_height: usize,
+    /// Terminal width at the last render; 0 before the first one.
+    frame_width: u16,
+    /// First sidebar entry on screen.
+    sidebar_offset: usize,
 }
 
 impl App {
-    pub fn new(source: DiffSource) -> App {
+    pub fn new(source: DiffSource, theme: Theme) -> App {
         let labels = match &source {
             DiffSource::Files { old, new } => {
                 (old.display().to_string(), new.display().to_string())
@@ -269,20 +344,24 @@ impl App {
         let mut app = App {
             source,
             selection: 0,
-            show_sidebar: true,
+            sidebar: None,
+            help: false,
             scroll_y: 0,
             scroll_x: 0,
             grid: None,
             display: None,
-            message: None,
+            notice: None,
             degraded: false,
             labels,
+            theme,
             // Unknown until the first render: 0 means "no clamp yet"
             // (max_scroll = content size). A positive default like
             // 80x24 would pin max_scroll_y/x to 0 for small diffs and
             // make j/l/n/p unable to move.
             pane_width: 0,
             pane_height: 0,
+            frame_width: 0,
+            sidebar_offset: 0,
         };
         app.reload();
         app
@@ -290,6 +369,13 @@ impl App {
 
     pub fn has_sidebar(&self) -> bool {
         matches!(self.source, DiffSource::Git { .. })
+    }
+
+    /// Whether the file sidebar is on screen. Before the first render
+    /// the terminal width is unknown and counts as wide.
+    pub fn sidebar_visible(&self) -> bool {
+        let wide = self.frame_width == 0 || self.frame_width >= SIDEBAR_MIN_FRAME_WIDTH;
+        self.has_sidebar() && !self.entries().is_empty() && self.sidebar.unwrap_or(wide)
     }
 
     fn entries(&self) -> &[ChangedFile] {
@@ -323,22 +409,38 @@ impl App {
                 // once here instead of on every frame.
                 self.display = Some(build_display(&grid));
                 self.grid = Some(grid);
-                self.message = None;
+                self.notice = None;
             }
             Ok(None) => {
                 self.grid = None;
                 self.display = None;
                 self.degraded = false;
-                self.message = Some(match &self.source {
-                    DiffSource::Git { files, .. } if files.is_empty() => "no changes".to_string(),
-                    _ => "binary or unreadable".to_string(),
+                let (old, new) = &self.labels;
+                self.notice = Some(match &self.source {
+                    DiffSource::Git { files, .. } if files.is_empty() => Notice {
+                        title: "No changes".to_string(),
+                        detail: Some(format!("{old} → {new}")),
+                    },
+                    DiffSource::Git { files, .. } => Notice {
+                        title: "Binary or unreadable file".to_string(),
+                        detail: Some(chrome::entry_text(
+                            &files[self.selection.min(files.len() - 1)],
+                        )),
+                    },
+                    DiffSource::Files { .. } => Notice {
+                        title: "Binary or unreadable file".to_string(),
+                        detail: Some(format!("{old} → {new}")),
+                    },
                 });
             }
             Err(message) => {
                 self.grid = None;
                 self.display = None;
                 self.degraded = false;
-                self.message = Some(message);
+                self.notice = Some(Notice {
+                    title: "Could not load this file".to_string(),
+                    detail: Some(message),
+                });
             }
         }
     }
@@ -357,102 +459,80 @@ impl App {
 
     fn max_scroll_y(&self) -> usize {
         let (h, _) = self.content_dims();
-        // The bordered diff pane's inner area is pane_height - 2 rows;
-        // the sticky marker row occupies one of them, so pane_height -
-        // 3 content rows are visible.
-        h.saturating_sub(self.pane_height.saturating_sub(3))
+        // The sticky marker row takes the pane's first row, so
+        // pane_height - 1 content rows are visible.
+        h.saturating_sub(self.pane_height.saturating_sub(1))
     }
 
     fn max_scroll_x(&self) -> usize {
         let (_, w) = self.content_dims();
-        // The horizontal window is the bordered inner width:
-        // pane_width - 2 columns.
-        w.saturating_sub(self.pane_width.saturating_sub(2))
+        w.saturating_sub(self.pane_width)
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
-            .split(area);
-        let (sidebar_area, diff_area) = if self.has_sidebar() && self.show_sidebar {
-            let c = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(28), Constraint::Min(0)])
-                .split(chunks[0]);
-            (Some(c[0]), c[1])
-        } else {
-            (None, chunks[0])
-        };
+        self.frame_width = area.width;
+        let [top_bar, main, status_bar] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        let mut diff_area = main;
+        let mut sidebar = None;
+        if self.sidebar_visible() {
+            let width = self.sidebar_width(main.width);
+            let [list, rule, rest] = Layout::horizontal([
+                Constraint::Length(width),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .areas(main);
+            sidebar = Some((list, rule));
+            diff_area = rest;
+        }
+        // A blank cell on each side keeps the diff off the divider and
+        // the terminal edge.
+        let pane = diff_area.inner(Margin::new(1, 0));
         // Record the pane size before rendering the status bar so the
         // scroll clamps are correct on the very first frame (and not
         // only after a state-changing key triggers a redraw).
-        self.pane_width = diff_area.width as usize;
-        self.pane_height = diff_area.height as usize;
+        self.pane_width = usize::from(pane.width);
+        self.pane_height = usize::from(pane.height);
         // A resize or a sidebar toggle can shrink the pane below the
         // current scroll; re-clamp here so every frame heals it (a
         // stale scroll_y after `G` + enlarge would blank the pane).
         self.scroll_y = self.scroll_y.min(self.max_scroll_y());
         self.scroll_x = self.scroll_x.min(self.max_scroll_x());
-        if let Some(area) = sidebar_area {
-            self.render_sidebar(frame, area);
+        if let Some((list, rule)) = sidebar {
+            self.scroll_sidebar(usize::from(list.height.saturating_sub(1)));
+            self.render_sidebar(frame, list);
+            self.render_rule(frame, rule);
         }
-        self.render_diff(frame, diff_area);
-        self.render_status(frame, chunks[1]);
+        self.render_diff(frame, pane);
+        self.render_top_bar(frame, top_bar);
+        self.render_status(frame, status_bar);
+        if self.help {
+            self.render_help(frame, area);
+        }
     }
 
-    fn render_sidebar(&self, frame: &mut Frame<'_>, area: Rect) {
-        let items: Vec<ListItem> = self
-            .entries()
-            .iter()
-            .map(|f| {
-                let (letter, color) = match f.status {
-                    Status::Modified => ("M", Color::Yellow),
-                    Status::Added => ("A", Color::Green),
-                    Status::Deleted => ("D", Color::Red),
-                    Status::Renamed => ("R", Color::Cyan),
-                };
-                let path = if f.status == Status::Renamed {
-                    format!("{} → {}", f.old_path, f.new_path)
-                } else {
-                    f.new_path.clone()
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(letter, Style::default().fg(color)),
-                    Span::raw(" "),
-                    Span::raw(path),
-                ]))
-            })
-            .collect();
-        let mut state = ListState::default().with_selected(Some(self.selection));
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" Files "))
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> ");
-        frame.render_stateful_widget(list, area, &mut state);
-    }
-
-    fn render_diff(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let title = format!(" {} → {} ", self.labels.0, self.labels.1);
-        let block = Block::default().borders(Borders::ALL).title(title);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        match (&self.grid, &self.message) {
+    fn render_diff(&self, frame: &mut Frame<'_>, inner: Rect) {
+        if inner.is_empty() {
+            return;
+        }
+        match (&self.grid, &self.notice) {
             (Some(_), _) => {
                 // Rows are cached in `self.display` (see `build_display`);
                 // they are built once per reload, not per frame.
                 let Some(disp) = &self.display else {
                     return;
                 };
-                // Color the full visible column, including the empty area
-                // below the file. Row drawing restores continuation-cell
-                // styles after ratatui writes wide characters.
+                // Color the full visible column with its fill, down to
+                // the bottom of the pane; the marker and file rows
+                // restyle their own cells. Row drawing restores
+                // continuation-cell styles after ratatui writes wide
+                // characters.
                 for (offset, kind) in disp
                     .kinds
                     .iter()
@@ -462,7 +542,7 @@ impl App {
                 {
                     frame.buffer_mut().set_style(
                         Rect::new(inner.x + offset as u16, inner.y, 1, inner.height),
-                        cell_style(*kind),
+                        diff_style(&self.theme, RowRole::Below, *kind),
                     );
                 }
                 let rows = &disp.rows;
@@ -473,7 +553,10 @@ impl App {
                 let top = usize::from(inner.y);
                 let bottom = top + usize::from(inner.height);
                 if let Some(marker) = rows.first() {
-                    self.draw_row(frame, inner, inner.y, marker, &disp.kinds);
+                    // Separators are gaps between the marker tabs.
+                    let tabs = marker.replace('|', " ");
+                    self.draw_cell(frame, inner, inner.y, &tabs, 0);
+                    self.style_row(frame, inner, inner.y, &disp.kinds, RowRole::Marker);
                 }
                 for (i, _) in rows.iter().enumerate().skip(1) {
                     let y = top.saturating_add(i).saturating_sub(self.scroll_y);
@@ -489,32 +572,9 @@ impl App {
                     self.draw_content_row(frame, inner, y as u16, i - 1, disp);
                 }
             }
-            (None, Some(message)) => {
-                let area = Rect {
-                    x: inner.x,
-                    y: inner.y + inner.height.saturating_sub(1) / 2,
-                    width: inner.width,
-                    height: 1,
-                };
-                frame.render_widget(
-                    Paragraph::new(message.as_str()).alignment(ratatui::layout::Alignment::Center),
-                    area,
-                );
-            }
+            (None, Some(notice)) => self.render_notice(frame, inner, notice),
             (None, None) => {}
         }
-    }
-
-    fn draw_row(
-        &self,
-        frame: &mut Frame<'_>,
-        inner: Rect,
-        y: u16,
-        row: &str,
-        kinds: &[Option<StepKind>],
-    ) {
-        self.draw_cell(frame, inner, y, row, 0);
-        self.style_row(frame, inner, y, kinds);
     }
 
     fn draw_content_row(
@@ -539,11 +599,11 @@ impl App {
                     let step = &grid.steps[index];
                     visible_block(step.content.get(row).unwrap_or(" "), step.kind)
                 }
-                None => Cow::Borrowed("|"),
+                None => Cow::Borrowed("│"),
             };
             self.draw_cell(frame, inner, y, &text, column.start);
         }
-        self.style_row(frame, inner, y, &display.kinds);
+        self.style_row(frame, inner, y, &display.kinds, RowRole::File);
     }
 
     fn draw_cell(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, text: &str, start: usize) {
@@ -569,7 +629,14 @@ impl App {
         }
     }
 
-    fn style_row(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, kinds: &[Option<StepKind>]) {
+    fn style_row(
+        &self,
+        frame: &mut Frame<'_>,
+        inner: Rect,
+        y: u16,
+        kinds: &[Option<StepKind>],
+        role: RowRole,
+    ) {
         // Restore styles in wide-glyph continuation and clipped cells.
         for (offset, kind) in kinds
             .iter()
@@ -577,35 +644,12 @@ impl App {
             .take(usize::from(inner.width))
             .enumerate()
         {
-            frame.buffer_mut()[(inner.x + offset as u16, y)].set_style(cell_style(*kind));
+            frame.buffer_mut()[(inner.x + offset as u16, y)].set_style(diff_style(
+                &self.theme,
+                role,
+                *kind,
+            ));
         }
-    }
-
-    fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
-        let mut spans = vec![Span::raw(format!(
-            " {} → {}  ",
-            self.labels.0, self.labels.1
-        ))];
-        match (&self.grid, &self.message) {
-            (Some(_), _) => {
-                spans.push(Span::raw(format!(
-                    "v{}/{} h{}/{}  ",
-                    self.scroll_y,
-                    self.max_scroll_y(),
-                    self.scroll_x,
-                    self.max_scroll_x()
-                )));
-                if self.degraded {
-                    spans.push(Span::raw("LCS skipped (wide file)  "));
-                }
-            }
-            (None, Some(m)) => spans.push(Span::raw(format!("{m}  "))),
-            (None, None) => {}
-        }
-        spans.push(Span::raw(
-            "tab/⇧tab select · hjkl scroll · n/p changes · e sidebar · q quit",
-        ));
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// Handle one key event. Returns whether the app should quit and
@@ -634,11 +678,25 @@ impl App {
                 changed: false,
             };
         }
+        if self.help {
+            // The help popup takes the keyboard until it closes, so `q`
+            // closes it instead of quitting.
+            let close = matches!(
+                key.code,
+                KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc
+            );
+            self.help = !close;
+            return KeyResult {
+                quit: false,
+                changed: close,
+            };
+        }
         let before = (
             self.scroll_y,
             self.scroll_x,
             self.selection,
-            self.show_sidebar,
+            self.sidebar_visible(),
+            self.help,
         );
         match key.code {
             KeyCode::Char('q') => {
@@ -647,7 +705,10 @@ impl App {
                     changed: false,
                 };
             }
-            KeyCode::Char('e') if self.has_sidebar() => self.show_sidebar = !self.show_sidebar,
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('e') if self.has_sidebar() => {
+                self.sidebar = Some(!self.sidebar_visible())
+            }
             // vim convention: g = top, G = bottom.
             KeyCode::Char('g') => self.scroll_y = 0,
             KeyCode::Char('G') => self.scroll_y = self.max_scroll_y(),
@@ -665,7 +726,8 @@ impl App {
             self.scroll_y,
             self.scroll_x,
             self.selection,
-            self.show_sidebar,
+            self.sidebar_visible(),
+            self.help,
         );
         KeyResult {
             quit: false,
@@ -760,7 +822,7 @@ fn first_affected_row(grid: &DiffGrid, group: &std::ops::Range<usize>) -> Option
 
 pub fn run_tui(cli: &crate::cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
     let source = DiffSource::from_cli(cli)?;
-    let mut app = App::new(source);
+    let mut app = App::new(source, Theme::detect());
     run_tui_app(&mut app)?;
     Ok(())
 }
@@ -833,6 +895,8 @@ pub fn slice_by_width(s: &str, start: usize, max_width: usize) -> (String, usize
 mod tests {
     use super::*;
     use crate::diff::compute;
+    use crate::theme::ColorDepth;
+    use ratatui::style::{Color, Modifier};
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -889,7 +953,7 @@ mod tests {
         assert_eq!(buf[(3, 1)].symbol(), "+");
         assert_eq!(buf[(3, 2)].symbol(), "e\u{308}");
         assert_eq!(buf[(3, 2)].bg, Color::Green);
-        assert_eq!(buf[(2, 2)].symbol(), "|");
+        assert_eq!(buf[(2, 2)].symbol(), "│");
         assert_eq!(buf[(2, 2)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -949,7 +1013,7 @@ mod tests {
         for y in [2, 3] {
             assert_eq!(buf[(1, y)].bg, Color::Red);
             assert_eq!(buf[(3, y)].bg, Color::Green);
-            assert_eq!(buf[(2, y)].symbol(), "|");
+            assert_eq!(buf[(2, y)].symbol(), "│");
         }
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -1023,7 +1087,7 @@ mod tests {
         for x in 8..=13 {
             assert_eq!(buf[(x, 2)].bg, Color::Green);
         }
-        assert_eq!(buf[(7, 2)].symbol(), "|");
+        assert_eq!(buf[(7, 2)].symbol(), "│");
         assert_eq!(buf[(7, 2)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -1041,8 +1105,8 @@ mod tests {
             assert_eq!(buf[(6, 2)].symbol(), "7");
             assert_eq!(buf[(7, 2)].symbol(), marked.as_ref());
             assert_eq!(buf[(7, 2)].bg, Color::Red);
-            assert_eq!(buf[(separator_x, 1)].symbol(), "|");
-            assert_eq!(buf[(separator_x, 2)].symbol(), "|");
+            assert_eq!(buf[(separator_x, 1)].symbol(), " ");
+            assert_eq!(buf[(separator_x, 2)].symbol(), "│");
             assert_eq!(buf[(separator_x, 2)].bg, Color::Reset);
             assert_eq!(buf[(separator_x + 1, 1)].symbol(), "+");
             assert_eq!(buf[(separator_x + 1, 2)].symbol(), "Y");
@@ -1066,8 +1130,8 @@ mod tests {
         assert_column_backgrounds_align(buf);
         assert_eq!(buf[(1, 2)].symbol(), "7");
         assert_eq!(buf[(2, 2)].symbol(), marked.as_ref());
-        assert_eq!(buf[(2 + width, 1)].symbol(), "|");
-        assert_eq!(buf[(2 + width, 2)].symbol(), "|");
+        assert_eq!(buf[(2 + width, 1)].symbol(), " ");
+        assert_eq!(buf[(2 + width, 2)].symbol(), "│");
         assert_eq!(buf[(3 + width, 1)].symbol(), "+");
         assert_eq!(buf[(3 + width, 2)].symbol(), "Y");
         assert_eq!(buf[(3 + width, 2)].bg, Color::Green);
@@ -1179,13 +1243,30 @@ mod tests {
         path
     }
 
+    /// The 16-color theme: black text on red and green for every row
+    /// of a changed column, so whole columns share one background.
+    fn ansi16() -> Theme {
+        Theme::new(ColorDepth::Ansi16)
+    }
+
     fn files_app(old: &str, new: &str) -> (App, std::path::PathBuf, std::path::PathBuf) {
+        files_app_with(old, new, ansi16())
+    }
+
+    fn files_app_with(
+        old: &str,
+        new: &str,
+        theme: Theme,
+    ) -> (App, std::path::PathBuf, std::path::PathBuf) {
         let a = temp_file("a.txt", old);
         let b = temp_file("b.txt", new);
-        let app = App::new(DiffSource::Files {
-            old: a.clone(),
-            new: b.clone(),
-        });
+        let app = App::new(
+            DiffSource::Files {
+                old: a.clone(),
+                new: b.clone(),
+            },
+            theme,
+        );
         (app, a, b)
     }
 
@@ -1220,11 +1301,14 @@ mod tests {
             toplevel: String::new(),
             prefix: String::new(),
         };
-        App::new(DiffSource::Git {
-            spec,
-            files,
-            git: Box::new(f),
-        })
+        App::new(
+            DiffSource::Git {
+                spec,
+                files,
+                git: Box::new(f),
+            },
+            ansi16(),
+        )
     }
 
     fn draw(app: &mut App) -> TestBackend {
@@ -1244,9 +1328,16 @@ mod tests {
             .clone()
     }
 
+    /// The symbols on row `y` in the given columns.
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16, xs: std::ops::Range<u16>) -> String {
+        xs.map(|x| buf[(x, y)].symbol()).collect()
+    }
+
     fn assert_column_backgrounds_align(buf: &ratatui::buffer::Buffer) {
+        // Every pane row, from below the marker row (y=1) down to the
+        // status bar on the last row.
         for x in 1..buf.area.width - 1 {
-            for y in 2..buf.area.height - 2 {
+            for y in 2..buf.area.height - 1 {
                 assert_eq!(buf[(x, y)].bg, buf[(x, 1)].bg, "column {x}, row {y}");
             }
         }
@@ -1257,34 +1348,36 @@ mod tests {
         let (mut app, a, b) = files_app("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
         let backend = draw(&mut app);
         let buf = backend.buffer();
-        // The diff pane block is bordered, so inner starts at (1,1):
-        // border at y=0, marker row at y=1 from x=1.
-        // Marker: "    |-|+...": '|' at col 5, '-' at col 6, '+' at col 8.
+        // The top bar is y=0; the diff pane keeps one blank cell on
+        // each side, so the marker row is y=1 from x=1.
+        // Marker: "    |-|+...": gap at col 5, '-' at col 6, '+' at col 8.
         assert_eq!(buf[(6, 1)].symbol(), "-");
         assert_eq!(buf[(6, 1)].fg, Color::Black);
         assert_eq!(buf[(6, 1)].bg, Color::Red);
         assert_eq!(buf[(8, 1)].symbol(), "+");
         assert_eq!(buf[(8, 1)].fg, Color::Black);
         assert_eq!(buf[(8, 1)].bg, Color::Green);
-        assert_eq!(buf[(5, 1)].symbol(), "|");
+        assert_eq!(buf[(5, 1)].symbol(), " ");
+        assert_eq!(buf[(5, 1)].bg, Color::Reset);
         for y in 2..=4 {
             assert_eq!(buf[(6, y)].bg, Color::Red);
             assert_eq!(buf[(8, y)].bg, Color::Green);
             assert_eq!(buf[(6, y)].fg, Color::Black);
             assert_eq!(buf[(8, y)].fg, Color::Black);
             assert_eq!(buf[(1, y)].bg, Color::Reset);
+            assert_eq!(buf[(5, y)].symbol(), "│");
             assert_eq!(buf[(5, y)].bg, Color::Reset);
             assert_eq!(buf[(5, y)].fg, Color::DarkGray);
         }
-        for y in 5..=21 {
+        // The colors run to the pane's last row, just above the status
+        // bar.
+        for y in 5..=22 {
             assert_eq!(buf[(6, y)].bg, Color::Red);
             assert_eq!(buf[(8, y)].bg, Color::Green);
             assert_eq!(buf[(5, y)].bg, Color::Reset);
             assert_eq!(buf[(12, y)].bg, Color::Reset);
         }
-        assert_eq!(buf[(6, 22)].bg, Color::Reset); // bottom border
-        assert_eq!(buf[(6, 22)].symbol(), "─");
-        assert_eq!(buf[(6, 23)].bg, Color::Reset); // status bar
+        assert_ne!(buf[(6, 23)].bg, Color::Red); // status bar
         assert_eq!(buf[(12, 2)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -1295,12 +1388,12 @@ mod tests {
         let (mut app, a, b) = files_app("中文abc\n", "中日abc\n");
         let buf = draw_buffer(&mut app);
         // Marker "  |- |+ |   " and content "中|文|日|abc" both place
-        // the `|`s at display cells 2, 5, 8. In buffer coords (inner
-        // starts at (1,1)) those are x = 3, 6, 9 on the marker row
-        // (y=1) and the content row (y=2).
+        // their separators at display cells 2, 5, 8. In buffer coords
+        // (inner starts at (1,1)) those are x = 3, 6, 9: gaps on the
+        // marker row (y=1) and rules on the content row (y=2).
         for x in [3, 6, 9] {
-            assert_eq!(buf[(x, 1)].symbol(), "|", "marker | at x={x}");
-            assert_eq!(buf[(x, 2)].symbol(), "|", "content | at x={x}");
+            assert_eq!(buf[(x, 1)].symbol(), " ", "marker gap at x={x}");
+            assert_eq!(buf[(x, 2)].symbol(), "│", "content rule at x={x}");
         }
         // The `-`/`+` markers sit over their column's first display
         // cell: '-' at buffer (4,1) over 文 at (4,2), '+' at (7,1) over
@@ -1382,7 +1475,7 @@ mod tests {
             assert_eq!(buf[(insert_x, 1)].symbol(), "+");
             assert_eq!(buf[(insert_x, 2)].bg, Color::Green);
             for x in [prefix_width + 1, prefix_width + 3] {
-                assert_eq!(buf[(x, 2)].symbol(), "|");
+                assert_eq!(buf[(x, 2)].symbol(), "│");
                 assert_eq!(buf[(x, 2)].fg, Color::DarkGray);
                 assert_eq!(buf[(x, 2)].bg, Color::Reset);
             }
@@ -1448,8 +1541,11 @@ mod tests {
         assert_eq!(buf[(3, 1)].symbol(), "-");
         assert_eq!(buf[(4, 3)].symbol(), "c");
         assert_eq!(buf[(5, 3)].symbol(), "x");
+        assert_eq!(buf[(6, 1)].symbol(), " ");
+        for y in [2, 3] {
+            assert_eq!(buf[(6, y)].symbol(), "│");
+        }
         for y in [1, 2, 3] {
-            assert_eq!(buf[(6, y)].symbol(), "|");
             assert_eq!(buf[(6, y)].bg, Color::Reset);
         }
         assert_eq!(buf[(7, 2)].symbol(), "a\u{301}");
@@ -1583,7 +1679,7 @@ mod tests {
             assert_eq!(buf[(inserted_x, 2)].symbol(), "y");
             assert_eq!(buf[(inserted_x, 2)].bg, Color::Green);
             for x in [deleted_x - 1, deleted_x + 1] {
-                assert_eq!(buf[(x, 2)].symbol(), "|");
+                assert_eq!(buf[(x, 2)].symbol(), "│");
                 assert_eq!(buf[(x, 2)].fg, Color::DarkGray);
                 assert_eq!(buf[(x, 2)].bg, Color::Reset);
             }
@@ -1625,16 +1721,17 @@ mod tests {
             let (mut app, a, b) = files_app(old, new);
             let buf = draw_buffer(&mut app);
             let width = app.display.as_ref().unwrap().width as u16;
-            for y in 1..=21 {
+            // The whole pane, from the marker row (y=1) to its last row
+            // (y=22), carries the color.
+            for y in 1..=22 {
                 for x in 1..=width {
                     assert_eq!(buf[(x, y)].bg, color);
                     assert_eq!(buf[(x, y)].fg, Color::Black);
                 }
                 assert_eq!(buf[(width + 1, y)].bg, Color::Reset);
             }
-            assert_eq!(buf[(1, 22)].bg, Color::Reset); // bottom border
-            assert_eq!(buf[(1, 23)].bg, Color::Reset); // status bar
-            assert_eq!(buf[(1, 0)].bg, Color::Reset); // top border
+            assert_ne!(buf[(1, 23)].bg, color); // status bar
+            assert_ne!(buf[(1, 0)].bg, color); // top bar
             let _ = std::fs::remove_file(&a);
             let _ = std::fs::remove_file(&b);
         }
@@ -1673,7 +1770,7 @@ mod tests {
     #[test]
     fn switching_files_clears_previous_backgrounds() {
         let mut app = git_app(vec![("a\u{301}x\n", "a\u{301}y\n"), ("same\n", "same\n")]);
-        app.show_sidebar = false;
+        app.sidebar = Some(false);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         assert_eq!(terminal.backend().buffer()[(3, 2)].bg, Color::Red);
@@ -1696,25 +1793,27 @@ mod tests {
             &format!("{}\n", block.repeat(10)),
             &format!("{}\n", block.replace("文", "日").repeat(10)),
         );
-        for scroll_x in [1, 4] {
+        for (scroll_x, next_tab) in [(1, "-"), (4, "+")] {
             // scroll_x cuts inside a wide char (中 at cells 0-1, 文 at
             // 3-4): it is skipped whole, so the first drawn char sits
             // one cell past the viewport; the marker row must still
-            // show the cell-2 `|` (viewport 1, buffer x = inner.x + 1
-            // = 2) over the content row's cell-2 `|`.
+            // show the separator gap (viewport 1, buffer x = inner.x +
+            // 1 = 2) over the content row's rule, with the next tab
+            // right after both.
             app.scroll_x = scroll_x;
             let backend = draw(&mut app);
             let buf = backend.buffer();
             assert_eq!(
                 buf[(2, 1)].symbol(),
-                "|",
-                "marker | at viewport 1 (scroll_x={scroll_x})"
+                " ",
+                "marker gap at viewport 1 (scroll_x={scroll_x})"
             );
             assert_eq!(
                 buf[(2, 2)].symbol(),
-                "|",
-                "content | at viewport 1 (scroll_x={scroll_x})"
+                "│",
+                "content rule at viewport 1 (scroll_x={scroll_x})"
             );
+            assert_eq!(buf[(3, 1)].symbol(), next_tab, "scroll_x={scroll_x}");
         }
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -1722,9 +1821,10 @@ mod tests {
 
     #[test]
     fn marker_row_is_sticky_when_scrolling() {
-        // 40 rows in a 23-row pane: max_scroll_y is 20, so a scroll of
-        // 10 survives the render clamp (with a 20-row diff the clamp
-        // pins it to 0 and the test would pass vacuously).
+        // 40 rows in a 22-row pane (21 below the marker row):
+        // max_scroll_y is 19, so a scroll of 10 survives the render
+        // clamp (with a 20-row diff the clamp pins it to 0 and the test
+        // would pass vacuously).
         let mut old = String::new();
         let mut new = String::new();
         for i in 1..=39 {
@@ -1734,12 +1834,12 @@ mod tests {
         old.push_str("L40\n");
         new.push_str("X40\n");
         let (mut app, a, b) = files_app(&old, &new);
-        let _ = draw(&mut app); // sets pane_height from the real rect (23)
-        assert_eq!(app.max_scroll_y(), 20);
+        let _ = draw(&mut app); // sets pane_height from the real rect (22)
+        assert_eq!(app.max_scroll_y(), 19);
         app.scroll_y = 10;
         let backend = draw(&mut app);
         let buf = backend.buffer();
-        // Marker "-|+|" starts at x=1 (block border): '-' over the
+        // Marker "-|+|" starts at x=1 (pane padding): '-' over the
         // delete column, '+' over the insert — still at the top row
         // after vertical scroll.
         assert_eq!(buf[(1, 1)].symbol(), "-");
@@ -1749,8 +1849,8 @@ mod tests {
             assert_eq!(buf[(3, y)].bg, Color::Green);
         }
         assert_eq!(app.scroll_y, 10, "clamp must keep a valid scroll");
-        // Line 30 sits on the pane's bottom row: '3' at col 0, '0' at
-        // col 5 (delete|insert cells, then the '0' of "30").
+        // Line 30 sits on the pane's second-to-last row: '3' at col 0,
+        // '0' at col 5 (delete|insert cells, then the '0' of "30").
         assert_eq!(buf[(1, 21)].symbol(), "3");
         assert_eq!(buf[(5, 21)].symbol(), "0");
         let _ = std::fs::remove_file(&a);
@@ -1762,24 +1862,87 @@ mod tests {
         let mut app = git_app(vec![("foo\n", "bar\n"), ("a\n", "b\n")]);
         let backend = draw(&mut app);
         let buf = backend.buffer();
-        // Sidebar block is bordered (inner x=1) and the highlight symbol
-        // "> " occupies columns 1-2, so the status letter starts at x=3.
-        assert_eq!(buf[(3, 1)].symbol(), "M"); // first entry: 'M' + space + path
-        // highlight symbol "> " on the selected entry
-        assert_eq!(buf[(1, 1)].symbol(), ">");
+        // A title row under the top bar, then one row per file: the
+        // selection mark, the status letter, two spaces, the path.
+        assert_eq!(row_text(buf, 1, 0..24), " FILES              1/2 ");
+        assert_eq!(row_text(buf, 2, 0..10), "▌M  f0.txt");
+        assert_eq!(row_text(buf, 3, 0..10), " M  f1.txt");
+        assert_eq!(buf[(1, 2)].fg, Color::Yellow);
+        // The selected row is highlighted across the sidebar.
+        for x in 1..24 {
+            assert_eq!(buf[(x, 2)].bg, Color::DarkGray, "x={x}");
+            assert_eq!(buf[(x, 3)].bg, Color::Reset, "x={x}");
+        }
+        // The divider follows the 24-column sidebar.
+        assert_eq!(buf[(24, 2)].symbol(), "│");
+    }
+
+    #[test]
+    fn sidebar_keeps_the_selection_in_view() {
+        let files: Vec<(&str, &str)> = vec![("a\n", "b\n"); 30];
+        let mut app = git_app(files);
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        // 10 rows: top bar, sidebar title, 7 entries, status bar.
+        for _ in 0..12 {
+            app.handle_key(key(KeyCode::Tab));
+        }
+        let buf = terminal
+            .draw(|frame| app.render(frame))
+            .unwrap()
+            .buffer
+            .clone();
+        assert_eq!(row_text(&buf, 8, 0..11), "▌M  f12.txt");
+        assert_eq!(row_text(&buf, 2, 0..11), " M  f6.txt ");
+        for _ in 0..10 {
+            app.handle_key(key(KeyCode::BackTab));
+        }
+        let buf = terminal
+            .draw(|frame| app.render(frame))
+            .unwrap()
+            .buffer
+            .clone();
+        assert_eq!(row_text(&buf, 2, 0..10), "▌M  f2.txt");
     }
 
     #[test]
     fn sidebar_hidden_diff_takes_full_width() {
         let mut app = git_app(vec![("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n")]);
         let buf_before = draw(&mut app);
-        assert_ne!(buf_before.buffer()[(4, 1)].symbol(), "-"); // (4,1) is inside the sidebar
-        app.show_sidebar = false;
+        assert_ne!(buf_before.buffer()[(6, 1)].symbol(), "-"); // (6,1) is inside the sidebar
+        app.sidebar = Some(false);
         let buf_after = draw(&mut app);
-        // Full-width diff pane is still bordered: inner starts at x=1,
-        // marker "    |-|+|  " → '|' at (5,1), '-' at (6,1).
-        assert_eq!(buf_after.buffer()[(5, 1)].symbol(), "|"); // marker separator at (5,1)
+        // The full-width pane keeps its blank first cell: inner starts
+        // at x=1, marker "    |-|+|  " → gap at (5,1), '-' at (6,1).
+        assert_eq!(buf_after.buffer()[(5, 1)].symbol(), " "); // marker gap at (5,1)
         assert_eq!(buf_after.buffer()[(6, 1)].symbol(), "-");
+    }
+
+    #[test]
+    fn sidebar_starts_hidden_on_narrow_terminals() {
+        let mut app = git_app(vec![("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n")]);
+        let mut narrow = Terminal::new(TestBackend::new(79, 24)).unwrap();
+        let buf = narrow
+            .draw(|frame| app.render(frame))
+            .unwrap()
+            .buffer
+            .clone();
+        assert!(!app.sidebar_visible());
+        assert_eq!(buf[(6, 1)].symbol(), "-", "the diff takes the full width");
+        // `e` still shows it, and the choice outlives a resize.
+        let r = app.handle_key(key(KeyCode::Char('e')));
+        assert!(r.changed);
+        assert!(app.sidebar_visible());
+        let buf = narrow
+            .draw(|frame| app.render(frame))
+            .unwrap()
+            .buffer
+            .clone();
+        assert_eq!(row_text(&buf, 2, 0..10), "▌M  f0.txt");
+        let _ = draw(&mut app);
+        assert!(app.sidebar_visible());
+        app.handle_key(key(KeyCode::Char('e')));
+        let _ = draw(&mut app);
+        assert!(!app.sidebar_visible(), "hidden on request even when wide");
     }
 
     #[test]
@@ -1787,21 +1950,25 @@ mod tests {
         let mut app = git_app(vec![]);
         let backend = draw(&mut app);
         let buf = backend.buffer();
-        let row: String = (0..80).map(|x| buf[(x, 11)].symbol().to_string()).collect();
-        assert!(
-            row.contains("no changes"),
+        // Centered in the 22-row pane: the title, then the revisions.
+        let row = row_text(buf, 11, 0..80);
+        assert_eq!(
+            row.trim(),
+            "No changes",
             "expected placeholder text, got {row:?}"
         );
+        assert_eq!(row_text(buf, 12, 0..80).trim(), "HEAD~1 → HEAD");
+        assert!(!app.sidebar_visible(), "no sidebar without files");
     }
 
     #[test]
     fn max_scroll_y_reaches_bottom_content_rows() {
-        // 30 content rows in the 80x24 pane: the bordered diff pane has
-        // inner height 21 and the sticky marker row occupies one of
-        // those, so 20 content rows are visible and the last line only
-        // becomes reachable at scroll_y = 10 (h - inner.height + 1).
-        // The old formula (h - pane_height = 7) left rows 28-30
-        // permanently unviewable.
+        // 30 content rows in the 80x24 terminal: between the top bar
+        // and the status bar the diff pane has height 22, and the
+        // sticky marker row occupies one of those rows, so 21 content
+        // rows are visible and the last line only becomes reachable at
+        // scroll_y = 9 (h - pane_height + 1). Without the marker row
+        // (h - pane_height = 8) line 30 would stay unviewable.
         let mut old = String::new();
         let mut new = String::new();
         for i in 1..=29 {
@@ -1811,24 +1978,24 @@ mod tests {
         old.push_str("L30\n");
         new.push_str("X30\n"); // only line 30 differs (col 0: 'L' vs 'X')
         let (mut app, a, b) = files_app(&old, &new);
-        let _ = draw(&mut app); // sets pane_height from the real rect (23)
-        assert_eq!(app.max_scroll_y(), 10);
-        app.scroll_y = 10;
+        let _ = draw(&mut app); // sets pane_height from the real rect (22)
+        assert_eq!(app.max_scroll_y(), 9);
+        app.scroll_y = 9;
         let backend = draw(&mut app);
         let buf = backend.buffer();
         // Last content row "L|X|3|0" (line 30, old side 'L' / new side 'X')
-        // sits at the bottom row of the pane: y = 21.
-        assert_eq!(buf[(1, 21)].symbol(), "L");
-        assert_eq!(buf[(3, 21)].symbol(), "X");
+        // sits at the bottom row of the pane: y = 22.
+        assert_eq!(buf[(1, 22)].symbol(), "L");
+        assert_eq!(buf[(3, 22)].symbol(), "X");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
 
     #[test]
     fn max_scroll_x_reaches_last_columns() {
-        // One 100-char row: the bordered pane's inner width is 78
-        // (pane_width - 2), so the row scrolls to 22. The old formula
-        // (w - pane_width = 20) left the last 2 columns unviewable.
+        // One 100-char row: the pane keeps a blank cell on each side,
+        // so its inner width is 78 and the row scrolls to 22. Scrolling
+        // only to 20 would leave the last 2 columns unviewable.
         let old = "a".repeat(100);
         let new = "a".repeat(100); // identical single-line files: width 100
         let (mut app, a, b) = files_app(&old, &new);
@@ -1859,7 +2026,7 @@ mod tests {
         let backend = draw(&mut app);
         assert_eq!(app.scroll_y, app.max_scroll_y(), "scroll must re-clamp");
         let buf = backend.buffer();
-        assert_eq!(buf[(3, 21)].symbol(), "X", "bottom row visible");
+        assert_eq!(buf[(3, 22)].symbol(), "X", "bottom row visible");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1991,14 +2158,16 @@ mod tests {
     #[test]
     fn e_toggles_sidebar_only_in_git_mode() {
         let mut app = git_app(vec![("a\n", "b\n")]);
-        assert!(app.show_sidebar);
+        assert!(app.sidebar_visible());
         app.handle_key(key(KeyCode::Char('e')));
-        assert!(!app.show_sidebar);
+        assert!(!app.sidebar_visible());
         app.handle_key(key(KeyCode::Char('e')));
-        assert!(app.show_sidebar);
+        assert!(app.sidebar_visible());
         let (mut files_app, a, b) = files_app("a\n", "b\n");
-        files_app.handle_key(key(KeyCode::Char('e'))); // no sidebar in files mode
-        assert!(files_app.show_sidebar);
+        let r = files_app.handle_key(key(KeyCode::Char('e'))); // no sidebar in files mode
+        assert!(!r.changed);
+        assert_eq!(files_app.sidebar, None);
+        assert!(!files_app.sidebar_visible());
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -2027,5 +2196,284 @@ mod tests {
         let grid = compute("aa\n", "ab\n");
         let display = build_display(&grid);
         assert_eq!(display.group_end_offsets, [2, 4, 5]);
+    }
+
+    const OLD_CPP: &str =
+        "#include <cstdio>\n\nint main() {\n  std::printf(\"Hello, World\\n\");\n  return 0;\n}\n";
+    const NEW_CPP: &str = "#include <print>\n\nauto main() -> int {\n  std::println(\"Hello, World\");\n  return 0;\n}\n";
+
+    #[test]
+    fn diff_stats_count_a_delete_run_and_its_insert_run_once() {
+        // The README example: -1/+1, -4/+4, a lone insert, a lone delete.
+        assert_eq!(
+            DiffStats::of(&compute(OLD_CPP, NEW_CPP)),
+            DiffStats {
+                changes: 4,
+                deleted: 19,
+                inserted: 18,
+            }
+        );
+        assert_eq!(
+            DiffStats::of(&compute("x\n", "xab\n")),
+            DiffStats {
+                changes: 1,
+                deleted: 0,
+                inserted: 2,
+            }
+        );
+        assert_eq!(DiffStats::of(&compute("a\n", "a\n")), DiffStats::default());
+    }
+
+    #[test]
+    fn true_color_separates_tabs_cells_and_fill() {
+        let theme = Theme::new(ColorDepth::TrueColor);
+        let (mut app, a, b) = files_app_with("foo\nbar baz\n", "foo\nbar qaz\n", theme.clone());
+        let buf = draw_buffer(&mut app);
+        // Marker row y=1, file rows y=2..=3, fill below down to y=22.
+        for (x, tab, cell, fill) in [
+            (6, theme.delete_tab, theme.delete, theme.delete_fill),
+            (8, theme.insert_tab, theme.insert, theme.insert_fill),
+        ] {
+            assert_eq!(buf[(x, 1)].bg, tab.bg.unwrap());
+            assert_eq!(buf[(x, 1)].fg, tab.fg.unwrap());
+            for y in [2, 3] {
+                assert_eq!(buf[(x, y)].bg, cell.bg.unwrap());
+                assert_eq!(buf[(x, y)].fg, cell.fg.unwrap());
+            }
+            for y in 4..=22 {
+                assert_eq!(buf[(x, y)].bg, fill.bg.unwrap());
+            }
+        }
+        assert_eq!(buf[(6, 3)].symbol(), "b");
+        assert_eq!(buf[(8, 3)].symbol(), "q");
+        // Separators: a gap between tabs, a rule between file cells.
+        assert_eq!(buf[(5, 1)].bg, Color::Reset);
+        assert_eq!(buf[(5, 3)].symbol(), "│");
+        assert_eq!(buf[(5, 3)].fg, theme.separator.fg.unwrap());
+        assert_eq!(buf[(5, 3)].bg, Color::Reset);
+        assert_eq!(buf[(1, 3)].bg, Color::Reset);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn no_color_marks_changes_without_colors() {
+        let (mut app, a, b) = files_app_with(
+            "foo\nbar baz\n",
+            "foo\nbar qaz\n",
+            Theme::new(ColorDepth::NoColor),
+        );
+        let buf = draw_buffer(&mut app);
+        for y in 0..24 {
+            for x in 0..80 {
+                assert_eq!(buf[(x, y)].fg, Color::Reset, "({x}, {y})");
+                assert_eq!(buf[(x, y)].bg, Color::Reset, "({x}, {y})");
+            }
+        }
+        assert_eq!(buf[(6, 1)].symbol(), "-");
+        assert_eq!(buf[(8, 1)].symbol(), "+");
+        for x in [6, 8] {
+            assert!(buf[(x, 3)].modifier.contains(Modifier::REVERSED));
+            assert!(!buf[(x, 4)].modifier.contains(Modifier::REVERSED));
+        }
+        assert!(!buf[(1, 3)].modifier.contains(Modifier::REVERSED));
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn top_bar_names_the_files_and_counts_changes() {
+        let (mut app, a, b) = files_app(OLD_CPP, NEW_CPP);
+        app.labels = ("demo/old.cpp".into(), "demo/new.cpp".into());
+        let buf = draw_buffer(&mut app);
+        let bar = row_text(&buf, 0, 0..80);
+        assert!(
+            bar.starts_with(" vdiff   demo/{old.cpp → new.cpp}  "),
+            "{bar:?}"
+        );
+        assert!(bar.ends_with("  4 changes   -19 +18 cols "), "{bar:?}");
+        assert_eq!(buf[(1, 0)].bg, Color::Cyan);
+        assert_eq!(buf[(67, 0)].symbol(), "-");
+        assert_eq!(buf[(67, 0)].fg, Color::Red);
+        assert_eq!(buf[(71, 0)].symbol(), "+");
+        assert_eq!(buf[(71, 0)].fg, Color::Green);
+        // A narrower bar folds the label's directories to keep the
+        // counts, and drops the counts when even that is too long.
+        app.labels = ("deep/demo/old.cpp".into(), "deep/demo/new.cpp".into());
+        for (width, expected) in [
+            (
+                60,
+                " vdiff   …/{old.cpp → new.cpp}     4 changes   -19 +18 cols ",
+            ),
+            (40, " vdiff   deep/demo/{old.cpp → new.cpp}  "),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let buf = terminal
+                .draw(|frame| app.render(frame))
+                .unwrap()
+                .buffer
+                .clone();
+            assert_eq!(row_text(&buf, 0, 0..width), expected);
+        }
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn top_bar_reports_identical_files_and_skipped_lcs() {
+        let (mut app, a, b) = files_app("same\n", "same\n");
+        app.labels = ("a.txt".into(), "b.txt".into());
+        let buf = draw_buffer(&mut app);
+        let bar = row_text(&buf, 0, 0..80);
+        assert!(bar.starts_with(" vdiff   a.txt → b.txt  "), "{bar:?}");
+        assert!(bar.ends_with(" identical "), "{bar:?}");
+        let (mut app, c, d) = files_app("x\n", "y\n");
+        app.labels = ("x".into(), "y".into());
+        app.degraded = true;
+        let bar = row_text(&draw_buffer(&mut app), 0, 0..80);
+        assert!(
+            bar.contains(" LCS skipped   1 change   -1 +1 cols "),
+            "{bar:?}"
+        );
+        for path in [a, b, c, d] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn top_bar_shows_the_selected_file_in_git_mode() {
+        let mut app = git_app(vec![("a\n", "b\n"), ("c\n", "d\n")]);
+        app.handle_key(key(KeyCode::Tab));
+        let bar = row_text(&draw_buffer(&mut app), 0, 0..80);
+        assert!(
+            bar.starts_with(" vdiff   HEAD~1 → HEAD   f1.txt  "),
+            "{bar:?}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_mode_ranges_and_hints() {
+        let (mut app, a, b) = files_app(&"x\n".repeat(40), &"y\n".repeat(40));
+        let buf = draw_buffer(&mut app);
+        assert_eq!(
+            row_text(&buf, 23, 0..80),
+            format!(
+                " FILES   line 1-21/40{}hjkl scroll   n/p change   ? help ",
+                " ".repeat(25)
+            )
+        );
+        // Narrow: hints go first, `? help` last.
+        let mut terminal = Terminal::new(TestBackend::new(30, 24)).unwrap();
+        let buf = terminal
+            .draw(|frame| app.render(frame))
+            .unwrap()
+            .buffer
+            .clone();
+        assert_eq!(row_text(&buf, 23, 0..30), " FILES   line 1-21/40  ? help ");
+        // A diff wider than the pane also shows the column range.
+        let line = "a".repeat(200) + "\n";
+        let (mut wide, c, d) = files_app(&line, &line);
+        wide.scroll_x = 10;
+        let bar = row_text(&draw_buffer(&mut wide), 23, 0..80);
+        assert!(
+            bar.starts_with(" FILES   line 1-1/1  col 11-88/200 "),
+            "{bar:?}"
+        );
+        for path in [a, b, c, d] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn status_bar_hints_follow_the_mode() {
+        let mut app = git_app(vec![("a\n", "b\n"), ("c\n", "d\n")]);
+        let bar = row_text(&draw_buffer(&mut app), 23, 0..80);
+        assert!(bar.starts_with(" GIT   line 1-1/1"), "{bar:?}");
+        assert!(bar.ends_with("tab file   n/p change   ? help "), "{bar:?}");
+        let mut empty = git_app(vec![]);
+        let bar = row_text(&draw_buffer(&mut empty), 23, 0..80);
+        assert_eq!(bar, format!(" GIT {}? help ", " ".repeat(68)));
+    }
+
+    #[test]
+    fn help_popup_takes_keys_until_closed() {
+        let tall = "a\n".repeat(50);
+        let mut app = git_app(vec![(&tall, "b\n")]);
+        let r = app.handle_key(key(KeyCode::Char('?')));
+        assert!(r.changed && app.help);
+        let buf = draw_buffer(&mut app);
+        let screen: Vec<String> = (0..24).map(|y| row_text(&buf, y, 0..80)).collect();
+        assert!(
+            screen.iter().any(|row| row.contains("╭ Keys ")),
+            "{screen:#?}"
+        );
+        assert!(
+            screen
+                .iter()
+                .any(|row| row.contains("Tab / S-Tab   next / previous file"))
+        );
+        assert!(screen.iter().any(|row| row.contains(" esc to close ╯")));
+        // Other keys do nothing while it is open, and `q` closes it
+        // instead of quitting.
+        let r = app.handle_key(key(KeyCode::Char('j')));
+        assert!(!r.changed && !r.quit);
+        assert_eq!(app.scroll_y, 0);
+        let r = app.handle_key(key(KeyCode::Char('q')));
+        assert!(r.changed && !r.quit && !app.help);
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(app.handle_key(key(KeyCode::Esc)).changed);
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(app.handle_key(key(KeyCode::Char('?'))).changed);
+        assert!(!app.help);
+        // Files mode has no file keys to list.
+        let (mut files, a, b) = files_app("a\n", "b\n");
+        files.handle_key(key(KeyCode::Char('?')));
+        let buf = draw_buffer(&mut files);
+        let screen: String = (0..24).map(|y| row_text(&buf, y, 0..80)).collect();
+        assert!(screen.contains("next / previous change"));
+        assert!(!screen.contains("next / previous file"));
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn unreadable_files_show_a_notice() {
+        let missing = std::env::temp_dir().join("vdiff-missing-file");
+        let mut app = App::new(
+            DiffSource::Files {
+                old: missing.clone(),
+                new: missing.clone(),
+            },
+            ansi16(),
+        );
+        let path = missing.display().to_string();
+        assert_eq!(
+            app.notice,
+            Some(Notice {
+                title: "Binary or unreadable file".into(),
+                detail: Some(format!("{path} → {path}")),
+            })
+        );
+        let buf = draw_buffer(&mut app);
+        assert_eq!(
+            row_text(&buf, 11, 0..80).trim(),
+            "Binary or unreadable file"
+        );
+        let bar = row_text(&buf, 23, 0..80);
+        assert!(bar.starts_with(" FILES  "), "{bar:?}");
+        assert!(bar.ends_with("  ? help "), "{bar:?}");
+    }
+
+    #[test]
+    fn tiny_terminals_do_not_panic() {
+        for (width, height) in [(1, 1), (1, 3), (5, 2), (9, 4), (30, 3)] {
+            let mut app = git_app(vec![("a\nb\n", "a\nc\n"), ("x\n", "y\n")]);
+            app.help = true;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            app.sidebar = Some(true);
+            app.help = false;
+            terminal.draw(|frame| app.render(frame)).unwrap();
+        }
     }
 }
