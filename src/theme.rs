@@ -44,13 +44,14 @@ impl ColorDepth {
 /// Every style the TUI draws, by role.
 #[derive(Clone, Debug)]
 pub struct Theme {
-    /// Changed cells on file rows.
-    pub delete: Style,
-    pub insert: Style,
-    /// The fainter tint that continues a changed column below the file.
-    pub delete_fill: Style,
-    pub insert_fill: Style,
-    /// Marker-row cells above changed columns.
+    /// File cells of a change on rows where its old and new text differ.
+    pub delete_strong: Style,
+    pub insert_strong: Style,
+    /// The rest of a changed column: rows the change leaves alone, and
+    /// the space below the file.
+    pub delete_lane: Style,
+    pub insert_lane: Style,
+    /// Marker-row tabs above changed columns.
     pub delete_tab: Style,
     pub insert_tab: Style,
     /// Unchanged cells. Clears any tint.
@@ -110,10 +111,10 @@ impl Theme {
         };
         let fg = |color: Color| Style::new().fg(color);
         Theme {
-            delete: tinted(p.delete),
-            insert: tinted(p.insert),
-            delete_fill: tinted(p.delete_fill),
-            insert_fill: tinted(p.insert_fill),
+            delete_strong: tinted(p.delete_strong).add_modifier(p.strong_modifier),
+            insert_strong: tinted(p.insert_strong).add_modifier(p.strong_modifier),
+            delete_lane: tinted(p.delete_lane),
+            insert_lane: tinted(p.insert_lane),
             delete_tab: badge(p.delete_tab),
             insert_tab: badge(p.insert_tab),
             plain: Style::new().fg(Color::Reset).bg(Color::Reset),
@@ -142,17 +143,17 @@ impl Theme {
     }
 
     /// `NO_COLOR`: changes stay visible through the marker row, the
-    /// separators, and reversed cells.
+    /// separators, and reversed cells on the rows that differ.
     fn monochrome() -> Theme {
         let plain = Style::new().fg(Color::Reset).bg(Color::Reset);
         let bold = Style::new().add_modifier(Modifier::BOLD);
         let dim = Style::new().add_modifier(Modifier::DIM);
         let reversed = Style::new().add_modifier(Modifier::REVERSED);
         Theme {
-            delete: plain.add_modifier(Modifier::REVERSED),
-            insert: plain.add_modifier(Modifier::REVERSED),
-            delete_fill: plain,
-            insert_fill: plain,
+            delete_strong: plain.add_modifier(Modifier::REVERSED),
+            insert_strong: plain.add_modifier(Modifier::REVERSED),
+            delete_lane: plain,
+            insert_lane: plain,
             delete_tab: plain.add_modifier(Modifier::BOLD),
             insert_tab: plain.add_modifier(Modifier::BOLD),
             plain,
@@ -182,12 +183,15 @@ struct Palette {
     ink: Color,
     /// Light text on dark badges and the selection.
     light: Color,
-    delete: Color,
-    delete_fill: Color,
+    delete_strong: Color,
+    delete_lane: Color,
     delete_tab: Color,
-    insert: Color,
-    insert_fill: Color,
+    insert_strong: Color,
+    insert_lane: Color,
     insert_tab: Color,
+    /// Added to strong cells, for palettes whose strong and lane colors
+    /// are the same.
+    strong_modifier: Modifier,
     /// Separators and divider lines.
     rule: Color,
     muted: Color,
@@ -207,12 +211,13 @@ const TRUE_COLOR: Palette = Palette {
     lane_text: Color::Rgb(0xdc, 0xdf, 0xe4),
     ink: Color::Rgb(0x1a, 0x1b, 0x26),
     light: Color::Rgb(0xc0, 0xca, 0xf5),
-    delete: Color::Rgb(0x6b, 0x2a, 0x35),
-    delete_fill: Color::Rgb(0x3a, 0x21, 0x29),
+    delete_strong: Color::Rgb(0x6b, 0x2a, 0x35),
+    delete_lane: Color::Rgb(0x3a, 0x21, 0x29),
     delete_tab: Color::Rgb(0xe8, 0x66, 0x71),
-    insert: Color::Rgb(0x2c, 0x5a, 0x3c),
-    insert_fill: Color::Rgb(0x1f, 0x33, 0x26),
+    insert_strong: Color::Rgb(0x2c, 0x5a, 0x3c),
+    insert_lane: Color::Rgb(0x1f, 0x33, 0x26),
     insert_tab: Color::Rgb(0x8f, 0xcf, 0x7f),
+    strong_modifier: Modifier::empty(),
     rule: Color::Rgb(0x3b, 0x42, 0x61),
     muted: Color::Rgb(0x56, 0x5f, 0x89),
     accent: Color::Rgb(0x7a, 0xa2, 0xf7),
@@ -226,20 +231,20 @@ const TRUE_COLOR: Palette = Palette {
     bold_badges: true,
 };
 
-/// The 256-color cube's darkest red and green (52, 22) are its only
-/// tints dark enough for light text, and the next steps up are much
-/// brighter in green than in red, so changed cells and the fill below
-/// the file share them.
+/// Lanes use the 256-color cube's darkest red and green (52, 22), the
+/// only tints dark enough to stay in the background; rows that differ
+/// step up to 88 and 28, as delta does.
 const ANSI_256: Palette = Palette {
     lane_text: Color::Indexed(255),
     ink: Color::Indexed(234),
     light: Color::Indexed(252),
-    delete: Color::Indexed(52),
-    delete_fill: Color::Indexed(52),
+    delete_strong: Color::Indexed(88),
+    delete_lane: Color::Indexed(52),
     delete_tab: Color::Indexed(167),
-    insert: Color::Indexed(22),
-    insert_fill: Color::Indexed(22),
+    insert_strong: Color::Indexed(28),
+    insert_lane: Color::Indexed(22),
     insert_tab: Color::Indexed(114),
+    strong_modifier: Modifier::empty(),
     rule: Color::Indexed(238),
     muted: Color::Indexed(60),
     accent: Color::Indexed(111),
@@ -254,18 +259,20 @@ const ANSI_256: Palette = Palette {
 };
 
 /// The terminal's own palette: black text on red and green, as the TUI
-/// has always drawn it. Bold is left off because many terminals turn
-/// bold black into gray.
+/// has always drawn it. With one red and one green, rows that differ
+/// are underlined instead of tinted. Bold is left off because many
+/// terminals turn bold black into gray.
 const ANSI_16: Palette = Palette {
     lane_text: Color::Black,
     ink: Color::Black,
     light: Color::White,
-    delete: Color::Red,
-    delete_fill: Color::Red,
+    delete_strong: Color::Red,
+    delete_lane: Color::Red,
     delete_tab: Color::Red,
-    insert: Color::Green,
-    insert_fill: Color::Green,
+    insert_strong: Color::Green,
+    insert_lane: Color::Green,
     insert_tab: Color::Green,
+    strong_modifier: Modifier::UNDERLINED,
     rule: Color::DarkGray,
     muted: Color::DarkGray,
     accent: Color::Cyan,
@@ -327,10 +334,10 @@ mod tests {
         ] {
             let theme = Theme::new(depth);
             for style in [
-                theme.delete,
-                theme.insert,
-                theme.delete_fill,
-                theme.insert_fill,
+                theme.delete_strong,
+                theme.insert_strong,
+                theme.delete_lane,
+                theme.insert_lane,
                 theme.delete_tab,
                 theme.insert_tab,
                 theme.logo,
@@ -347,12 +354,26 @@ mod tests {
     }
 
     #[test]
+    fn strong_cells_stand_out_from_their_lane() {
+        for depth in [
+            ColorDepth::TrueColor,
+            ColorDepth::Ansi256,
+            ColorDepth::Ansi16,
+            ColorDepth::NoColor,
+        ] {
+            let theme = Theme::new(depth);
+            assert_ne!(theme.delete_strong, theme.delete_lane, "{depth:?}");
+            assert_ne!(theme.insert_strong, theme.insert_lane, "{depth:?}");
+        }
+    }
+
+    #[test]
     fn monochrome_uses_no_colors() {
         let theme = Theme::new(ColorDepth::NoColor);
         for style in [
-            theme.delete,
-            theme.insert,
-            theme.delete_fill,
+            theme.delete_strong,
+            theme.insert_strong,
+            theme.delete_lane,
             theme.delete_tab,
             theme.separator,
             theme.rule,
@@ -367,6 +388,11 @@ mod tests {
                 assert_eq!(color, Color::Reset, "{style:?}");
             }
         }
-        assert!(theme.delete.add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            theme
+                .delete_strong
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 }

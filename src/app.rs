@@ -13,17 +13,21 @@ use crate::git::{self, ChangedFile, GitShell, RevSpec};
 use crate::theme::Theme;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Margin, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Span;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io;
+use std::ops::Range;
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Below this terminal width the file sidebar starts hidden.
 const SIDEBAR_MIN_FRAME_WIDTH: u16 = 80;
+
+/// Diff areas narrower than this leave out the line-number gutter.
+const GUTTER_MIN_AREA_WIDTH: u16 = 20;
 
 /// Display rows for the TUI: rows[0] is the marker row (one marker per
 /// grapheme column, `|` between groups, padded to the full content
@@ -35,31 +39,33 @@ pub fn build_rows(grid: &DiffGrid) -> Vec<String> {
     build_display(grid).rows
 }
 
-/// Where a cell sits in its column.
+/// How a diff cell is drawn.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RowRole {
-    /// The sticky marker row.
-    Marker,
-    /// A file line.
-    File,
-    /// Below the last file line.
-    Below,
+enum CellRole {
+    /// On the sticky marker row.
+    Tab,
+    /// On a file row the cell's change leaves alone, or below the file.
+    Lane,
+    /// On a file row where the cell's change reads differently in the
+    /// old and new file.
+    Strong,
 }
 
 /// The style of a diff cell; `kind` is `None` for a group separator.
-/// A changed column is a tab on the marker row, a tinted cell on file
-/// rows, and a fainter fill below the file. Separators are blank gaps
-/// between the tabs and thin rules between the file cells.
-fn diff_style(theme: &Theme, role: RowRole, kind: Option<StepKind>) -> Style {
+/// A changed column is a tab on the marker row, a faint lane down to
+/// the bottom of the pane, and strong cells on the rows its change
+/// alters. Separators are blank gaps between the tabs and thin rules
+/// between the cells.
+fn diff_style(theme: &Theme, role: CellRole, kind: Option<StepKind>) -> Style {
     match (kind, role) {
-        (Some(StepKind::Match), _) | (None, RowRole::Marker) => theme.plain,
+        (Some(StepKind::Match), _) | (None, CellRole::Tab) => theme.plain,
         (None, _) => theme.separator,
-        (Some(StepKind::Delete), RowRole::Marker) => theme.delete_tab,
-        (Some(StepKind::Delete), RowRole::File) => theme.delete,
-        (Some(StepKind::Delete), RowRole::Below) => theme.delete_fill,
-        (Some(StepKind::Insert), RowRole::Marker) => theme.insert_tab,
-        (Some(StepKind::Insert), RowRole::File) => theme.insert,
-        (Some(StepKind::Insert), RowRole::Below) => theme.insert_fill,
+        (Some(StepKind::Delete), CellRole::Tab) => theme.delete_tab,
+        (Some(StepKind::Delete), CellRole::Lane) => theme.delete_lane,
+        (Some(StepKind::Delete), CellRole::Strong) => theme.delete_strong,
+        (Some(StepKind::Insert), CellRole::Tab) => theme.insert_tab,
+        (Some(StepKind::Insert), CellRole::Lane) => theme.insert_lane,
+        (Some(StepKind::Insert), CellRole::Strong) => theme.insert_strong,
     }
 }
 
@@ -74,14 +80,86 @@ struct Display {
     group_end_offsets: Vec<usize>,
     /// Layout width shared by rows when cells are drawn independently.
     width: usize,
+    /// Changes in display order.
+    changes: Vec<Change>,
+    /// Per file row, the number of old and new columns up to the line's
+    /// last non-space character. Cells past it are padding.
+    old_ends: Vec<usize>,
+    new_ends: Vec<usize>,
     stats: DiffStats,
+}
+
+impl Display {
+    /// Whether `change` reads differently on `row` in the old and the
+    /// new file. Spaces past the end of a line are padding and do not
+    /// count; spaces before its last character do.
+    fn differs(&self, grid: &DiffGrid, change: &Change, row: usize) -> bool {
+        let old = run_text(grid, change.delete.as_ref(), self.old_ends[row], row);
+        let new = run_text(grid, change.insert.as_ref(), self.new_ends[row], row);
+        !old.eq(new)
+    }
+
+    /// Whether any change reads differently on `row`.
+    fn line_changed(&self, grid: &DiffGrid, row: usize) -> bool {
+        self.changes
+            .iter()
+            .any(|change| self.differs(grid, change, row))
+    }
+}
+
+/// The cells of `run` on `row` before the line ends at column `end`.
+fn run_text<'a>(
+    grid: &'a DiffGrid,
+    run: Option<&'a Run>,
+    end: usize,
+    row: usize,
+) -> impl Iterator<Item = &'a str> + 'a {
+    run.into_iter().flat_map(move |run| {
+        let significant = end.saturating_sub(run.column).min(run.steps.len());
+        run.steps
+            .clone()
+            .take(significant)
+            .map(move |step| grid.steps[step].content.get(row).unwrap_or(" "))
+    })
+}
+
+/// A run of deleted or inserted columns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Run {
+    steps: Range<usize>,
+    /// The run's first column in its own file: the old file for a
+    /// delete run, the new file for an insert run.
+    column: usize,
+    /// Display cells the run covers.
+    cells: Range<usize>,
+}
+
+/// A delete run, an insert run, or a delete run directly followed by
+/// an insert run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Change {
+    delete: Option<Run>,
+    insert: Option<Run>,
+}
+
+impl Change {
+    fn runs(&self) -> impl Iterator<Item = (StepKind, &Run)> {
+        let delete = self.delete.iter().map(|run| (StepKind::Delete, run));
+        delete.chain(self.insert.iter().map(|run| (StepKind::Insert, run)))
+    }
+
+    /// Display cells from the first run's start to the last run's end,
+    /// including the separator between the runs.
+    fn cells(&self) -> Range<usize> {
+        let mut runs = self.runs().map(|(_, run)| &run.cells);
+        let first = runs.next().expect("a change has at least one run");
+        first.start..runs.last().unwrap_or(first).end
+    }
 }
 
 /// Change counts for the top bar.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DiffStats {
-    /// Delete runs and insert runs, where a delete run directly
-    /// followed by an insert run counts once.
     changes: usize,
     /// Deleted and inserted grapheme columns.
     deleted: usize,
@@ -89,23 +167,13 @@ struct DiffStats {
 }
 
 impl DiffStats {
-    fn of(grid: &DiffGrid) -> DiffStats {
-        let mut stats = DiffStats::default();
-        let mut previous = StepKind::Match;
-        for group in &grid.groups {
-            let kind = grid.steps[group.start].kind;
-            match kind {
-                StepKind::Match => {}
-                StepKind::Delete => stats.deleted += group.len(),
-                StepKind::Insert => stats.inserted += group.len(),
-            }
-            let pairs_with_previous = kind == StepKind::Insert && previous == StepKind::Delete;
-            if kind != StepKind::Match && !pairs_with_previous {
-                stats.changes += 1;
-            }
-            previous = kind;
+    fn of(changes: &[Change]) -> DiffStats {
+        let columns = |run: &Option<Run>| run.as_ref().map_or(0, |run| run.steps.len());
+        DiffStats {
+            changes: changes.len(),
+            deleted: changes.iter().map(|change| columns(&change.delete)).sum(),
+            inserted: changes.iter().map(|change| columns(&change.insert)).sum(),
         }
-        stats
     }
 }
 
@@ -122,6 +190,12 @@ fn build_display(grid: &DiffGrid) -> Display {
     let mut kinds = Vec::new();
     let mut columns = Vec::new();
     let mut group_end_offsets = Vec::with_capacity(grid.groups.len());
+    let mut changes = Vec::new();
+    // A delete run waits here for an insert run right after it.
+    let mut pending: Option<Run> = None;
+    let mut old_ends = vec![0; grid.height];
+    let mut new_ends = vec![0; grid.height];
+    let (mut old_column, mut new_column) = (0, 0);
     for group in &grid.groups {
         let kind = grid.steps[group.start].kind;
         let mark = match kind {
@@ -129,6 +203,12 @@ fn build_display(grid: &DiffGrid) -> Display {
             StepKind::Delete => '-',
             StepKind::Insert => '+',
         };
+        let run_column = if kind == StepKind::Insert {
+            new_column
+        } else {
+            old_column
+        };
+        let run_start = kinds.len();
         for step_index in group.clone() {
             let step = &grid.steps[step_index];
             let cells: Vec<_> = step
@@ -158,6 +238,36 @@ fn build_display(grid: &DiffGrid) -> Display {
                 row.push_str(&text);
                 row.extend(std::iter::repeat_n(' ', width - actual_width));
             }
+            for row in step.content.non_padding_rows() {
+                if kind != StepKind::Insert {
+                    old_ends[row] = old_column + 1;
+                }
+                if kind != StepKind::Delete {
+                    new_ends[row] = new_column + 1;
+                }
+            }
+            if kind != StepKind::Insert {
+                old_column += 1;
+            }
+            if kind != StepKind::Delete {
+                new_column += 1;
+            }
+        }
+        let run = Run {
+            steps: group.clone(),
+            column: run_column,
+            cells: run_start..kinds.len(),
+        };
+        match kind {
+            StepKind::Match => changes.extend(pending.take().map(|delete| Change {
+                delete: Some(delete),
+                insert: None,
+            })),
+            StepKind::Delete => pending = Some(run),
+            StepKind::Insert => changes.push(Change {
+                delete: pending.take(),
+                insert: Some(run),
+            }),
         }
         if group.end < grid.steps.len() {
             columns.push(DisplayColumn {
@@ -173,17 +283,53 @@ fn build_display(grid: &DiffGrid) -> Display {
         }
         group_end_offsets.push(kinds.len());
     }
+    changes.extend(pending.map(|delete| Change {
+        delete: Some(delete),
+        insert: None,
+    }));
     let mut out = vec![marker];
     out.extend(rows);
     let width = kinds.len();
+    let stats = DiffStats::of(&changes);
     Display {
         rows: out,
         columns,
         kinds,
         group_end_offsets,
         width,
-        stats: DiffStats::of(grid),
+        changes,
+        old_ends,
+        new_ends,
+        stats,
     }
+}
+
+/// Changes with display cells in `left..right`.
+fn visible_changes(display: &Display, left: usize, right: usize) -> impl Iterator<Item = &Change> {
+    let first = display
+        .changes
+        .partition_point(|change| change.cells().end <= left);
+    display.changes[first..]
+        .iter()
+        .take_while(move |change| change.cells().start < right)
+}
+
+/// A tab label in git's hunk-header style: `-4,15` for a delete run
+/// starting at old column 4 and spanning 15 columns, `+4` for a
+/// one-column insert run. It shortens to `-4`, then `-`, to fit `width`.
+fn tab_label(kind: StepKind, run: &Run, width: usize) -> String {
+    let sign = if kind == StepKind::Delete { '-' } else { '+' };
+    let column = run.column + 1;
+    let count = run.steps.len();
+    let full = if count == 1 {
+        format!("{sign}{column}")
+    } else {
+        format!("{sign}{column},{count}")
+    };
+    [full, format!("{sign}{column}"), sign.to_string()]
+        .into_iter()
+        .find(|label| label.len() <= width)
+        .unwrap_or_default()
 }
 
 /// Give standalone zero-width glyphs a base so they cannot attach to
@@ -492,8 +638,17 @@ impl App {
             diff_area = rest;
         }
         // A blank cell on each side keeps the diff off the divider and
-        // the terminal edge.
-        let pane = diff_area.inner(Margin::new(1, 0));
+        // the terminal edge; line numbers take the left one's place.
+        let gutter = Rect {
+            width: self.gutter_width(diff_area.width),
+            ..diff_area
+        };
+        let left = gutter.width.max(1);
+        let pane = Rect {
+            x: diff_area.x + left,
+            width: diff_area.width.saturating_sub(left + 1),
+            ..diff_area
+        };
         // Record the pane size before rendering the status bar so the
         // scroll clamps are correct on the very first frame (and not
         // only after a state-changing key triggers a redraw).
@@ -509,11 +664,52 @@ impl App {
             self.render_sidebar(frame, list);
             self.render_rule(frame, rule);
         }
+        self.render_gutter(frame, gutter);
         self.render_diff(frame, pane);
         self.render_top_bar(frame, top_bar);
         self.render_status(frame, status_bar);
         if self.help {
             self.render_help(frame, area);
+        }
+    }
+
+    /// Width of the line-number gutter: a blank cell, the numbers (at
+    /// least two digits), and a blank cell. Panes narrower than
+    /// `GUTTER_MIN_AREA_WIDTH` keep their columns for the diff.
+    fn gutter_width(&self, area_width: u16) -> u16 {
+        match &self.grid {
+            Some(grid) if area_width >= GUTTER_MIN_AREA_WIDTH => {
+                let digits = grid.height.max(1).ilog10() + 1;
+                digits.max(2) as u16 + 2
+            }
+            _ => 0,
+        }
+    }
+
+    /// Line numbers beside the visible file rows, `~` below the file.
+    /// Lines that read differently in the two files are brighter.
+    fn render_gutter(&self, frame: &mut Frame<'_>, area: Rect) {
+        let (Some(grid), Some(display)) = (&self.grid, &self.display) else {
+            return;
+        };
+        if area.width < 3 || area.height < 2 {
+            return;
+        }
+        let digits = usize::from(area.width - 2);
+        // The marker row has no number.
+        for (offset, y) in (area.y + 1..area.bottom()).enumerate() {
+            let row = self.scroll_y + offset;
+            let (text, style) = if row < grid.height {
+                let style = if display.line_changed(grid, row) {
+                    self.theme.plain
+                } else {
+                    self.theme.muted
+                };
+                (format!("{:>digits$}", row + 1), style)
+            } else {
+                (format!("{:>digits$}", "~"), self.theme.rule)
+            };
+            frame.buffer_mut().set_string(area.x + 1, y, text, style);
         }
     }
 
@@ -528,11 +724,10 @@ impl App {
                 let Some(disp) = &self.display else {
                     return;
                 };
-                // Color the full visible column with its fill, down to
-                // the bottom of the pane; the marker and file rows
-                // restyle their own cells. Row drawing restores
-                // continuation-cell styles after ratatui writes wide
-                // characters.
+                // Color the full visible column as a lane, down to the
+                // bottom of the pane; the marker and file rows restyle
+                // their own cells. Row drawing restores continuation-cell
+                // styles after ratatui writes wide characters.
                 for (offset, kind) in disp
                     .kinds
                     .iter()
@@ -542,7 +737,7 @@ impl App {
                 {
                     frame.buffer_mut().set_style(
                         Rect::new(inner.x + offset as u16, inner.y, 1, inner.height),
-                        diff_style(&self.theme, RowRole::Below, *kind),
+                        diff_style(&self.theme, CellRole::Lane, *kind),
                     );
                 }
                 let rows = &disp.rows;
@@ -552,12 +747,7 @@ impl App {
                 // is cast.
                 let top = usize::from(inner.y);
                 let bottom = top + usize::from(inner.height);
-                if let Some(marker) = rows.first() {
-                    // Separators are gaps between the marker tabs.
-                    let tabs = marker.replace('|', " ");
-                    self.draw_cell(frame, inner, inner.y, &tabs, 0);
-                    self.style_row(frame, inner, inner.y, &disp.kinds, RowRole::Marker);
-                }
+                self.draw_tabs(frame, inner, disp);
                 for (i, _) in rows.iter().enumerate().skip(1) {
                     let y = top.saturating_add(i).saturating_sub(self.scroll_y);
                     // Content rows live below the sticky marker row:
@@ -603,7 +793,41 @@ impl App {
             };
             self.draw_cell(frame, inner, y, &text, column.start);
         }
-        self.style_row(frame, inner, y, &display.kinds, RowRole::File);
+        // Lanes first, then the changes that alter this row.
+        self.style_row(frame, inner, y, &display.kinds, CellRole::Lane);
+        let left = self.scroll_x;
+        for change in visible_changes(display, left, right) {
+            if !display.differs(grid, change, row) {
+                continue;
+            }
+            let cells = change.cells();
+            for cell in cells.start.max(left)..cells.end.min(right) {
+                let style = diff_style(&self.theme, CellRole::Strong, display.kinds[cell]);
+                frame.buffer_mut()[(inner.x + (cell - left) as u16, y)].set_style(style);
+            }
+        }
+    }
+
+    /// The marker row: a tab over each changed run, labelled with where
+    /// the run starts in its file and how many columns it spans. A run
+    /// scrolled partly out of view keeps its label at the pane's edge.
+    fn draw_tabs(&self, frame: &mut Frame<'_>, inner: Rect, display: &Display) {
+        self.style_row(frame, inner, inner.y, &display.kinds, CellRole::Tab);
+        let left = self.scroll_x;
+        let right = left + usize::from(inner.width);
+        for change in visible_changes(display, left, right) {
+            for (kind, run) in change.runs() {
+                let start = run.cells.start.max(left);
+                let end = run.cells.end.min(right);
+                if start < end {
+                    let x = inner.x + (start - left) as u16;
+                    let label = tab_label(kind, run, end - start);
+                    frame
+                        .buffer_mut()
+                        .set_string(x, inner.y, label, Style::default());
+                }
+            }
+        }
     }
 
     fn draw_cell(&self, frame: &mut Frame<'_>, inner: Rect, y: u16, text: &str, start: usize) {
@@ -635,7 +859,7 @@ impl App {
         inner: Rect,
         y: u16,
         kinds: &[Option<StepKind>],
-        role: RowRole,
+        role: CellRole,
     ) {
         // Restore styles in wide-glyph continuation and clipped cells.
         for (offset, kind) in kinds
@@ -947,14 +1171,14 @@ mod tests {
         let (mut app, a, b) = files_app("e\u{301}\n", "e\u{308}\n");
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
-        assert_eq!(buf[(1, 1)].symbol(), "-");
-        assert_eq!(buf[(1, 2)].symbol(), "e\u{301}");
-        assert_eq!(buf[(1, 2)].bg, Color::Red);
-        assert_eq!(buf[(3, 1)].symbol(), "+");
-        assert_eq!(buf[(3, 2)].symbol(), "e\u{308}");
-        assert_eq!(buf[(3, 2)].bg, Color::Green);
-        assert_eq!(buf[(2, 2)].symbol(), "│");
-        assert_eq!(buf[(2, 2)].bg, Color::Reset);
+        assert_eq!(buf[(1 + G, 1)].symbol(), "-");
+        assert_eq!(buf[(1 + G, 2)].symbol(), "e\u{301}");
+        assert_eq!(buf[(1 + G, 2)].bg, Color::Red);
+        assert_eq!(buf[(3 + G, 1)].symbol(), "+");
+        assert_eq!(buf[(3 + G, 2)].symbol(), "e\u{308}");
+        assert_eq!(buf[(3 + G, 2)].bg, Color::Green);
+        assert_eq!(buf[(2 + G, 2)].symbol(), "│");
+        assert_eq!(buf[(2 + G, 2)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -978,7 +1202,7 @@ mod tests {
         }
         let (mut app, a, b) = files_app(text, text);
         let buf = draw_buffer(&mut app);
-        assert_eq!(buf[(3, 2)].symbol(), "a\u{301}");
+        assert_eq!(buf[(3 + G, 2)].symbol(), "a\u{301}");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -992,10 +1216,10 @@ mod tests {
             let (mut app, a, b) = files_app(old, new);
             let buf = draw_buffer(&mut app);
             assert_column_backgrounds_align(&buf);
-            assert_eq!(buf[(1, 1)].symbol(), mark);
-            assert_eq!(buf[(1, 2)].symbol(), "◌\u{301}");
-            assert_eq!(buf[(1, 2)].bg, color);
-            assert_eq!(buf[(1, 21)].bg, color);
+            assert_eq!(buf[(1 + G, 1)].symbol(), mark);
+            assert_eq!(buf[(1 + G, 2)].symbol(), "◌\u{301}");
+            assert_eq!(buf[(1 + G, 2)].bg, color);
+            assert_eq!(buf[(1 + G, 21)].bg, color);
             let _ = std::fs::remove_file(&a);
             let _ = std::fs::remove_file(&b);
         }
@@ -1008,12 +1232,12 @@ mod tests {
         assert_eq!(display.rows, ["-|+", "◌\u{301}|◌\u{308}", "x|y"]);
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
-        assert_eq!(buf[(1, 2)].symbol(), "◌\u{301}");
-        assert_eq!(buf[(3, 2)].symbol(), "◌\u{308}");
+        assert_eq!(buf[(1 + G, 2)].symbol(), "◌\u{301}");
+        assert_eq!(buf[(3 + G, 2)].symbol(), "◌\u{308}");
         for y in [2, 3] {
-            assert_eq!(buf[(1, y)].bg, Color::Red);
-            assert_eq!(buf[(3, y)].bg, Color::Green);
-            assert_eq!(buf[(2, y)].symbol(), "│");
+            assert_eq!(buf[(1 + G, y)].bg, Color::Red);
+            assert_eq!(buf[(3 + G, y)].bg, Color::Green);
+            assert_eq!(buf[(2 + G, y)].symbol(), "│");
         }
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -1044,9 +1268,9 @@ mod tests {
         let (mut app, a, b) = files_app(&format!("{prefix}x\n"), &format!("{prefix}y\n"));
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
-        assert_eq!(buf[(1, 2)].symbol(), "👩‍❤️‍👩");
-        assert_eq!(buf[(4, 2)].symbol(), "x");
-        assert_eq!(buf[(6, 2)].symbol(), "y");
+        assert_eq!(buf[(1 + G, 2)].symbol(), "👩‍❤️‍👩");
+        assert_eq!(buf[(4 + G, 2)].symbol(), "x");
+        assert_eq!(buf[(6 + G, 2)].symbol(), "y");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1061,12 +1285,12 @@ mod tests {
         assert!(app.display.as_ref().unwrap().rows[1].contains('\r'));
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
-        assert_eq!(buf[(1, 2)].symbol(), "🇺");
-        assert_eq!(buf[(1 + left_width, 2)].symbol(), "🇸");
-        assert_eq!(buf[(delete_x, 2)].symbol(), "x");
-        assert_eq!(buf[(delete_x, 2)].bg, Color::Red);
-        assert_eq!(buf[(delete_x + 2, 2)].symbol(), "y");
-        assert_eq!(buf[(delete_x + 2, 2)].bg, Color::Green);
+        assert_eq!(buf[(1 + G, 2)].symbol(), "🇺");
+        assert_eq!(buf[(1 + left_width + G, 2)].symbol(), "🇸");
+        assert_eq!(buf[(delete_x + G, 2)].symbol(), "x");
+        assert_eq!(buf[(delete_x + G, 2)].bg, Color::Red);
+        assert_eq!(buf[(delete_x + 2 + G, 2)].symbol(), "y");
+        assert_eq!(buf[(delete_x + 2 + G, 2)].bg, Color::Green);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1082,13 +1306,13 @@ mod tests {
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
         for x in 1..=6 {
-            assert_eq!(buf[(x, 2)].bg, Color::Red);
+            assert_eq!(buf[(x + G, 2)].bg, Color::Red);
         }
         for x in 8..=13 {
-            assert_eq!(buf[(x, 2)].bg, Color::Green);
+            assert_eq!(buf[(x + G, 2)].bg, Color::Green);
         }
-        assert_eq!(buf[(7, 2)].symbol(), "│");
-        assert_eq!(buf[(7, 2)].bg, Color::Reset);
+        assert_eq!(buf[(7 + G, 2)].symbol(), "│");
+        assert_eq!(buf[(7 + G, 2)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1102,16 +1326,16 @@ mod tests {
             let separator_x = 7 + rendered_width(&marked) as u16;
             let buf = draw_buffer(&mut app);
             assert_column_backgrounds_align(&buf);
-            assert_eq!(buf[(6, 2)].symbol(), "7");
-            assert_eq!(buf[(7, 2)].symbol(), marked.as_ref());
-            assert_eq!(buf[(7, 2)].bg, Color::Red);
-            assert_eq!(buf[(separator_x, 1)].symbol(), " ");
-            assert_eq!(buf[(separator_x, 2)].symbol(), "│");
-            assert_eq!(buf[(separator_x, 2)].bg, Color::Reset);
-            assert_eq!(buf[(separator_x + 1, 1)].symbol(), "+");
-            assert_eq!(buf[(separator_x + 1, 2)].symbol(), "Y");
-            assert_eq!(buf[(separator_x + 1, 2)].bg, Color::Green);
-            assert_eq!(buf[(separator_x + 3, 2)].symbol(), "x");
+            assert_eq!(buf[(6 + G, 2)].symbol(), "7");
+            assert_eq!(buf[(7 + G, 2)].symbol(), marked.as_ref());
+            assert_eq!(buf[(7 + G, 2)].bg, Color::Red);
+            assert_eq!(buf[(separator_x + G, 1)].symbol(), " ");
+            assert_eq!(buf[(separator_x + G, 2)].symbol(), "│");
+            assert_eq!(buf[(separator_x + G, 2)].bg, Color::Reset);
+            assert_eq!(buf[(separator_x + 1 + G, 1)].symbol(), "+");
+            assert_eq!(buf[(separator_x + 1 + G, 2)].symbol(), "Y");
+            assert_eq!(buf[(separator_x + 1 + G, 2)].bg, Color::Green);
+            assert_eq!(buf[(separator_x + 3 + G, 2)].symbol(), "x");
             let _ = std::fs::remove_file(&a);
             let _ = std::fs::remove_file(&b);
         }
@@ -1138,10 +1362,10 @@ mod tests {
         let buf = draw_buffer(&mut app);
         assert_eq!(app.scroll_x, 0);
         assert_column_backgrounds_align(&buf);
-        assert_eq!(buf[(6, 2)].symbol(), "7");
-        assert_eq!(buf[(7, 2)].symbol(), marked.as_ref());
-        assert_eq!(buf[(8 + width, 1)].symbol(), "+");
-        assert_eq!(buf[(8 + width, 2)].symbol(), "Y");
+        assert_eq!(buf[(6 + G, 2)].symbol(), "7");
+        assert_eq!(buf[(7 + G, 2)].symbol(), marked.as_ref());
+        assert_eq!(buf[(8 + width + G, 1)].symbol(), "+");
+        assert_eq!(buf[(8 + width + G, 2)].symbol(), "Y");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1165,8 +1389,8 @@ mod tests {
         assert_eq!(app.scroll_x, 0);
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
-        assert_eq!(buf[(3, 2)].symbol(), "◌\u{301}");
-        assert_eq!(buf[(5, 2)].symbol(), "◌\u{308}");
+        assert_eq!(buf[(3 + G, 2)].symbol(), "◌\u{301}");
+        assert_eq!(buf[(5 + G, 2)].symbol(), "◌\u{308}");
         app.scroll_x = 2;
         let buf = terminal.draw(|frame| app.render(frame)).unwrap().buffer;
         assert_column_backgrounds_align(buf);
@@ -1245,6 +1469,11 @@ mod tests {
 
     /// The 16-color theme: black text on red and green for every row
     /// of a changed column, so whole columns share one background.
+    /// Columns before the first diff cell at 80x24, past the pane's
+    /// old blank first cell: the line-number gutter is four cells (a
+    /// blank, two digits, a blank).
+    const G: u16 = 3;
+
     fn ansi16() -> Theme {
         Theme::new(ColorDepth::Ansi16)
     }
@@ -1351,34 +1580,34 @@ mod tests {
         // The top bar is y=0; the diff pane keeps one blank cell on
         // each side, so the marker row is y=1 from x=1.
         // Marker: "    |-|+...": gap at col 5, '-' at col 6, '+' at col 8.
-        assert_eq!(buf[(6, 1)].symbol(), "-");
-        assert_eq!(buf[(6, 1)].fg, Color::Black);
-        assert_eq!(buf[(6, 1)].bg, Color::Red);
-        assert_eq!(buf[(8, 1)].symbol(), "+");
-        assert_eq!(buf[(8, 1)].fg, Color::Black);
-        assert_eq!(buf[(8, 1)].bg, Color::Green);
-        assert_eq!(buf[(5, 1)].symbol(), " ");
-        assert_eq!(buf[(5, 1)].bg, Color::Reset);
+        assert_eq!(buf[(6 + G, 1)].symbol(), "-");
+        assert_eq!(buf[(6 + G, 1)].fg, Color::Black);
+        assert_eq!(buf[(6 + G, 1)].bg, Color::Red);
+        assert_eq!(buf[(8 + G, 1)].symbol(), "+");
+        assert_eq!(buf[(8 + G, 1)].fg, Color::Black);
+        assert_eq!(buf[(8 + G, 1)].bg, Color::Green);
+        assert_eq!(buf[(5 + G, 1)].symbol(), " ");
+        assert_eq!(buf[(5 + G, 1)].bg, Color::Reset);
         for y in 2..=4 {
-            assert_eq!(buf[(6, y)].bg, Color::Red);
-            assert_eq!(buf[(8, y)].bg, Color::Green);
-            assert_eq!(buf[(6, y)].fg, Color::Black);
-            assert_eq!(buf[(8, y)].fg, Color::Black);
-            assert_eq!(buf[(1, y)].bg, Color::Reset);
-            assert_eq!(buf[(5, y)].symbol(), "│");
-            assert_eq!(buf[(5, y)].bg, Color::Reset);
-            assert_eq!(buf[(5, y)].fg, Color::DarkGray);
+            assert_eq!(buf[(6 + G, y)].bg, Color::Red);
+            assert_eq!(buf[(8 + G, y)].bg, Color::Green);
+            assert_eq!(buf[(6 + G, y)].fg, Color::Black);
+            assert_eq!(buf[(8 + G, y)].fg, Color::Black);
+            assert_eq!(buf[(1 + G, y)].bg, Color::Reset);
+            assert_eq!(buf[(5 + G, y)].symbol(), "│");
+            assert_eq!(buf[(5 + G, y)].bg, Color::Reset);
+            assert_eq!(buf[(5 + G, y)].fg, Color::DarkGray);
         }
         // The colors run to the pane's last row, just above the status
         // bar.
         for y in 5..=22 {
-            assert_eq!(buf[(6, y)].bg, Color::Red);
-            assert_eq!(buf[(8, y)].bg, Color::Green);
-            assert_eq!(buf[(5, y)].bg, Color::Reset);
-            assert_eq!(buf[(12, y)].bg, Color::Reset);
+            assert_eq!(buf[(6 + G, y)].bg, Color::Red);
+            assert_eq!(buf[(8 + G, y)].bg, Color::Green);
+            assert_eq!(buf[(5 + G, y)].bg, Color::Reset);
+            assert_eq!(buf[(12 + G, y)].bg, Color::Reset);
         }
-        assert_ne!(buf[(6, 23)].bg, Color::Red); // status bar
-        assert_eq!(buf[(12, 2)].bg, Color::Reset);
+        assert_ne!(buf[(6 + G, 23)].bg, Color::Red); // status bar
+        assert_eq!(buf[(12 + G, 2)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1392,23 +1621,23 @@ mod tests {
         // (inner starts at (1,1)) those are x = 3, 6, 9: gaps on the
         // marker row (y=1) and rules on the content row (y=2).
         for x in [3, 6, 9] {
-            assert_eq!(buf[(x, 1)].symbol(), " ", "marker gap at x={x}");
-            assert_eq!(buf[(x, 2)].symbol(), "│", "content rule at x={x}");
+            assert_eq!(buf[(x + G, 1)].symbol(), " ", "marker gap at x={x}");
+            assert_eq!(buf[(x + G, 2)].symbol(), "│", "content rule at x={x}");
         }
         // The `-`/`+` markers sit over their column's first display
         // cell: '-' at buffer (4,1) over 文 at (4,2), '+' at (7,1) over
         // 日 at (7,2). Continuation cells (x=5, x=8) are skipped;
         // TestBackend leaves them empty.
-        assert_eq!(buf[(4, 1)].symbol(), "-");
-        assert_eq!(buf[(7, 1)].symbol(), "+");
-        assert_eq!(buf[(4, 2)].symbol(), "文");
-        assert_eq!(buf[(7, 2)].symbol(), "日");
+        assert_eq!(buf[(4 + G, 1)].symbol(), "-");
+        assert_eq!(buf[(7 + G, 1)].symbol(), "+");
+        assert_eq!(buf[(4 + G, 2)].symbol(), "文");
+        assert_eq!(buf[(7 + G, 2)].symbol(), "日");
         for y in 1..=2 {
             for x in [4, 5] {
-                assert_eq!(buf[(x, y)].bg, Color::Red);
+                assert_eq!(buf[(x + G, y)].bg, Color::Red);
             }
             for x in [7, 8] {
-                assert_eq!(buf[(x, y)].bg, Color::Green);
+                assert_eq!(buf[(x + G, y)].bg, Color::Green);
             }
         }
         let _ = std::fs::remove_file(&a);
@@ -1425,7 +1654,7 @@ mod tests {
         // ratatui stores the whole grapheme cluster in one cell; a pad
         // space between the ZWJ and the following emoji would split it
         // into separate symbols.
-        assert_eq!(buf[(1, 2)].symbol(), "👩‍❤️‍👩");
+        assert_eq!(buf[(1 + G, 2)].symbol(), "👩‍❤️‍👩");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1436,17 +1665,17 @@ mod tests {
         let buf = draw_buffer(&mut app);
         for y in 1..=3 {
             for x in [1, 2] {
-                assert_eq!(buf[(x, y)].bg, Color::Red);
+                assert_eq!(buf[(x + G, y)].bg, Color::Red);
             }
             for x in [4, 5] {
-                assert_eq!(buf[(x, y)].bg, Color::Green);
+                assert_eq!(buf[(x + G, y)].bg, Color::Green);
             }
             for x in [3, 6, 7, 8] {
-                assert_eq!(buf[(x, y)].bg, Color::Reset);
+                assert_eq!(buf[(x + G, y)].bg, Color::Reset);
             }
         }
-        assert_eq!(buf[(2, 3)].symbol(), " ");
-        assert_eq!(buf[(5, 3)].symbol(), " ");
+        assert_eq!(buf[(2 + G, 3)].symbol(), " ");
+        assert_eq!(buf[(5 + G, 3)].symbol(), " ");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1462,24 +1691,24 @@ mod tests {
             let (mut app, a, b) = files_app(&format!("{prefix}x\n"), &format!("{prefix}y\n"));
             let buf = draw_buffer(&mut app);
             assert_column_backgrounds_align(&buf);
-            assert_eq!(buf[(1, 2)].symbol(), prefix);
+            assert_eq!(buf[(1 + G, 2)].symbol(), prefix);
             for x in 1..=prefix_width {
-                assert_eq!(buf[(x, 2)].bg, Color::Reset);
+                assert_eq!(buf[(x + G, 2)].bg, Color::Reset);
             }
             let delete_x = prefix_width + 2;
             let insert_x = prefix_width + 4;
-            assert_eq!(buf[(delete_x, 2)].symbol(), "x");
-            assert_eq!(buf[(delete_x, 1)].symbol(), "-");
-            assert_eq!(buf[(delete_x, 2)].bg, Color::Red);
-            assert_eq!(buf[(insert_x, 2)].symbol(), "y");
-            assert_eq!(buf[(insert_x, 1)].symbol(), "+");
-            assert_eq!(buf[(insert_x, 2)].bg, Color::Green);
+            assert_eq!(buf[(delete_x + G, 2)].symbol(), "x");
+            assert_eq!(buf[(delete_x + G, 1)].symbol(), "-");
+            assert_eq!(buf[(delete_x + G, 2)].bg, Color::Red);
+            assert_eq!(buf[(insert_x + G, 2)].symbol(), "y");
+            assert_eq!(buf[(insert_x + G, 1)].symbol(), "+");
+            assert_eq!(buf[(insert_x + G, 2)].bg, Color::Green);
             for x in [prefix_width + 1, prefix_width + 3] {
-                assert_eq!(buf[(x, 2)].symbol(), "│");
-                assert_eq!(buf[(x, 2)].fg, Color::DarkGray);
-                assert_eq!(buf[(x, 2)].bg, Color::Reset);
+                assert_eq!(buf[(x + G, 2)].symbol(), "│");
+                assert_eq!(buf[(x + G, 2)].fg, Color::DarkGray);
+                assert_eq!(buf[(x + G, 2)].bg, Color::Reset);
             }
-            assert_eq!(buf[(insert_x + 1, 2)].bg, Color::Reset);
+            assert_eq!(buf[(insert_x + 1 + G, 2)].bg, Color::Reset);
             let _ = std::fs::remove_file(&a);
             let _ = std::fs::remove_file(&b);
         }
@@ -1492,19 +1721,19 @@ mod tests {
         assert_column_backgrounds_align(&buf);
         for (y, delete_x, insert_x, deleted, inserted) in [(2, 3, 5, "x", "y"), (3, 3, 5, "b", "b")]
         {
-            assert_eq!(buf[(delete_x, y)].symbol(), deleted);
-            assert_eq!(buf[(delete_x, y)].bg, Color::Red);
-            assert_eq!(buf[(insert_x, y)].symbol(), inserted);
-            assert_eq!(buf[(insert_x, y)].bg, Color::Green);
-            assert_eq!(buf[(delete_x - 1, y)].bg, Color::Reset);
-            assert_eq!(buf[(delete_x + 1, y)].bg, Color::Reset);
-            assert_eq!(buf[(insert_x + 1, y)].bg, Color::Reset);
+            assert_eq!(buf[(delete_x + G, y)].symbol(), deleted);
+            assert_eq!(buf[(delete_x + G, y)].bg, Color::Red);
+            assert_eq!(buf[(insert_x + G, y)].symbol(), inserted);
+            assert_eq!(buf[(insert_x + G, y)].bg, Color::Green);
+            assert_eq!(buf[(delete_x - 1 + G, y)].bg, Color::Reset);
+            assert_eq!(buf[(delete_x + 1 + G, y)].bg, Color::Reset);
+            assert_eq!(buf[(insert_x + 1 + G, y)].bg, Color::Reset);
         }
         // Blank rows retain the marker's full-height column bands.
-        assert_eq!(buf[(3, 21)].bg, Color::Red);
-        assert_eq!(buf[(5, 21)].bg, Color::Green);
-        assert_eq!(buf[(7, 3)].symbol(), "z");
-        assert_eq!(buf[(7, 3)].bg, Color::Reset);
+        assert_eq!(buf[(3 + G, 21)].bg, Color::Red);
+        assert_eq!(buf[(5 + G, 21)].bg, Color::Green);
+        assert_eq!(buf[(7 + G, 3)].symbol(), "z");
+        assert_eq!(buf[(7 + G, 3)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1534,24 +1763,26 @@ mod tests {
         assert_eq!(display.width, 8);
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
-        assert_eq!(buf[(1, 2)].symbol(), "a\u{301}");
-        assert_eq!(buf[(1, 3)].symbol(), "中");
-        assert_eq!(buf[(3, 2)].symbol(), "x");
-        assert_eq!(buf[(3, 3)].symbol(), "b");
-        assert_eq!(buf[(3, 1)].symbol(), "-");
-        assert_eq!(buf[(4, 3)].symbol(), "c");
-        assert_eq!(buf[(5, 3)].symbol(), "x");
-        assert_eq!(buf[(6, 1)].symbol(), " ");
+        assert_eq!(buf[(1 + G, 2)].symbol(), "a\u{301}");
+        assert_eq!(buf[(1 + G, 3)].symbol(), "中");
+        assert_eq!(buf[(3 + G, 2)].symbol(), "x");
+        assert_eq!(buf[(3 + G, 3)].symbol(), "b");
+        // Tabs: "-1,4" over the five-cell delete run, "+1" over the
+        // two-cell insert run, a gap between them.
+        assert_eq!(row_text(&buf, 1, 1 + G..9 + G), "-1,4  +1");
+        assert_eq!(buf[(4 + G, 3)].symbol(), "c");
+        assert_eq!(buf[(5 + G, 3)].symbol(), "x");
+        assert_eq!(buf[(6 + G, 1)].symbol(), " ");
         for y in [2, 3] {
-            assert_eq!(buf[(6, y)].symbol(), "│");
+            assert_eq!(buf[(6 + G, y)].symbol(), "│");
         }
         for y in [1, 2, 3] {
-            assert_eq!(buf[(6, y)].bg, Color::Reset);
+            assert_eq!(buf[(6 + G, y)].bg, Color::Reset);
         }
-        assert_eq!(buf[(7, 2)].symbol(), "a\u{301}");
-        assert_eq!(buf[(8, 2)].symbol(), "y");
-        assert_eq!(buf[(7, 2)].bg, Color::Green);
-        assert_eq!(buf[(8, 2)].bg, Color::Green);
+        assert_eq!(buf[(7 + G, 2)].symbol(), "a\u{301}");
+        assert_eq!(buf[(8 + G, 2)].symbol(), "y");
+        assert_eq!(buf[(7 + G, 2)].bg, Color::Green);
+        assert_eq!(buf[(8 + G, 2)].bg, Color::Green);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1572,13 +1803,13 @@ mod tests {
             let (mut app, a, b) = files_app(old, new);
             let buf = draw_buffer(&mut app);
             assert_column_backgrounds_align(&buf);
-            assert_eq!(buf[(1, 2)].symbol(), prefix);
-            assert_eq!(buf[(delete_x, 2)].symbol(), "x");
-            assert_eq!(buf[(insert_x, 2)].symbol(), "y");
-            assert_eq!(buf[(delete_x, 3)].symbol(), second_cell);
-            assert_eq!(buf[(insert_x, 3)].symbol(), second_cell);
-            assert_eq!(buf[(delete_x, 1)].symbol(), "-");
-            assert_eq!(buf[(insert_x, 1)].symbol(), "+");
+            assert_eq!(buf[(1 + G, 2)].symbol(), prefix);
+            assert_eq!(buf[(delete_x + G, 2)].symbol(), "x");
+            assert_eq!(buf[(insert_x + G, 2)].symbol(), "y");
+            assert_eq!(buf[(delete_x + G, 3)].symbol(), second_cell);
+            assert_eq!(buf[(insert_x + G, 3)].symbol(), second_cell);
+            assert_eq!(buf[(delete_x + G, 1)].symbol(), "-");
+            assert_eq!(buf[(insert_x + G, 1)].symbol(), "+");
             let _ = std::fs::remove_file(&a);
             let _ = std::fs::remove_file(&b);
         }
@@ -1592,12 +1823,12 @@ mod tests {
         let buf = draw_buffer(&mut app);
         assert_eq!(app.scroll_y, 17);
         assert_column_backgrounds_align(&buf);
-        assert_eq!(buf[(3, 1)].symbol(), "-");
-        assert_eq!(buf[(5, 1)].symbol(), "+");
+        assert_eq!(buf[(3 + G, 1)].symbol(), "-");
+        assert_eq!(buf[(5 + G, 1)].symbol(), "+");
         for y in [2, 21] {
-            assert_eq!(buf[(1, y)].symbol(), "a\u{301}");
-            assert_eq!(buf[(3, y)].symbol(), "x");
-            assert_eq!(buf[(5, y)].symbol(), "y");
+            assert_eq!(buf[(1 + G, y)].symbol(), "a\u{301}");
+            assert_eq!(buf[(3 + G, y)].symbol(), "x");
+            assert_eq!(buf[(5 + G, y)].symbol(), "y");
         }
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -1630,10 +1861,10 @@ mod tests {
         let buf = draw_buffer(&mut app); // larger viewport reclamps scroll
         assert_eq!(app.scroll_x, 0);
         assert_column_backgrounds_align(&buf);
-        assert_eq!(buf[(18, 1)].symbol(), "-");
-        assert_eq!(buf[(18, 2)].symbol(), "x");
-        assert_eq!(buf[(20, 1)].symbol(), "+");
-        assert_eq!(buf[(20, 2)].symbol(), "y");
+        assert_eq!(buf[(18 + G, 1)].symbol(), "-");
+        assert_eq!(buf[(18 + G, 2)].symbol(), "x");
+        assert_eq!(buf[(20 + G, 1)].symbol(), "+");
+        assert_eq!(buf[(20 + G, 2)].symbol(), "y");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1699,18 +1930,18 @@ mod tests {
             let backend = draw(&mut app);
             let buf = backend.buffer();
             let x = if color == Color::Red { 1 } else { 3 };
-            assert_eq!(buf[(x, 2)].symbol(), "|");
-            assert_eq!(buf[(x, 2)].bg, color);
-            assert_eq!(buf[(x, 2)].fg, Color::Black);
-            assert_eq!(buf[(2, 2)].bg, Color::Reset);
-            assert_eq!(buf[(2, 2)].fg, Color::DarkGray);
+            assert_eq!(buf[(x + G, 2)].symbol(), "|");
+            assert_eq!(buf[(x + G, 2)].bg, color);
+            assert_eq!(buf[(x + G, 2)].fg, Color::Black);
+            assert_eq!(buf[(2 + G, 2)].bg, Color::Reset);
+            assert_eq!(buf[(2 + G, 2)].fg, Color::DarkGray);
             let _ = std::fs::remove_file(&a);
             let _ = std::fs::remove_file(&b);
         }
         let (mut app, a, b) = files_app("|\n", "|\n");
         let backend = draw(&mut app);
-        assert_eq!(backend.buffer()[(1, 2)].fg, Color::Reset);
-        assert_eq!(backend.buffer()[(1, 2)].bg, Color::Reset);
+        assert_eq!(backend.buffer()[(1 + G, 2)].fg, Color::Reset);
+        assert_eq!(backend.buffer()[(1 + G, 2)].bg, Color::Reset);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1725,13 +1956,13 @@ mod tests {
             // (y=22), carries the color.
             for y in 1..=22 {
                 for x in 1..=width {
-                    assert_eq!(buf[(x, y)].bg, color);
-                    assert_eq!(buf[(x, y)].fg, Color::Black);
+                    assert_eq!(buf[(x + G, y)].bg, color);
+                    assert_eq!(buf[(x + G, y)].fg, Color::Black);
                 }
-                assert_eq!(buf[(width + 1, y)].bg, Color::Reset);
+                assert_eq!(buf[(width + 1 + G, y)].bg, Color::Reset);
             }
-            assert_ne!(buf[(1, 23)].bg, color); // status bar
-            assert_ne!(buf[(1, 0)].bg, color); // top bar
+            assert_ne!(buf[(1 + G, 23)].bg, color); // status bar
+            assert_ne!(buf[(1 + G, 0)].bg, color); // top bar
             let _ = std::fs::remove_file(&a);
             let _ = std::fs::remove_file(&b);
         }
@@ -1773,14 +2004,14 @@ mod tests {
         app.sidebar = Some(false);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
-        assert_eq!(terminal.backend().buffer()[(3, 2)].bg, Color::Red);
-        assert_eq!(terminal.backend().buffer()[(5, 2)].bg, Color::Green);
+        assert_eq!(terminal.backend().buffer()[(3 + G, 2)].bg, Color::Red);
+        assert_eq!(terminal.backend().buffer()[(5 + G, 2)].bg, Color::Green);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         terminal.draw(|frame| app.render(frame)).unwrap();
         assert_eq!(app.selection, 1);
         for y in 1..=21 {
             for x in 1..=6 {
-                assert_eq!(terminal.backend().buffer()[(x, y)].bg, Color::Reset);
+                assert_eq!(terminal.backend().buffer()[(x + G, y)].bg, Color::Reset);
             }
         }
     }
@@ -1804,16 +2035,16 @@ mod tests {
             let backend = draw(&mut app);
             let buf = backend.buffer();
             assert_eq!(
-                buf[(2, 1)].symbol(),
+                buf[(2 + G, 1)].symbol(),
                 " ",
                 "marker gap at viewport 1 (scroll_x={scroll_x})"
             );
             assert_eq!(
-                buf[(2, 2)].symbol(),
+                buf[(2 + G, 2)].symbol(),
                 "│",
                 "content rule at viewport 1 (scroll_x={scroll_x})"
             );
-            assert_eq!(buf[(3, 1)].symbol(), next_tab, "scroll_x={scroll_x}");
+            assert_eq!(buf[(3 + G, 1)].symbol(), next_tab, "scroll_x={scroll_x}");
         }
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -1842,17 +2073,17 @@ mod tests {
         // Marker "-|+|" starts at x=1 (pane padding): '-' over the
         // delete column, '+' over the insert — still at the top row
         // after vertical scroll.
-        assert_eq!(buf[(1, 1)].symbol(), "-");
-        assert_eq!(buf[(3, 1)].symbol(), "+");
+        assert_eq!(buf[(1 + G, 1)].symbol(), "-");
+        assert_eq!(buf[(3 + G, 1)].symbol(), "+");
         for y in [1, 2, 21] {
-            assert_eq!(buf[(1, y)].bg, Color::Red);
-            assert_eq!(buf[(3, y)].bg, Color::Green);
+            assert_eq!(buf[(1 + G, y)].bg, Color::Red);
+            assert_eq!(buf[(3 + G, y)].bg, Color::Green);
         }
         assert_eq!(app.scroll_y, 10, "clamp must keep a valid scroll");
         // Line 30 sits on the pane's second-to-last row: '3' at col 0,
         // '0' at col 5 (delete|insert cells, then the '0' of "30").
-        assert_eq!(buf[(1, 21)].symbol(), "3");
-        assert_eq!(buf[(5, 21)].symbol(), "0");
+        assert_eq!(buf[(1 + G, 21)].symbol(), "3");
+        assert_eq!(buf[(5 + G, 21)].symbol(), "0");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -1908,13 +2139,13 @@ mod tests {
     fn sidebar_hidden_diff_takes_full_width() {
         let mut app = git_app(vec![("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n")]);
         let buf_before = draw(&mut app);
-        assert_ne!(buf_before.buffer()[(6, 1)].symbol(), "-"); // (6,1) is inside the sidebar
+        assert_ne!(buf_before.buffer()[(6 + G, 1)].symbol(), "-"); // (6,1) is inside the sidebar
         app.sidebar = Some(false);
         let buf_after = draw(&mut app);
         // The full-width pane keeps its blank first cell: inner starts
         // at x=1, marker "    |-|+|  " → gap at (5,1), '-' at (6,1).
-        assert_eq!(buf_after.buffer()[(5, 1)].symbol(), " "); // marker gap at (5,1)
-        assert_eq!(buf_after.buffer()[(6, 1)].symbol(), "-");
+        assert_eq!(buf_after.buffer()[(5 + G, 1)].symbol(), " "); // marker gap at (5,1)
+        assert_eq!(buf_after.buffer()[(6 + G, 1)].symbol(), "-");
     }
 
     #[test]
@@ -1927,7 +2158,11 @@ mod tests {
             .buffer
             .clone();
         assert!(!app.sidebar_visible());
-        assert_eq!(buf[(6, 1)].symbol(), "-", "the diff takes the full width");
+        assert_eq!(
+            buf[(6 + G, 1)].symbol(),
+            "-",
+            "the diff takes the full width"
+        );
         // `e` still shows it, and the choice outlives a resize.
         let r = app.handle_key(key(KeyCode::Char('e')));
         assert!(r.changed);
@@ -1985,22 +2220,23 @@ mod tests {
         let buf = backend.buffer();
         // Last content row "L|X|3|0" (line 30, old side 'L' / new side 'X')
         // sits at the bottom row of the pane: y = 22.
-        assert_eq!(buf[(1, 22)].symbol(), "L");
-        assert_eq!(buf[(3, 22)].symbol(), "X");
+        assert_eq!(buf[(1 + G, 22)].symbol(), "L");
+        assert_eq!(buf[(3 + G, 22)].symbol(), "X");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
 
     #[test]
     fn max_scroll_x_reaches_last_columns() {
-        // One 100-char row: the pane keeps a blank cell on each side,
-        // so its inner width is 78 and the row scrolls to 22. Scrolling
-        // only to 20 would leave the last 2 columns unviewable.
+        // One 100-char row: the four-cell line-number gutter and the
+        // blank cell at the right edge leave a 75-cell pane, so the row
+        // scrolls to 25. Scrolling any less would leave its last
+        // columns unviewable.
         let old = "a".repeat(100);
         let new = "a".repeat(100); // identical single-line files: width 100
         let (mut app, a, b) = files_app(&old, &new);
         let _ = draw(&mut app); // sets pane_width from the real rect (80)
-        assert_eq!(app.max_scroll_x(), 22);
+        assert_eq!(app.max_scroll_x(), 25);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -2026,7 +2262,7 @@ mod tests {
         let backend = draw(&mut app);
         assert_eq!(app.scroll_y, app.max_scroll_y(), "scroll must re-clamp");
         let buf = backend.buffer();
-        assert_eq!(buf[(3, 22)].symbol(), "X", "bottom row visible");
+        assert_eq!(buf[(3 + G, 22)].symbol(), "X", "bottom row visible");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -2206,7 +2442,7 @@ mod tests {
     fn diff_stats_count_a_delete_run_and_its_insert_run_once() {
         // The README example: -1/+1, -4/+4, a lone insert, a lone delete.
         assert_eq!(
-            DiffStats::of(&compute(OLD_CPP, NEW_CPP)),
+            build_display(&compute(OLD_CPP, NEW_CPP)).stats,
             DiffStats {
                 changes: 4,
                 deleted: 19,
@@ -2214,44 +2450,215 @@ mod tests {
             }
         );
         assert_eq!(
-            DiffStats::of(&compute("x\n", "xab\n")),
+            build_display(&compute("x\n", "xab\n")).stats,
             DiffStats {
                 changes: 1,
                 deleted: 0,
                 inserted: 2,
             }
         );
-        assert_eq!(DiffStats::of(&compute("a\n", "a\n")), DiffStats::default());
+        assert_eq!(
+            build_display(&compute("a\n", "a\n")).stats,
+            DiffStats::default()
+        );
     }
 
     #[test]
-    fn true_color_separates_tabs_cells_and_fill() {
+    fn changes_pair_runs_and_record_their_columns_and_cells() {
+        // Display: "--|++| |---------------|+++++++++++++++| |+|...|--|"
+        let display = build_display(&compute(OLD_CPP, NEW_CPP));
+        let run = |steps: Range<usize>, column, cells: Range<usize>| Run {
+            steps,
+            column,
+            cells,
+        };
+        assert_eq!(
+            display.changes,
+            [
+                Change {
+                    delete: Some(run(0..2, 0, 0..2)),
+                    insert: Some(run(2..4, 0, 3..5)),
+                },
+                Change {
+                    delete: Some(run(5..20, 3, 8..23)),
+                    insert: Some(run(20..35, 3, 24..39)),
+                },
+                Change {
+                    delete: None,
+                    insert: Some(run(36..37, 19, 42..43)),
+                },
+                Change {
+                    delete: Some(run(45..47, 27, 53..55)),
+                    insert: None,
+                },
+            ]
+        );
+        assert_eq!(display.changes[1].cells(), 8..39);
+        assert_eq!(display.changes[2].cells(), 42..43);
+        // Line ends, in columns: "#include <cstdio>" has 17.
+        assert_eq!(display.old_ends, [17, 0, 12, 32, 11, 1]);
+        assert_eq!(display.new_ends, [16, 0, 20, 31, 11, 1]);
+    }
+
+    #[test]
+    fn differs_compares_the_text_a_change_leaves_on_a_row() {
+        let grid = compute(OLD_CPP, NEW_CPP);
+        let display = build_display(&grid);
+        let rows = |change: usize| -> Vec<usize> {
+            (0..grid.height)
+                .filter(|&row| display.differs(&grid, &display.changes[change], row))
+                .collect()
+        };
+        assert_eq!(rows(0), [2]); // "in" → "au"
+        assert_eq!(rows(1), [0, 2, 3]);
+        assert_eq!(rows(2), [2, 3]); // "{" and "l"
+        assert_eq!(rows(3), [3]); // "\n"
+        let changed: Vec<_> = (0..grid.height)
+            .map(|row| display.line_changed(&grid, row))
+            .collect();
+        assert_eq!(changed, [true, false, true, true, false, false]);
+    }
+
+    #[test]
+    fn differs_ignores_padding_but_not_inner_spaces() {
+        // Dropping a trailing space is invisible; dropping an inner one
+        // is not.
+        for (old, new, changed) in [("x \n", "x\n", false), ("x b\n", "xb\n", true)] {
+            let grid = compute(old, new);
+            let display = build_display(&grid);
+            assert_eq!(display.changes.len(), 1, "{old:?}");
+            assert_eq!(display.differs(&grid, &display.changes[0], 0), changed);
+            assert_eq!(display.line_changed(&grid, 0), changed);
+        }
+        // A wider run on one side differs only where the text does.
+        let grid = compute("ab\nxy\n", "c\nxy\n");
+        let display = build_display(&grid);
+        let change = &display.changes[0];
+        assert!(display.differs(&grid, change, 0));
+        assert!(!display.line_changed(&grid, 1));
+    }
+
+    #[test]
+    fn tab_labels_shorten_to_fit() {
+        let run = |column, count: usize| Run {
+            steps: 0..count,
+            column,
+            cells: 0..0,
+        };
+        assert_eq!(tab_label(StepKind::Delete, &run(3, 15), 15), "-4,15");
+        assert_eq!(tab_label(StepKind::Delete, &run(3, 15), 4), "-4");
+        assert_eq!(tab_label(StepKind::Insert, &run(3, 15), 1), "+");
+        assert_eq!(tab_label(StepKind::Insert, &run(19, 1), 5), "+20");
+        assert_eq!(tab_label(StepKind::Delete, &run(27, 2), 2), "-");
+        assert_eq!(tab_label(StepKind::Delete, &run(0, 2), 0), "");
+    }
+
+    #[test]
+    fn true_color_separates_tabs_lanes_and_strong_cells() {
         let theme = Theme::new(ColorDepth::TrueColor);
         let (mut app, a, b) = files_app_with("foo\nbar baz\n", "foo\nbar qaz\n", theme.clone());
         let buf = draw_buffer(&mut app);
-        // Marker row y=1, file rows y=2..=3, fill below down to y=22.
-        for (x, tab, cell, fill) in [
-            (6, theme.delete_tab, theme.delete, theme.delete_fill),
-            (8, theme.insert_tab, theme.insert, theme.insert_fill),
+        // The gutter takes x=0..=3. Marker row y=1, file rows y=2..=3,
+        // lanes below down to y=22. Only row 2 of the file ("bar") differs.
+        for (x, tab, strong, lane) in [
+            (9, theme.delete_tab, theme.delete_strong, theme.delete_lane),
+            (11, theme.insert_tab, theme.insert_strong, theme.insert_lane),
         ] {
             assert_eq!(buf[(x, 1)].bg, tab.bg.unwrap());
             assert_eq!(buf[(x, 1)].fg, tab.fg.unwrap());
-            for y in [2, 3] {
-                assert_eq!(buf[(x, y)].bg, cell.bg.unwrap());
-                assert_eq!(buf[(x, y)].fg, cell.fg.unwrap());
-            }
-            for y in 4..=22 {
-                assert_eq!(buf[(x, y)].bg, fill.bg.unwrap());
+            assert_eq!(buf[(x, 3)].bg, strong.bg.unwrap());
+            assert_eq!(buf[(x, 3)].fg, strong.fg.unwrap());
+            for y in [2].into_iter().chain(4..=22) {
+                assert_eq!(buf[(x, y)].bg, lane.bg.unwrap(), "y={y}");
             }
         }
-        assert_eq!(buf[(6, 3)].symbol(), "b");
-        assert_eq!(buf[(8, 3)].symbol(), "q");
+        assert_eq!(buf[(9, 3)].symbol(), "b");
+        assert_eq!(buf[(11, 3)].symbol(), "q");
+        assert_eq!(row_text(&buf, 1, 9..12), "- +");
         // Separators: a gap between tabs, a rule between file cells.
-        assert_eq!(buf[(5, 1)].bg, Color::Reset);
-        assert_eq!(buf[(5, 3)].symbol(), "│");
-        assert_eq!(buf[(5, 3)].fg, theme.separator.fg.unwrap());
-        assert_eq!(buf[(5, 3)].bg, Color::Reset);
-        assert_eq!(buf[(1, 3)].bg, Color::Reset);
+        assert_eq!(buf[(8, 1)].bg, Color::Reset);
+        assert_eq!(buf[(10, 3)].symbol(), "│");
+        assert_eq!(buf[(10, 3)].fg, theme.separator.fg.unwrap());
+        assert_eq!(buf[(10, 3)].bg, Color::Reset);
+        assert_eq!(buf[(4, 3)].bg, Color::Reset);
+        // Line numbers: the changed line is brighter.
+        assert_eq!(row_text(&buf, 2, 0..4), "  1 ");
+        assert_eq!(buf[(2, 2)].fg, theme.muted.fg.unwrap());
+        assert_eq!(row_text(&buf, 3, 0..4), "  2 ");
+        assert_eq!(buf[(2, 3)].fg, Color::Reset);
+        assert_eq!(row_text(&buf, 4, 0..4), "  ~ ");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn line_numbers_stay_put_and_give_way_on_narrow_panes() {
+        let line = "a".repeat(200);
+        let (mut app, a, b) = files_app(&format!("{line}\nx\n"), &format!("{line}\ny\n"));
+        app.scroll_x = 50;
+        let buf = draw_buffer(&mut app);
+        assert_eq!(row_text(&buf, 1, 0..4), "    ");
+        assert_eq!(row_text(&buf, 2, 0..5), "  1 a");
+        assert_eq!(row_text(&buf, 3, 0..4), "  2 ");
+        assert_eq!(buf[(2, 2)].fg, Color::DarkGray, "line 1 reads the same");
+        assert_eq!(buf[(2, 3)].fg, Color::Reset, "line 2 differs");
+        assert_eq!(row_text(&buf, 4, 0..4), "  ~ ");
+        // A diff area under 20 columns keeps them all for the diff.
+        let mut narrow = Terminal::new(TestBackend::new(19, 6)).unwrap();
+        let buf = narrow
+            .draw(|frame| app.render(frame))
+            .unwrap()
+            .buffer
+            .clone();
+        assert_eq!(row_text(&buf, 2, 0..3), " aa");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn line_numbers_widen_past_two_digits() {
+        let (mut app, a, b) = files_app(&"x\n".repeat(120), &"y\n".repeat(120));
+        app.scroll_y = 99;
+        let buf = draw_buffer(&mut app);
+        assert_eq!(row_text(&buf, 1, 0..6), "     -");
+        assert_eq!(row_text(&buf, 2, 0..6), " 100 x");
+        assert_eq!(row_text(&buf, 22, 0..6), " 120 x");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn tab_labels_stick_to_the_pane_edge() {
+        // Ten inserted columns from new column 3: cells 3..13.
+        let (mut app, a, b) = files_app("ab\n", "ab0123456789\n");
+        let mut narrow = Terminal::new(TestBackend::new(10, 6)).unwrap();
+        let buf = narrow
+            .draw(|frame| app.render(frame))
+            .unwrap()
+            .buffer
+            .clone();
+        assert_eq!(row_text(&buf, 1, 1..9), "   +3,10");
+        app.scroll_x = 5;
+        let buf = narrow
+            .draw(|frame| app.render(frame))
+            .unwrap()
+            .buffer
+            .clone();
+        assert_eq!(row_text(&buf, 1, 1..9), "+3,10   ");
+        assert_eq!(row_text(&buf, 2, 1..9), "23456789");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn ansi16_underlines_strong_cells() {
+        let (mut app, a, b) = files_app("foo\nbar baz\n", "foo\nbar qaz\n");
+        let buf = draw_buffer(&mut app);
+        for x in [6 + G, 8 + G] {
+            assert!(!buf[(x, 2)].modifier.contains(Modifier::UNDERLINED));
+            assert!(buf[(x, 3)].modifier.contains(Modifier::UNDERLINED));
+            assert_eq!(buf[(x, 2)].bg, buf[(x, 3)].bg);
+        }
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -2270,13 +2677,15 @@ mod tests {
                 assert_eq!(buf[(x, y)].bg, Color::Reset, "({x}, {y})");
             }
         }
-        assert_eq!(buf[(6, 1)].symbol(), "-");
-        assert_eq!(buf[(8, 1)].symbol(), "+");
+        assert_eq!(buf[(6 + G, 1)].symbol(), "-");
+        assert_eq!(buf[(8 + G, 1)].symbol(), "+");
+        // Only the row that differs ("bar") is reversed.
         for x in [6, 8] {
-            assert!(buf[(x, 3)].modifier.contains(Modifier::REVERSED));
-            assert!(!buf[(x, 4)].modifier.contains(Modifier::REVERSED));
+            assert!(!buf[(x + G, 2)].modifier.contains(Modifier::REVERSED));
+            assert!(buf[(x + G, 3)].modifier.contains(Modifier::REVERSED));
+            assert!(!buf[(x + G, 4)].modifier.contains(Modifier::REVERSED));
         }
-        assert!(!buf[(1, 3)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(1 + G, 3)].modifier.contains(Modifier::REVERSED));
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
@@ -2376,7 +2785,7 @@ mod tests {
         wide.scroll_x = 10;
         let bar = row_text(&draw_buffer(&mut wide), 23, 0..80);
         assert!(
-            bar.starts_with(" FILES   line 1-1/1  col 11-88/200 "),
+            bar.starts_with(" FILES   line 1-1/1  col 11-85/200 "),
             "{bar:?}"
         );
         for path in [a, b, c, d] {
