@@ -46,7 +46,7 @@ kind. Identical inputs take a direct path to an all-match grid.
 
 If the product of the two remaining column counts exceeds 1,000,000, the
 engine skips the LCS table and emits the middle columns as one delete run and
-one insert run. The TUI status bar reports this degraded mode.
+one insert run. The TUI top bar reports this degraded mode.
 
 ## Display layout
 
@@ -65,11 +65,100 @@ separators, and change-navigation offsets share that layout. Content is drawn
 at explicit cell positions, preserving boundaries that could be lost by
 concatenating and re-segmenting a whole row.
 
-Deleted columns use black text on red; inserted columns use black text on
-green. The backgrounds cover the marker row, file rows, and remaining space
-down to the bottom of the diff pane. Match columns and separators stay
-neutral. Horizontal clipping omits a grapheme that straddles a viewport edge
+Match columns stay neutral. A separator is a blank gap between the marker
+tabs and a thin `│` rule between file cells; the plain-text renderer keeps
+its `|`. Horizontal clipping omits a grapheme that straddles a viewport edge
 instead of drawing only part of it.
+
+### Changes and tabs
+
+A change is a delete run, an insert run, or a delete run directly followed
+by an insert run. Each run is a tab on the marker row, labelled like a git
+hunk header: the run's first column in its own file and its column count,
+`-4,15`, shortened to `-4` and then `-` when the tab is narrower. A run
+scrolled partly out of view keeps its label at the pane's edge.
+
+Below its tab, a changed column is tinted on every file row, and a fainter
+fill continues from the end of the file down to the bottom of the diff pane.
+The tint marks the column as a whole; the TUI does not mark which lines
+changed.
+
+### Line numbers
+
+A gutter left of the diff numbers the file rows: a blank cell, the numbers
+right-aligned in at least two digits, and a blank cell. It stays in place
+while the diff scrolls sideways. The numbers are muted, and `~` marks the
+rows below the file. Diff areas narrower than 20 columns leave out the
+gutter.
+
+### Overview bar
+
+When the diff is wider than the pane, the pane's last row becomes a map of
+the whole diff width. Each bar cell covers an equal share of the display
+cells and shows a red tick for deleted columns, a green tick for inserted
+ones, or a half-red, half-green tick for both. The part the pane shows lies
+between two `┃`, which are drawn over any ticks so a crowded bar still shows
+it; its ticks are bright and the rest are dim. Panes shorter than eight rows
+leave out the bar.
+
+### Screen layout
+
+The diff pane sits between a one-row top bar and a one-row status bar, with
+no border: the line-number gutter on its left and a blank cell on its right. The top bar shows the compared
+paths and the change counts: changes, where a delete run directly followed
+by an insert run counts once, and deleted and inserted columns. Paths are
+shortened the way git prints renames, `dir/{old → new}`, and their leading
+directories fold into `…` before the counts are dropped on a narrow screen.
+The status bar shows the mode, the visible line and column ranges, and a few
+key hints; `?` opens the full key list in a popup. These parts live in
+[src/app/chrome.rs](../src/app/chrome.rs).
+
+In git mode, the file sidebar sits to the left of a divider. Its width
+follows the longest path plus room for counts, within 24 to 40 columns and
+at most two fifths of the screen. It starts hidden on terminals narrower
+than 80 columns; `e` overrides that choice either way.
+
+Each sidebar row ends with the file's deleted and inserted column counts,
+`-12 +34`, leaving out a side with none; `=` when the contents match, `bin`
+for a binary file, and `err` when git fails to load it. The open file is
+counted with its diff. A background thread counts the rest in sidebar order
+with its own `git` calls, and the event loop polls for its results until it
+finishes.
+
+### Inspecting cells
+
+Graphemes are compared without Unicode normalization, so a column can
+change while looking the same: `é` as U+00E9 in one file and as U+0065
+U+0301 in the other. `i`, or a click on a cell, puts a cursor on a cell and
+turns the status bar into a readout of it: the file line, its column in the
+old and new file (one side only for a deleted or inserted column), the
+grapheme as drawn, its width in cells, and its code points. Graphemes with
+control characters show only their code points. The cursor moves by drawn
+column and by row, scrolling the pane to stay in view, and stops at the
+edges.
+
+### Colors
+
+[src/theme.rs](../src/theme.rs) holds every style the TUI draws, by role:
+the tab, cell, and fill styles per change kind, separators, muted text,
+badges, and the sidebar selection. A theme is built from a scheme and a
+color depth. The scheme comes from `--theme` or `VDIFF_THEME`: `dark` (the
+default) and `light` use red and green, while `dark-colorblind` and
+`light-colorblind` use orange and blue from the Okabe–Ito palette with a
+neutral accent. The color depth is detected:
+
+- 24-bit color when `COLORTERM` is `truecolor` or `24bit`, or in Windows
+  Terminal (`WT_SESSION`).
+- The 256-color palette when `TERM` contains `256color`. Its darkest red and
+  green are the only tints dark enough for light text, so file cells and the
+  fill share them.
+- Otherwise the 16 basic colors: black text on red and green for every row
+  of a changed column, the TUI's original look.
+- A non-empty `NO_COLOR` turns colors off. Changed cells use reverse video,
+  and the marker row and separators keep changes readable.
+
+Every style that sets a background also sets the text color, so tinted cells
+stay legible on light and dark terminals.
 
 ### Standalone marks and controls
 

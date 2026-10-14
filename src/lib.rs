@@ -2,6 +2,7 @@ pub mod app;
 pub mod cli;
 pub mod diff;
 pub mod git;
+pub mod theme;
 
 use std::io::IsTerminal;
 
