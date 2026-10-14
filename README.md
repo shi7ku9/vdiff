@@ -54,7 +54,8 @@ where the changed columns are, with the part on screen bright between two
 `┃`.
 Unchanged columns stay neutral, and group separators are thin rules. A top bar
 names what is being compared and counts the changes; the status bar shows the
-visible lines and the keys worth knowing.
+visible lines and the keys worth knowing. In git mode, the sidebar lists each
+changed file with its deleted and inserted column counts, such as `-12 +34`.
 
 Colors follow what the terminal supports: 24-bit color when `COLORTERM` is
 `truecolor` or `24bit`, a 256-color palette when `TERM` contains `256color`,

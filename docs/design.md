@@ -114,9 +114,16 @@ key hints; `?` opens the full key list in a popup. These parts live in
 [src/app/chrome.rs](../src/app/chrome.rs).
 
 In git mode, the file sidebar sits to the left of a divider. Its width
-follows the longest path, within 24 to 40 columns and at most two fifths of
-the screen. It starts hidden on terminals narrower than 80 columns; `e`
-overrides that choice either way.
+follows the longest path plus room for counts, within 24 to 40 columns and
+at most two fifths of the screen. It starts hidden on terminals narrower
+than 80 columns; `e` overrides that choice either way.
+
+Each sidebar row ends with the file's deleted and inserted column counts,
+`-12 +34`, leaving out a side with none; `=` when the contents match, `bin`
+for a binary file, and `err` when git fails to load it. The open file is
+counted with its diff. A background thread counts the rest in sidebar order
+with its own `git` calls, and the event loop polls for its results until it
+finishes.
 
 ### Inspecting cells
 

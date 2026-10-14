@@ -149,14 +149,68 @@ struct DiffStats {
 }
 
 impl DiffStats {
-    fn of(changes: &[Change]) -> DiffStats {
-        let columns = |run: &Option<Run>| run.as_ref().map_or(0, |run| run.steps.len());
+    fn of(grid: &DiffGrid) -> DiffStats {
+        let changes = change_groups(grid);
+        let columns = |group: Option<usize>| group.map_or(0, |group| grid.groups[group].len());
         DiffStats {
             changes: changes.len(),
-            deleted: changes.iter().map(|change| columns(&change.delete)).sum(),
-            inserted: changes.iter().map(|change| columns(&change.insert)).sum(),
+            deleted: changes.iter().map(|(delete, _)| columns(*delete)).sum(),
+            inserted: changes.iter().map(|(_, insert)| columns(*insert)).sum(),
         }
     }
+}
+
+/// The groups of each change, in order: a delete run, an insert run,
+/// or a delete run directly followed by an insert run.
+fn change_groups(grid: &DiffGrid) -> Vec<(Option<usize>, Option<usize>)> {
+    let mut changes = Vec::new();
+    // A delete run waits here for an insert run right after it.
+    let mut pending = None;
+    for (index, group) in grid.groups.iter().enumerate() {
+        match grid.steps[group.start].kind {
+            StepKind::Match => changes.extend(pending.take().map(|delete| (Some(delete), None))),
+            StepKind::Delete => pending = Some(index),
+            StepKind::Insert => changes.push((pending.take(), Some(index))),
+        }
+    }
+    changes.extend(pending.map(|delete| (Some(delete), None)));
+    changes
+}
+
+/// How a changed file's diff came out, for the sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileStats {
+    Counted(DiffStats),
+    Binary,
+    /// Git failed to load one side.
+    Failed,
+}
+
+/// Count the changes in one file of a git diff.
+fn count_file(git: &dyn GitShell, spec: &RevSpec, file: &ChangedFile) -> FileStats {
+    match git::load_content(git, spec, file) {
+        Ok(Some((old, new))) => FileStats::Counted(DiffStats::of(&diff::compute(&old, &new))),
+        Ok(None) => FileStats::Binary,
+        Err(_) => FileStats::Failed,
+    }
+}
+
+/// Count every file's changes on a background thread, in sidebar
+/// order, sending each result as it is ready.
+fn count_files_in_background(
+    spec: RevSpec,
+    files: Vec<ChangedFile>,
+) -> std::sync::mpsc::Receiver<(usize, FileStats)> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for (index, file) in files.iter().enumerate() {
+            let stats = count_file(&git::RealGit, &spec, file);
+            if sender.send((index, stats)).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
 }
 
 struct DisplayColumn {
@@ -172,10 +226,9 @@ fn build_display(grid: &DiffGrid) -> Display {
     let mut kinds = Vec::new();
     let mut columns = Vec::new();
     let mut group_end_offsets = Vec::with_capacity(grid.groups.len());
-    let mut changes = Vec::new();
+    // Each group's run, or `None` for a match group.
+    let mut runs: Vec<Option<Run>> = Vec::with_capacity(grid.groups.len());
     let mut places = Vec::with_capacity(grid.steps.len());
-    // A delete run waits here for an insert run right after it.
-    let mut pending: Option<Run> = None;
     let (mut old_column, mut new_column) = (0, 0);
     for group in &grid.groups {
         let kind = grid.steps[group.start].kind;
@@ -231,22 +284,11 @@ fn build_display(grid: &DiffGrid) -> Display {
                 new_column += 1;
             }
         }
-        let run = Run {
+        runs.push((kind != StepKind::Match).then(|| Run {
             steps: group.clone(),
             column: run_column,
             cells: run_start..kinds.len(),
-        };
-        match kind {
-            StepKind::Match => changes.extend(pending.take().map(|delete| Change {
-                delete: Some(delete),
-                insert: None,
-            })),
-            StepKind::Delete => pending = Some(run),
-            StepKind::Insert => changes.push(Change {
-                delete: pending.take(),
-                insert: Some(run),
-            }),
-        }
+        }));
         if group.end < grid.steps.len() {
             columns.push(DisplayColumn {
                 start: kinds.len(),
@@ -261,14 +303,17 @@ fn build_display(grid: &DiffGrid) -> Display {
         }
         group_end_offsets.push(kinds.len());
     }
-    changes.extend(pending.map(|delete| Change {
-        delete: Some(delete),
-        insert: None,
-    }));
+    let changes = change_groups(grid)
+        .into_iter()
+        .map(|(delete, insert)| Change {
+            delete: delete.and_then(|group| runs[group].take()),
+            insert: insert.and_then(|group| runs[group].take()),
+        })
+        .collect();
     let mut out = vec![marker];
     out.extend(rows);
     let width = kinds.len();
-    let stats = DiffStats::of(&changes);
+    let stats = DiffStats::of(grid);
     Display {
         rows: out,
         columns,
@@ -458,6 +503,8 @@ pub struct App {
     sidebar_offset: usize,
     /// Where the last frame drew the parts the mouse can act on.
     areas: Areas,
+    /// Each changed file's counts, once known (git mode).
+    file_stats: Vec<Option<FileStats>>,
 }
 
 /// Where the last frame put the parts the mouse can act on.
@@ -511,7 +558,9 @@ impl App {
             frame_width: 0,
             sidebar_offset: 0,
             areas: Areas::default(),
+            file_stats: Vec::new(),
         };
+        app.file_stats = vec![None; app.entries().len()];
         app.reload();
         app
     }
@@ -557,7 +606,10 @@ impl App {
                 self.degraded = grid.degraded;
                 // Display rows depend only on the grid; build them
                 // once here instead of on every frame.
-                self.display = Some(build_display(&grid));
+                let display = build_display(&grid);
+                // The loaded file's counts come free with its diff.
+                self.record_stats(self.selection, FileStats::Counted(display.stats));
+                self.display = Some(display);
                 self.grid = Some(grid);
                 self.notice = None;
             }
@@ -565,6 +617,7 @@ impl App {
                 self.grid = None;
                 self.display = None;
                 self.degraded = false;
+                self.record_stats(self.selection, FileStats::Binary);
                 let (old, new) = &self.labels;
                 self.notice = Some(match &self.source {
                     DiffSource::Git { files, .. } if files.is_empty() => Notice {
@@ -587,11 +640,19 @@ impl App {
                 self.grid = None;
                 self.display = None;
                 self.degraded = false;
+                self.record_stats(self.selection, FileStats::Failed);
                 self.notice = Some(Notice {
                     title: "Could not load this file".to_string(),
                     detail: Some(message),
                 });
             }
+        }
+    }
+
+    /// Remember a file's counts for the sidebar.
+    fn record_stats(&mut self, index: usize, stats: FileStats) {
+        if let Some(slot) = self.file_stats.get_mut(index) {
+            *slot = Some(stats);
         }
     }
 
@@ -1298,6 +1359,14 @@ pub fn run_tui(cli: &crate::cli::Cli) -> Result<(), Box<dyn std::error::Error>> 
 /// when a key actually changed the state (or the terminal resized),
 /// instead of unconditionally on every event.
 pub fn run_tui_app(app: &mut App) -> io::Result<()> {
+    // Count the other files' changes for the sidebar while the user
+    // reads the first one.
+    let mut counts = match &app.source {
+        DiffSource::Git { spec, files, .. } if files.len() > 1 => {
+            Some(count_files_in_background(spec.clone(), files.clone()))
+        }
+        _ => None,
+    };
     let mut terminal = ratatui::init();
     // ratatui's panic hook restores the terminal but leaves mouse
     // capture on; switch it off first.
@@ -1310,6 +1379,29 @@ pub fn run_tui_app(app: &mut App) -> io::Result<()> {
         crossterm::execute!(io::stdout(), EnableMouseCapture)?;
         terminal.draw(|frame| app.render(frame))?;
         loop {
+            // While counts are still coming, wake up for them too.
+            if let Some(receiver) = &counts {
+                let mut counted = false;
+                loop {
+                    match receiver.try_recv() {
+                        Ok((index, stats)) => {
+                            app.record_stats(index, stats);
+                            counted = true;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            counts = None;
+                            break;
+                        }
+                    }
+                }
+                if counted {
+                    terminal.draw(|frame| app.render(frame))?;
+                }
+                if !event::poll(std::time::Duration::from_millis(100))? {
+                    continue;
+                }
+            }
             match event::read()? {
                 Event::Key(key) => {
                     let r = app.handle_key(key);
@@ -3124,6 +3216,75 @@ mod tests {
         assert!(!app.handle_mouse(mouse(click, 2, 4)));
         assert!(!app.handle_mouse(mouse(click, 6, 4)));
         assert_eq!(app.inspect, None);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn count_file_reports_counts_binaries_and_failures() {
+        let spec = RevSpec {
+            old: Source::Rev("HEAD~1".into()),
+            new: Source::Rev("HEAD".into()),
+            diff_args: vec![],
+            toplevel: String::new(),
+            prefix: String::new(),
+        };
+        let file = |path: &str| ChangedFile {
+            status: Status::Modified,
+            old_path: path.into(),
+            new_path: path.into(),
+        };
+        let mut git = FakeGit::default();
+        git.set(&["cat-file", "-p", "HEAD~1:a"], Some("foo\n".into()));
+        git.set(&["cat-file", "-p", "HEAD:a"], Some("fox\n".into()));
+        git.set_binary(&["cat-file", "-p", "HEAD~1:b"]);
+        git.set(&["cat-file", "-p", "HEAD:b"], Some("x\n".into()));
+        assert_eq!(
+            count_file(&git, &spec, &file("a")),
+            FileStats::Counted(DiffStats {
+                changes: 1,
+                deleted: 1,
+                inserted: 1,
+            })
+        );
+        assert_eq!(count_file(&git, &spec, &file("b")), FileStats::Binary);
+        assert_eq!(count_file(&git, &spec, &file("c")), FileStats::Failed);
+    }
+
+    #[test]
+    fn sidebar_shows_each_files_counts_once_known() {
+        let mut app = git_app(vec![("foo\n", "bar\n"), ("a\n", "a\n"), ("x\n", "y\n")]);
+        // The loaded file is counted right away; the others wait.
+        let buf = draw_buffer(&mut app);
+        assert_eq!(row_text(&buf, 2, 0..24), "▌M  f0.txt        -3 +3 ");
+        assert_eq!(row_text(&buf, 3, 0..24), " M  f1.txt              ");
+        assert_eq!(buf[(18, 2)].fg, Color::Red);
+        assert_eq!(buf[(21, 2)].fg, Color::Green);
+        app.record_stats(1, FileStats::Counted(DiffStats::default()));
+        app.record_stats(2, FileStats::Binary);
+        let buf = draw_buffer(&mut app);
+        assert_eq!(row_text(&buf, 3, 0..24), format!(" M  f1.txt{:>13} ", "="));
+        assert_eq!(
+            row_text(&buf, 4, 0..24),
+            format!(" M  f2.txt{:>13} ", "bin")
+        );
+        app.record_stats(2, FileStats::Failed);
+        let buf = draw_buffer(&mut app);
+        assert_eq!(
+            row_text(&buf, 4, 0..24),
+            format!(" M  f2.txt{:>13} ", "err")
+        );
+    }
+
+    #[test]
+    fn counts_leave_out_a_side_with_none() {
+        let (mut app, a, b) = files_app("x\n", "xab\n");
+        app.labels = ("a".into(), "b".into());
+        let bar = row_text(&draw_buffer(&mut app), 0, 0..80);
+        assert!(bar.ends_with("  1 change   +2 cols "), "{bar:?}");
+        let mut git = git_app(vec![("ab\n", "a\n"), ("x\n", "y\n")]);
+        let buf = draw_buffer(&mut git);
+        assert_eq!(row_text(&buf, 2, 0..24), format!("▌M  f0.txt{:>13} ", "-1"));
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }

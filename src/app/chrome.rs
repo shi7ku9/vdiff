@@ -1,7 +1,7 @@
 //! The frame around the diff: top bar, status bar, file sidebar, help
 //! popup, and notices.
 
-use super::{App, Cursor, DiffSource, Notice, rendered_width, visible_block};
+use super::{App, Cursor, DiffSource, DiffStats, FileStats, Notice, rendered_width, visible_block};
 use crate::diff::StepKind;
 use crate::git::{ChangedFile, Status};
 use ratatui::Frame;
@@ -92,11 +92,31 @@ impl App {
         spans.extend([
             Span::styled(format!("{} change{plural}", stats.changes), theme.muted),
             Span::raw("   "),
-            Span::styled(format!("-{}", stats.deleted), theme.delete_mark),
-            Span::raw(" "),
-            Span::styled(format!("+{}", stats.inserted), theme.insert_mark),
-            Span::styled(" cols", theme.muted),
         ]);
+        spans.extend(self.column_counts(stats));
+        spans.push(Span::styled(" cols", theme.muted));
+        spans
+    }
+
+    /// Deleted and inserted column counts, `-12 +34`, leaving out a side
+    /// with none.
+    fn column_counts(&self, stats: DiffStats) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        if stats.deleted > 0 {
+            spans.push(Span::styled(
+                format!("-{}", stats.deleted),
+                self.theme.delete_mark,
+            ));
+        }
+        if stats.inserted > 0 {
+            if !spans.is_empty() {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(
+                format!("+{}", stats.inserted),
+                self.theme.insert_mark,
+            ));
+        }
         spans
     }
 
@@ -261,8 +281,8 @@ impl App {
     }
 
     /// Sidebar width for a main area `total` columns wide: the longest
-    /// entry plus padding, within 24..=40 columns and two fifths of the
-    /// screen.
+    /// entry plus padding and room for its counts, within 24..=40
+    /// columns and two fifths of the screen.
     pub(super) fn sidebar_width(&self, total: u16) -> u16 {
         let longest = self
             .entries()
@@ -270,9 +290,24 @@ impl App {
             .map(|file| entry_text(file).width())
             .max()
             .unwrap_or(0);
-        // Selection mark, status letter, two spaces, path, one space.
-        let wanted = (longest + 5).clamp(24, 40) as u16;
+        // Selection mark, status letter, two spaces, path, a space,
+        // counts like `-12 +34`, and a space.
+        let wanted = (longest + 5 + COUNTS_ROOM).clamp(24, 40) as u16;
         wanted.min(total.saturating_mul(2) / 5)
+    }
+
+    /// A file's counts for its sidebar row: `-12 +34`, `=` when the
+    /// contents match, `bin` or `err` when there is no diff, and
+    /// nothing until they are known.
+    fn counts(&self, index: usize) -> Vec<Span<'static>> {
+        let theme = &self.theme;
+        match self.file_stats.get(index).copied().flatten() {
+            Some(FileStats::Counted(stats)) if stats.changes > 0 => self.column_counts(stats),
+            Some(FileStats::Counted(_)) => vec![Span::styled("=", theme.muted)],
+            Some(FileStats::Binary) => vec![Span::styled("bin", theme.muted)],
+            Some(FileStats::Failed) => vec![Span::styled("err", theme.warning)],
+            None => Vec::new(),
+        }
     }
 
     /// Keep the selected entry among the `rows` entries on screen.
@@ -322,6 +357,16 @@ impl App {
                 Status::Renamed => ("R", theme.renamed),
             };
             buf.set_string(area.x + 1, y, letter, style);
+            // Counts sit at the right edge; the path gives way to them.
+            let counts = self.counts(index);
+            let counts_width = spans_width(&counts) as u16;
+            let room = if counts_width > 0 && counts_width + 6 <= room {
+                let x = area.right() - 1 - counts_width;
+                buf.set_line(x, y, &Line::from(counts), counts_width);
+                room - counts_width - 1
+            } else {
+                room
+            };
             // Directories are muted, except on the selected row, whose
             // background would swallow them.
             let dim = if selected { Style::new() } else { theme.muted };
@@ -437,6 +482,9 @@ impl App {
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
     }
 }
+
+/// Cells a sidebar row sets aside for its counts, `-12 +34` and a gap.
+const COUNTS_ROOM: usize = 8;
 
 /// A changed file as plain text: its path, or `dir/{old → new}` for a
 /// rename.
