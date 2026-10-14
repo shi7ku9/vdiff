@@ -44,9 +44,17 @@ in|au|t| main() {      |o main() -> int| |{|        |  |
 
 The first row is the **marker row**: `-`/`+` mark the columns that changed. The `|` separators group runs of changes; the one between `-` and `+` separates the delete run and insert run of the same changed column. Each following row is one line of the file, with the old and new characters of each changed column shown side by side.
 
-In the TUI, deleted columns have a red background and inserted columns have a
-green background, with black text. The color extends down to the bottom of the
-diff pane. Unchanged columns and group separators stay neutral.
+In the TUI, the marker row becomes red and green tabs over the changed
+columns. Deleted columns are tinted red and inserted columns green, and a
+fainter tint continues each changed column down to the bottom of the diff
+pane. Unchanged columns stay neutral, and group separators are thin rules. A
+top bar names what is being compared and counts the changes; the status bar
+shows the visible lines and the keys worth knowing.
+
+Colors follow what the terminal supports: 24-bit color when `COLORTERM` is
+`truecolor` or `24bit`, a 256-color palette when `TERM` contains `256color`,
+and otherwise the 16 basic colors, with black text on red and green. With
+`NO_COLOR` set, changed cells are shown in reverse video instead.
 
 ## Building
 
@@ -85,7 +93,8 @@ When stdout is not a terminal, `vdiff` prints plain text instead of opening the 
 | `Tab` / `Shift-Tab` | move the file selection (git mode; the diff updates live) |
 | `n` / `p` | jump to the next / previous change group |
 | `g` / `G` | scroll to top / bottom |
-| `e` | toggle the file sidebar (git mode) |
+| `e` | toggle the file sidebar (git mode; starts hidden below 80 columns) |
+| `?` | show or hide the key help (`Esc` or `q` also closes it) |
 | `q` / `Ctrl-C` | quit |
 
 ## Documentation

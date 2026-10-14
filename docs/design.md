@@ -46,7 +46,7 @@ kind. Identical inputs take a direct path to an all-match grid.
 
 If the product of the two remaining column counts exceeds 1,000,000, the
 engine skips the LCS table and emits the middle columns as one delete run and
-one insert run. The TUI status bar reports this degraded mode.
+one insert run. The TUI top bar reports this degraded mode.
 
 ## Display layout
 
@@ -65,11 +65,48 @@ separators, and change-navigation offsets share that layout. Content is drawn
 at explicit cell positions, preserving boundaries that could be lost by
 concatenating and re-segmenting a whole row.
 
-Deleted columns use black text on red; inserted columns use black text on
-green. The backgrounds cover the marker row, file rows, and remaining space
-down to the bottom of the diff pane. Match columns and separators stay
-neutral. Horizontal clipping omits a grapheme that straddles a viewport edge
-instead of drawing only part of it.
+A changed column has three styles: a tab on the marker row, a tinted cell on
+each file row, and a fainter fill from the end of the file down to the
+bottom of the diff pane. Match columns stay neutral. A separator is a blank
+gap between the marker tabs and a thin `│` rule between file cells; the
+plain-text renderer keeps its `|`. Horizontal clipping omits a grapheme that
+straddles a viewport edge instead of drawing only part of it.
+
+### Screen layout
+
+The diff pane sits between a one-row top bar and a one-row status bar, with
+no border and a blank cell on each side. The top bar shows the compared
+paths and the change counts: changes, where a delete run directly followed
+by an insert run counts once, and deleted and inserted columns. Paths are
+shortened the way git prints renames, `dir/{old → new}`, and their leading
+directories fold into `…` before the counts are dropped on a narrow screen.
+The status bar shows the mode, the visible line and column ranges, and a few
+key hints; `?` opens the full key list in a popup. These parts live in
+[src/app/chrome.rs](../src/app/chrome.rs).
+
+In git mode, the file sidebar sits to the left of a divider. Its width
+follows the longest path, within 24 to 40 columns and at most two fifths of
+the screen. It starts hidden on terminals narrower than 80 columns; `e`
+overrides that choice either way.
+
+### Colors
+
+[src/theme.rs](../src/theme.rs) holds every style the TUI draws, by role:
+the three diff styles per change kind, separators, muted text, badges, and
+the sidebar selection. The theme is chosen by color depth:
+
+- 24-bit color when `COLORTERM` is `truecolor` or `24bit`, or in Windows
+  Terminal (`WT_SESSION`).
+- The 256-color palette when `TERM` contains `256color`. Its darkest red and
+  green are the only tints dark enough for light text, so file cells and the
+  fill share them.
+- Otherwise the 16 basic colors: black text on red and green for every row
+  of a changed column, the TUI's original look.
+- A non-empty `NO_COLOR` turns colors off. Changed cells use reverse video,
+  and the marker row and separators keep changes readable.
+
+Every style that sets a background also sets the text color, so tinted cells
+stay legible on light and dark terminals.
 
 ### Standalone marks and controls
 
