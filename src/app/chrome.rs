@@ -1,7 +1,8 @@
 //! The frame around the diff: top bar, status bar, file sidebar, help
 //! popup, and notices.
 
-use super::{App, DiffSource, Notice};
+use super::{App, Cursor, DiffSource, Notice, rendered_width, visible_block};
+use crate::diff::StepKind;
 use crate::git::{ChangedFile, Status};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Rect};
@@ -99,9 +100,14 @@ impl App {
         spans
     }
 
-    /// Mode, visible ranges, and key hints.
+    /// Mode, visible ranges, and key hints; while inspecting, the cell
+    /// under the cursor instead.
     pub(super) fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
         if area.is_empty() {
+            return;
+        }
+        if let Some(cursor) = self.inspect {
+            self.render_inspect_status(frame, area, cursor);
             return;
         }
         let theme = &self.theme;
@@ -148,6 +154,61 @@ impl App {
         let right_width = spans_width(&right) as u16;
         let right_x = area.right().saturating_sub(right_width + 1);
         buf.set_line(right_x, area.y, &Line::from(right), right_width);
+    }
+
+    /// Where the cursor's cell is in each file, and what it holds: the
+    /// grapheme, its code points, and its width. Graphemes with
+    /// control characters show only their code points.
+    fn render_inspect_status(&self, frame: &mut Frame<'_>, area: Rect, cursor: Cursor) {
+        let (Some(grid), Some(display)) = (&self.grid, &self.display) else {
+            return;
+        };
+        let theme = &self.theme;
+        let place = &display.places[cursor.step];
+        let raw = grid.steps[cursor.step]
+            .content
+            .get(cursor.row)
+            .unwrap_or(" ");
+        let field = |name: &str, value: String| {
+            [
+                Span::styled(format!("  {name} "), theme.muted),
+                Span::raw(value),
+            ]
+        };
+        let mut left = vec![Span::styled(" INSPECT ", theme.logo)];
+        left.extend(field("line", (cursor.row + 1).to_string()));
+        if let Some(old) = place.old {
+            left.extend(field("old col", (old + 1).to_string()));
+        }
+        if let Some(new) = place.new {
+            left.extend(field("new col", (new + 1).to_string()));
+        }
+        if !raw.chars().any(char::is_control) {
+            // A dotted circle keeps a lone combining mark off the quote.
+            let shown = visible_block(raw, StepKind::Delete);
+            let width = rendered_width(&shown);
+            left.push(Span::raw(format!("   \"{shown}\"")));
+            let unit = if width == 1 { "cell" } else { "cells" };
+            left.push(Span::styled(format!(" {width} {unit}"), theme.muted));
+        }
+        let points: Vec<String> = raw
+            .chars()
+            .map(|c| format!("U+{:04X}", u32::from(c)))
+            .collect();
+        left.push(Span::raw(format!("   {}", points.join(" "))));
+        let buf = frame.buffer_mut();
+        buf.set_line(area.x, area.y, &Line::from(left.clone()), area.width);
+        let hints = Line::from(vec![
+            Span::styled("hjkl", theme.key),
+            Span::styled(" move   ", theme.muted),
+            Span::styled("esc", theme.key),
+            Span::styled(" done", theme.muted),
+        ]);
+        let hints_width = hints.width() as u16;
+        if spans_width(&left) as u16 + hints_width + 3 <= area.width {
+            let x = area.right() - hints_width - 1;
+            buf.set_line(x, area.y, &hints, hints_width);
+        }
     }
 
     /// The visible line range, and the column range when the diff is
@@ -289,7 +350,13 @@ impl App {
                     ("g / G", "top / bottom"),
                 ],
             ),
-            ("Changes", vec![("n / p", "next / previous change")]),
+            (
+                "Changes",
+                vec![
+                    ("n / p", "next / previous change"),
+                    ("i", "inspect cells: hjkl moves, esc ends"),
+                ],
+            ),
         ];
         if self.has_sidebar() {
             sections.push((

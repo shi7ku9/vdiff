@@ -90,7 +90,19 @@ struct Display {
     width: usize,
     /// Changes in display order.
     changes: Vec<Change>,
+    /// Per grid step: its display cells and its column in each file.
+    places: Vec<Place>,
     stats: DiffStats,
+}
+
+/// Where a grid step is drawn, and which column it is in the old and
+/// the new file (`None` on the side it was deleted from or inserted
+/// into).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Place {
+    cells: Range<usize>,
+    old: Option<usize>,
+    new: Option<usize>,
 }
 
 /// A run of deleted or inserted columns.
@@ -161,6 +173,7 @@ fn build_display(grid: &DiffGrid) -> Display {
     let mut columns = Vec::new();
     let mut group_end_offsets = Vec::with_capacity(grid.groups.len());
     let mut changes = Vec::new();
+    let mut places = Vec::with_capacity(grid.steps.len());
     // A delete run waits here for an insert run right after it.
     let mut pending: Option<Run> = None;
     let (mut old_column, mut new_column) = (0, 0);
@@ -196,6 +209,11 @@ fn build_display(grid: &DiffGrid) -> Display {
                 start: kinds.len(),
                 width,
                 step: Some(step_index),
+            });
+            places.push(Place {
+                cells: kinds.len()..kinds.len() + width,
+                old: (kind != StepKind::Insert).then_some(old_column),
+                new: (kind != StepKind::Delete).then_some(new_column),
             });
             if width > 0 {
                 marker.push(mark);
@@ -258,6 +276,7 @@ fn build_display(grid: &DiffGrid) -> Display {
         group_end_offsets,
         width,
         changes,
+        places,
         stats,
     }
 }
@@ -418,6 +437,8 @@ pub struct App {
     pub sidebar: Option<bool>,
     /// Whether the key help popup is open.
     pub help: bool,
+    /// The inspect cursor, while inspecting cells.
+    pub inspect: Option<Cursor>,
     pub scroll_y: usize,
     pub scroll_x: usize,
     pub grid: Option<DiffGrid>,
@@ -444,7 +465,19 @@ pub struct App {
 struct Areas {
     /// The sidebar's file list, title row included.
     sidebar: Option<Rect>,
+    /// The diff, marker row included.
+    pane: Rect,
     overview: Option<Rect>,
+}
+
+/// Scroll offsets, selection, sidebar, help, and inspect cursor.
+type ViewState = (usize, usize, usize, bool, bool, Option<Cursor>);
+
+/// A cell of the diff: a file row and a grid step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    pub row: usize,
+    pub step: usize,
 }
 
 impl App {
@@ -460,6 +493,7 @@ impl App {
             selection: 0,
             sidebar: None,
             help: false,
+            inspect: None,
             scroll_y: 0,
             scroll_x: 0,
             grid: None,
@@ -516,6 +550,7 @@ impl App {
         };
         self.scroll_y = 0;
         self.scroll_x = 0;
+        self.inspect = None;
         match loaded {
             Ok(Some((old, new))) => {
                 let grid = diff::compute(&old, &new);
@@ -638,6 +673,7 @@ impl App {
         };
         self.areas = Areas {
             sidebar: sidebar.map(|(list, _)| list),
+            pane,
             overview,
         };
         // Record the pane size before rendering the status bar so the
@@ -799,6 +835,7 @@ impl App {
                     }
                     self.draw_content_row(frame, inner, y as u16, i - 1, disp);
                 }
+                self.draw_cursor(frame, inner, disp);
             }
             (None, Some(notice)) => self.render_notice(frame, inner, notice),
             (None, None) => {}
@@ -832,6 +869,24 @@ impl App {
             self.draw_cell(frame, inner, y, &text, column.start);
         }
         self.style_row(frame, inner, y, &display.kinds, RowRole::File);
+    }
+
+    /// Highlight the cell under the inspect cursor, if it is in view.
+    fn draw_cursor(&self, frame: &mut Frame<'_>, inner: Rect, display: &Display) {
+        let Some(cursor) = self.inspect else {
+            return;
+        };
+        let rows = usize::from(inner.height).saturating_sub(1);
+        if cursor.row < self.scroll_y || cursor.row >= self.scroll_y + rows {
+            return;
+        }
+        let y = inner.y + 1 + (cursor.row - self.scroll_y) as u16;
+        let right = self.scroll_x + usize::from(inner.width);
+        let cells = &display.places[cursor.step].cells;
+        for cell in cells.start.max(self.scroll_x)..cells.end.min(right) {
+            let x = inner.x + (cell - self.scroll_x) as u16;
+            frame.buffer_mut()[(x, y)].set_style(self.theme.cursor);
+        }
     }
 
     /// The marker row: a tab over each changed run, labelled with where
@@ -941,13 +996,42 @@ impl App {
                 changed: close,
             };
         }
-        let before = (
+        let before = self.view_state();
+        if self.inspect.is_some() {
+            // hjkl, g, and G move the cursor; Esc and i stop inspecting.
+            // Other keys keep their usual meaning.
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('i') => self.inspect = None,
+                KeyCode::Char('h') => self.move_cursor(-1, 0),
+                KeyCode::Char('l') => self.move_cursor(1, 0),
+                KeyCode::Char('j') => self.move_cursor(0, 1),
+                KeyCode::Char('k') => self.move_cursor(0, -1),
+                KeyCode::Char('g') => self.move_cursor(0, isize::MIN),
+                KeyCode::Char('G') => self.move_cursor(0, isize::MAX),
+                _ => return self.handle_plain_key(key, before),
+            }
+            return KeyResult {
+                quit: false,
+                changed: before != self.view_state(),
+            };
+        }
+        self.handle_plain_key(key, before)
+    }
+
+    /// What keys and the mouse can change; comparing it before and
+    /// after an event tells whether the screen must redraw.
+    fn view_state(&self) -> ViewState {
+        (
             self.scroll_y,
             self.scroll_x,
             self.selection,
             self.sidebar_visible(),
             self.help,
-        );
+            self.inspect,
+        )
+    }
+
+    fn handle_plain_key(&mut self, key: KeyEvent, before: ViewState) -> KeyResult {
         match key.code {
             KeyCode::Char('q') => {
                 return KeyResult {
@@ -956,6 +1040,7 @@ impl App {
                 };
             }
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('i') => self.start_inspecting(),
             KeyCode::Char('e') if self.has_sidebar() => {
                 self.sidebar = Some(!self.sidebar_visible())
             }
@@ -972,17 +1057,74 @@ impl App {
             KeyCode::BackTab => self.move_selection(-1),
             _ => {}
         }
-        let after = (
-            self.scroll_y,
-            self.scroll_x,
-            self.selection,
-            self.sidebar_visible(),
-            self.help,
-        );
         KeyResult {
             quit: false,
-            changed: before != after,
+            changed: before != self.view_state(),
         }
+    }
+
+    /// Put the inspect cursor on the first visible cell.
+    fn start_inspecting(&mut self) {
+        let (Some(grid), Some(display)) = (&self.grid, &self.display) else {
+            return;
+        };
+        if grid.height == 0 {
+            return;
+        }
+        let shown = |place: &Place| !place.cells.is_empty() && place.cells.start >= self.scroll_x;
+        if let Some(step) = display.places.iter().position(shown) {
+            let row = self.scroll_y.min(grid.height - 1);
+            self.inspect = Some(Cursor { row, step });
+        }
+    }
+
+    /// Move the inspect cursor by `dx` drawn columns and `dy` rows,
+    /// stopping at the edges, then scroll it into view.
+    fn move_cursor(&mut self, dx: isize, dy: isize) {
+        let (Some(grid), Some(display), Some(cursor)) = (&self.grid, &self.display, self.inspect)
+        else {
+            return;
+        };
+        let drawn = |step: &usize| !display.places[*step].cells.is_empty();
+        let step = match dx.signum() {
+            1 => (cursor.step + 1..display.places.len()).find(drawn),
+            -1 => (0..cursor.step).rev().find(drawn),
+            _ => None,
+        }
+        .unwrap_or(cursor.step);
+        let row = cursor
+            .row
+            .saturating_add_signed(dy)
+            .min(grid.height.saturating_sub(1));
+        let cells = display.places[step].cells.clone();
+        self.inspect = Some(Cursor { row, step });
+        let rows = self.pane_height.saturating_sub(1).max(1);
+        if row < self.scroll_y {
+            self.scroll_y = row;
+        } else if row >= self.scroll_y + rows {
+            self.scroll_y = row + 1 - rows;
+        }
+        if cells.start < self.scroll_x {
+            self.scroll_x = cells.start;
+        } else if self.pane_width > 0 && cells.end > self.scroll_x + self.pane_width {
+            self.scroll_x = cells.end - self.pane_width;
+        }
+    }
+
+    /// The diff cell drawn at screen position (`x`, `y`), if any.
+    fn cell_at(&self, x: u16, y: u16) -> Option<Cursor> {
+        let (grid, display) = (self.grid.as_ref()?, self.display.as_ref()?);
+        let pane = self.areas.pane;
+        if !pane.contains((x, y).into()) || y == pane.y {
+            return None;
+        }
+        let row = self.scroll_y + usize::from(y - pane.y - 1);
+        let cell = self.scroll_x + usize::from(x - pane.x);
+        let step = display
+            .places
+            .partition_point(|place| place.cells.end <= cell);
+        let place = display.places.get(step)?;
+        (row < grid.height && place.cells.contains(&cell)).then_some(Cursor { row, step })
     }
 
     /// Handle one mouse event; returns whether the screen must redraw.
@@ -1000,7 +1142,7 @@ impl App {
             self.help = !click;
             return click;
         }
-        let before = (self.scroll_y, self.scroll_x, self.selection);
+        let before = self.view_state();
         let sideways = mouse.modifiers.contains(KeyModifiers::SHIFT);
         match mouse.kind {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
@@ -1020,6 +1162,8 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(bar) = at(self.areas.overview) {
                     self.center_view_on(bar, mouse.column);
+                } else if let Some(cell) = self.cell_at(mouse.column, mouse.row) {
+                    self.inspect = Some(cell);
                 } else if let Some(list) = at(self.areas.sidebar)
                     && mouse.kind == MouseEventKind::Down(MouseButton::Left)
                     && mouse.row > list.y
@@ -1033,7 +1177,7 @@ impl App {
             }
             _ => {}
         }
-        before != (self.scroll_y, self.scroll_x, self.selection)
+        before != self.view_state()
     }
 
     fn scroll_right(&mut self, cells: usize) {
@@ -2892,6 +3036,94 @@ mod tests {
         assert!(app.help);
         assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 10)));
         assert!(!app.help);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn inspecting_shows_what_a_cell_holds() {
+        // "é" as one code point in the old file, as e + U+0301 in the new.
+        let (mut app, a, b) = files_app("caf\u{e9}\n", "cafe\u{301}\n");
+        let _ = draw(&mut app);
+        let status = |app: &mut App| row_text(&draw_buffer(app), 23, 0..80);
+        assert!(app.handle_key(key(KeyCode::Char('i'))).changed);
+        assert_eq!(app.inspect, Some(Cursor { row: 0, step: 0 }));
+        let bar = status(&mut app);
+        assert!(
+            bar.starts_with(" INSPECT   line 1  old col 1  new col 1   \"c\" 1 cell   U+0063"),
+            "{bar:?}"
+        );
+        // The key hints fit on a wider screen.
+        let mut wide = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let buf = wide.draw(|frame| app.render(frame)).unwrap().buffer.clone();
+        let bar = row_text(&buf, 23, 0..100);
+        assert!(bar.ends_with("hjkl move   esc done "), "{bar:?}");
+        let _ = draw(&mut app);
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Char('l')));
+        }
+        let bar = status(&mut app);
+        assert!(
+            bar.starts_with(" INSPECT   line 1  old col 4   \"\u{e9}\" 1 cell   U+00E9 "),
+            "{bar:?}"
+        );
+        app.handle_key(key(KeyCode::Char('l')));
+        let bar = status(&mut app);
+        assert!(
+            bar.starts_with(" INSPECT   line 1  new col 4   \"e\u{301}\" 1 cell   U+0065 U+0301"),
+            "{bar:?}"
+        );
+        // Display cells: "caf", gap, delete (cell 4), gap, insert
+        // (cell 6). The cursor's cell is highlighted.
+        let buf = draw_buffer(&mut app);
+        assert_eq!(buf[(7 + G, 2)].bg, Color::Cyan);
+        assert_eq!(buf[(5 + G, 2)].bg, Color::Red);
+        // The cursor stops at the last column; Esc ends inspecting.
+        assert!(!app.handle_key(key(KeyCode::Char('l'))).changed);
+        assert!(app.handle_key(key(KeyCode::Esc)).changed);
+        assert_eq!(app.inspect, None);
+        assert!(status(&mut app).starts_with(" FILES "));
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn inspect_cursor_moves_by_rows_and_stays_in_view() {
+        let (mut app, a, b) = files_app(&"x\n".repeat(50), &"y\n".repeat(50));
+        let _ = draw(&mut app);
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.inspect, Some(Cursor { row: 1, step: 0 }));
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.inspect, Some(Cursor { row: 49, step: 0 }));
+        assert_eq!(app.scroll_y, app.max_scroll_y(), "the cursor row is shown");
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!((app.inspect.unwrap().row, app.scroll_y), (0, 0));
+        // Other keys keep working; switching files ends inspecting.
+        assert!(app.handle_key(key(KeyCode::Char('q'))).quit);
+        let mut git = git_app(vec![("a\n", "b\n"), ("c\n", "d\n")]);
+        git.handle_key(key(KeyCode::Char('i')));
+        assert!(git.inspect.is_some());
+        git.handle_key(key(KeyCode::Tab));
+        assert_eq!(git.inspect, None);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn clicking_a_cell_inspects_it() {
+        let (mut app, a, b) = files_app(OLD_CPP, NEW_CPP);
+        let _ = draw(&mut app);
+        let click = MouseEventKind::Down(MouseButton::Left);
+        // Line 3 is y=4; display cell 25 ("o" of "auto main") is x=4+25.
+        assert!(app.handle_mouse(mouse(click, 29, 4)));
+        assert_eq!(app.inspect, Some(Cursor { row: 2, step: 21 }));
+        // The marker row, gutter, and separators are not cells.
+        app.inspect = None;
+        assert!(!app.handle_mouse(mouse(click, 29, 1)));
+        assert!(!app.handle_mouse(mouse(click, 2, 4)));
+        assert!(!app.handle_mouse(mouse(click, 6, 4)));
+        assert_eq!(app.inspect, None);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }

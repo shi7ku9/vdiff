@@ -118,6 +118,18 @@ follows the longest path, within 24 to 40 columns and at most two fifths of
 the screen. It starts hidden on terminals narrower than 80 columns; `e`
 overrides that choice either way.
 
+### Inspecting cells
+
+Graphemes are compared without Unicode normalization, so a column can
+change while looking the same: `é` as U+00E9 in one file and as U+0065
+U+0301 in the other. `i`, or a click on a cell, puts a cursor on a cell and
+turns the status bar into a readout of it: the file line, its column in the
+old and new file (one side only for a deleted or inserted column), the
+grapheme as drawn, its width in cells, and its code points. Graphemes with
+control characters show only their code points. The cursor moves by drawn
+column and by row, scrolling the pane to stay in view, and stops at the
+edges.
+
 ### Colors
 
 [src/theme.rs](../src/theme.rs) holds every style the TUI draws, by role:

@@ -99,12 +99,14 @@ When stdout is not a terminal, `vdiff` prints plain text instead of opening the 
 | `n` / `p` | jump to the next / previous change group |
 | `g` / `G` | scroll to top / bottom |
 | `e` | toggle the file sidebar (git mode; starts hidden below 80 columns) |
+| `i` | inspect cells: a cursor shows its cell's grapheme, code points, width, and column in each file (`h`/`j`/`k`/`l` move it, `Esc` ends) |
 | `?` | show or hide the key help (`Esc` or `q` also closes it) |
 | `q` / `Ctrl-C` | quit |
 
 The mouse works too: the wheel scrolls the diff (sideways with Shift held) or,
-over the sidebar, moves the file selection; clicking a file opens it, and
-clicking or dragging on the overview bar moves the view there. While vdiff
+over the sidebar, moves the file selection; clicking a file opens it,
+clicking a cell inspects it, and clicking or dragging on the overview bar
+moves the view there. While vdiff
 holds the mouse, most terminals still select text with Shift held.
 
 ## Documentation

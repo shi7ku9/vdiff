@@ -83,6 +83,8 @@ pub struct Theme {
     pub insert_mark: Style,
     /// The part of the overview bar the pane shows.
     pub viewport: Style,
+    /// The cell under the inspect cursor.
+    pub cursor: Style,
 }
 
 impl Theme {
@@ -142,6 +144,7 @@ impl Theme {
             delete_mark: fg(p.deleted),
             insert_mark: fg(p.added),
             viewport: fg(p.accent),
+            cursor: badge(p.accent),
         }
     }
 
@@ -176,6 +179,7 @@ impl Theme {
             delete_mark: Style::new(),
             insert_mark: Style::new(),
             viewport: bold,
+            cursor: reversed.add_modifier(Modifier::BOLD),
         }
     }
 }
