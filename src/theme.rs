@@ -77,9 +77,12 @@ pub struct Theme {
     pub added: Style,
     pub deleted: Style,
     pub renamed: Style,
-    /// Deleted and inserted column counts.
-    pub delete_count: Style,
-    pub insert_count: Style,
+    /// Red and green marks: the column counts and the overview bar's
+    /// change ticks.
+    pub delete_mark: Style,
+    pub insert_mark: Style,
+    /// The part of the overview bar the pane shows.
+    pub viewport: Style,
 }
 
 impl Theme {
@@ -136,8 +139,9 @@ impl Theme {
             added: fg(p.added),
             deleted: fg(p.deleted),
             renamed: fg(p.renamed),
-            delete_count: fg(p.deleted),
-            insert_count: fg(p.added),
+            delete_mark: fg(p.deleted),
+            insert_mark: fg(p.added),
+            viewport: fg(p.accent),
         }
     }
 
@@ -169,8 +173,9 @@ impl Theme {
             added: bold,
             deleted: bold,
             renamed: bold,
-            delete_count: Style::new(),
-            insert_count: Style::new(),
+            delete_mark: Style::new(),
+            insert_mark: Style::new(),
+            viewport: bold,
         }
     }
 }

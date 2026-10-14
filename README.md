@@ -48,7 +48,10 @@ In the TUI, the marker row becomes red and green tabs over the changed
 columns, labelled like git hunk headers: `-4,15` marks 15 columns starting at
 column 4 of the old file. Deleted columns are tinted red and inserted columns
 green, and a fainter tint continues each changed column down to the bottom of
-the diff pane. Line numbers stay on the left while you scroll sideways.
+the diff pane. Line numbers stay on the left while you scroll sideways, and
+when the diff is wider than the pane, an overview bar along its bottom shows
+where the changed columns are, with the part on screen bright between two
+`┃`.
 Unchanged columns stay neutral, and group separators are thin rules. A top bar
 names what is being compared and counts the changes; the status bar shows the
 visible lines and the keys worth knowing.

@@ -29,6 +29,9 @@ const SIDEBAR_MIN_FRAME_WIDTH: u16 = 80;
 /// Diff areas narrower than this leave out the line-number gutter.
 const GUTTER_MIN_AREA_WIDTH: u16 = 20;
 
+/// Panes shorter than this leave out the overview bar.
+const OVERVIEW_MIN_PANE_HEIGHT: u16 = 8;
+
 /// Display rows for the TUI: rows[0] is the marker row (one marker per
 /// grapheme column, `|` between groups, padded to the full content
 /// display width), rows[i+1] is file line i. All rows share the same
@@ -592,10 +595,28 @@ impl App {
             ..diff_area
         };
         let left = gutter.width.max(1);
-        let pane = Rect {
+        let mut pane = Rect {
             x: diff_area.x + left,
             width: diff_area.width.saturating_sub(left + 1),
             ..diff_area
+        };
+        // A diff wider than the pane gets an overview bar on the pane's
+        // last row.
+        let mut overview = None;
+        if let Some(display) = &self.display
+            && pane.height >= OVERVIEW_MIN_PANE_HEIGHT
+            && display.width > usize::from(pane.width)
+        {
+            pane.height -= 1;
+            overview = Some(Rect {
+                y: pane.bottom(),
+                height: 1,
+                ..pane
+            });
+        }
+        let gutter = Rect {
+            height: pane.height,
+            ..gutter
         };
         // Record the pane size before rendering the status bar so the
         // scroll clamps are correct on the very first frame (and not
@@ -614,6 +635,9 @@ impl App {
         }
         self.render_gutter(frame, gutter);
         self.render_diff(frame, pane);
+        if let Some(area) = overview {
+            self.render_overview(frame, area);
+        }
         self.render_top_bar(frame, top_bar);
         self.render_status(frame, status_bar);
         if self.help {
@@ -631,6 +655,56 @@ impl App {
                 digits.max(2) as u16 + 2
             }
             _ => 0,
+        }
+    }
+
+    /// A one-row map of the whole diff width: a tick where columns were
+    /// deleted or inserted (half red, half green where both meet). The
+    /// part the pane shows has bright ticks between two `┃`, drawn over
+    /// any ticks so a crowded bar still shows it; ticks outside it are
+    /// dim.
+    fn render_overview(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(display) = &self.display else {
+            return;
+        };
+        let (total, cells) = (display.width, usize::from(area.width));
+        let span = |cell: usize| {
+            let start = cell * total / cells;
+            start..((cell + 1) * total / cells).clamp(start + 1, total)
+        };
+        let view = self.scroll_x..self.scroll_x + self.pane_width;
+        let shown = |cell: usize| {
+            let span = span(cell);
+            span.start < view.end && span.end > view.start
+        };
+        let first = (0..cells).find(|&cell| shown(cell));
+        let last = (0..cells).rev().find(|&cell| shown(cell));
+        let theme = &self.theme;
+        for cell in 0..cells {
+            let kinds = &display.kinds[span(cell)];
+            let deleted = kinds.contains(&Some(StepKind::Delete));
+            let inserted = kinds.contains(&Some(StepKind::Insert));
+            let (red, green) = if shown(cell) {
+                (theme.delete_mark.fg, theme.insert_mark.fg)
+            } else {
+                (theme.delete.bg, theme.insert.bg)
+            };
+            let tick = |fg, bg| Style {
+                fg,
+                bg,
+                ..Style::new()
+            };
+            let (symbol, style) = match (deleted, inserted) {
+                _ if Some(cell) == first || Some(cell) == last => ("┃", theme.viewport),
+                (true, true) => ("▌", tick(red, green)),
+                (true, false) => ("▌", tick(red, None)),
+                (false, true) => ("▌", tick(green, None)),
+                _ if shown(cell) => ("━", theme.viewport),
+                _ => ("─", theme.rule),
+            };
+            frame
+                .buffer_mut()
+                .set_string(area.x + cell as u16, area.y, symbol, style);
         }
     }
 
@@ -2538,6 +2612,100 @@ mod tests {
             .clone();
         assert_eq!(row_text(&buf, 1, 1..9), "+3,10   ");
         assert_eq!(row_text(&buf, 2, 1..9), "23456789");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn overview_bar_maps_changes_and_the_view() {
+        // Display: delete, gap, insert, gap, then 199 matched columns:
+        // 203 cells over a 75-cell bar on the pane's last row (y=22).
+        let rest = "a".repeat(199);
+        let (mut app, a, b) = files_app(&format!("x{rest}\n"), &format!("y{rest}\n"));
+        let buf = draw_buffer(&mut app);
+        assert_eq!(app.pane_height, 21, "the bar takes a pane row");
+        // Bar cells 0 and 1 hold the delete and insert runs; the pane
+        // shows cells 0..=27, so `┃` marks both ends of that span.
+        let bar = |viewed: std::ops::RangeInclusive<usize>| -> String {
+            (0..75)
+                .map(|cell| match cell {
+                    _ if cell == *viewed.start() || cell == *viewed.end() => '┃',
+                    0 | 1 => '▌',
+                    _ if viewed.contains(&cell) => '━',
+                    _ => '─',
+                })
+                .collect()
+        };
+        assert_eq!(row_text(&buf, 22, 4..79), bar(0..=27));
+        assert_eq!(buf[(4, 22)].fg, Color::Cyan);
+        assert_eq!(buf[(5, 22)].fg, Color::Green);
+        assert_eq!(buf[(6, 22)].fg, Color::Cyan);
+        assert_eq!(buf[(40, 22)].fg, Color::DarkGray);
+        assert_eq!(row_text(&buf, 22, 0..4), "    ");
+        app.scroll_x = 128;
+        let buf = draw_buffer(&mut app);
+        assert_eq!(row_text(&buf, 22, 4..79), bar(47..=74));
+        assert_eq!(buf[(4, 22)].fg, Color::Red);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn overview_bar_marks_where_both_kinds_meet() {
+        // 304 cells over a 25-cell bar: the first bar cell covers both
+        // the delete and the insert run. Scrolled away from it, it is
+        // not a `┃` end.
+        let rest = "a".repeat(300);
+        let (mut app, a, b) = files_app(&format!("x{rest}\n"), &format!("y{rest}\n"));
+        let mut small = Terminal::new(TestBackend::new(30, 12)).unwrap();
+        app.scroll_x = 200;
+        let buf = small
+            .draw(|frame| app.render(frame))
+            .unwrap()
+            .buffer
+            .clone();
+        assert_eq!(buf[(4, 10)].symbol(), "▌");
+        assert_eq!(buf[(4, 10)].fg, Color::Red);
+        assert_eq!(buf[(4, 10)].bg, Color::Green);
+        assert_eq!(buf[(5, 10)].symbol(), "─");
+        // A pane under eight rows keeps them all for the diff.
+        let mut short = Terminal::new(TestBackend::new(30, 9)).unwrap();
+        let buf = short
+            .draw(|frame| app.render(frame))
+            .unwrap()
+            .buffer
+            .clone();
+        assert_eq!(app.pane_height, 7);
+        assert!(!row_text(&buf, 7, 0..30).contains('━'));
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn overview_ticks_outside_the_view_are_dim() {
+        let theme = Theme::new(ColorDepth::TrueColor);
+        let rest = "a".repeat(199);
+        let (mut app, a, b) =
+            files_app_with(&format!("x{rest}\n"), &format!("y{rest}\n"), theme.clone());
+        app.scroll_x = 128;
+        let buf = draw_buffer(&mut app);
+        assert_eq!(buf[(4, 22)].fg, theme.delete.bg.unwrap());
+        assert_eq!(buf[(5, 22)].fg, theme.insert.bg.unwrap());
+        app.scroll_x = 1;
+        let buf = draw_buffer(&mut app);
+        assert_eq!(buf[(5, 22)].symbol(), "▌");
+        assert_eq!(buf[(5, 22)].fg, theme.insert_mark.fg.unwrap());
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn no_overview_bar_when_the_diff_fits() {
+        let (mut app, a, b) = files_app(OLD_CPP, NEW_CPP);
+        let buf = draw_buffer(&mut app);
+        assert_eq!(app.pane_height, 22);
+        let row = row_text(&buf, 22, 0..80);
+        assert!(!row.contains('━') && !row.contains('─'), "{row:?}");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }

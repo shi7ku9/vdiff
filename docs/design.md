@@ -91,6 +91,16 @@ while the diff scrolls sideways. The numbers are muted, and `~` marks the
 rows below the file. Diff areas narrower than 20 columns leave out the
 gutter.
 
+### Overview bar
+
+When the diff is wider than the pane, the pane's last row becomes a map of
+the whole diff width. Each bar cell covers an equal share of the display
+cells and shows a red tick for deleted columns, a green tick for inserted
+ones, or a half-red, half-green tick for both. The part the pane shows lies
+between two `┃`, which are drawn over any ticks so a crowded bar still shows
+it; its ticks are bright and the rest are dim. Panes shorter than eight rows
+leave out the bar.
+
 ### Screen layout
 
 The diff pane sits between a one-row top bar and a one-row status bar, with

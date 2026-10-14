@@ -91,9 +91,9 @@ impl App {
         spans.extend([
             Span::styled(format!("{} change{plural}", stats.changes), theme.muted),
             Span::raw("   "),
-            Span::styled(format!("-{}", stats.deleted), theme.delete_count),
+            Span::styled(format!("-{}", stats.deleted), theme.delete_mark),
             Span::raw(" "),
-            Span::styled(format!("+{}", stats.inserted), theme.insert_count),
+            Span::styled(format!("+{}", stats.inserted), theme.insert_mark),
             Span::styled(" cols", theme.muted),
         ]);
         spans
