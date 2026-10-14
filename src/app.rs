@@ -2861,22 +2861,54 @@ mod tests {
 
     #[test]
     fn changes_near_the_end_share_the_last_stop() {
+        // One change early on, two that cannot get their context because
+        // the diff ends soon after them.
+        let (early, late) = ("p".repeat(10), "p".repeat(20));
+        let (mut app, a, b) = files_app(
+            &format!("{early}x{late}xAAx\n"),
+            &format!("{early}y{late}yAAy\n"),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(16, 6)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let max = app.max_scroll_x();
+        let starts: Vec<usize> = app
+            .display
+            .as_ref()
+            .unwrap()
+            .changes
+            .iter()
+            .map(|c| c.cells().start)
+            .collect();
+        assert_eq!(starts.len(), 3);
+        assert!(starts[0] - CHANGE_CONTEXT < max && starts[1] - CHANGE_CONTEXT >= max);
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.scroll_x, starts[0] - CHANGE_CONTEXT);
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.scroll_x, max);
+        // Both late changes are in view there, so the next n wraps
+        // around instead of sticking at the end.
+        assert!(starts[1..].iter().all(|&start| start >= max));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.scroll_x, starts[0] - CHANGE_CONTEXT);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.scroll_x, 0);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.scroll_x, max);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn n_stays_put_when_every_change_shares_the_last_stop() {
         let prefix = "p".repeat(30);
         let (mut app, a, b) = files_app(&format!("{prefix}xAAx\n"), &format!("{prefix}yAAy\n"));
         let mut terminal = Terminal::new(TestBackend::new(16, 6)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let max = app.max_scroll_x();
-        assert!(max > 0);
         app.handle_key(key(KeyCode::Char('n')));
         assert_eq!(app.scroll_x, max);
-        // Both changes are in view there, so n stays put instead of
-        // scrolling past the end.
-        let display = app.display.as_ref().unwrap();
-        assert_eq!(display.changes.len(), 2);
-        assert!(display.changes.iter().all(|c| c.cells().start >= max));
+        // Every change is in view, so wrapping to the first lands here.
         assert!(!app.handle_key(key(KeyCode::Char('n'))).changed);
-        app.handle_key(key(KeyCode::Char('p')));
-        assert_eq!(app.scroll_x, 0);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
