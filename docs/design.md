@@ -85,9 +85,11 @@ changed.
 
 `n` and `p` scroll sideways to the next or previous change, counted from the
 pane's left edge, and leave the vertical scroll alone so that jumping does
-not point at changed lines either. A change lands three cells from the left
-edge, after a little of the unchanged text before it, so its delete run is in
-view. Changes that would scroll past the end of the diff share the last stop.
+not point at changed lines either. A change usually lands three cells from
+the left edge, after a little of the unchanged text before it, so its delete
+run is in view. Narrow panes reduce this context to leave room for the first
+complete displayed cell. Changes that would scroll past the end of the diff
+share the last stop.
 Past the last change, `n` wraps to the first; before the first, `p` returns
 to the left edge, then wraps to the last.
 

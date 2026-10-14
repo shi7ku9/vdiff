@@ -39,7 +39,7 @@ const OVERVIEW_MIN_PANE_HEIGHT: u16 = 8;
 const WHEEL_ROWS: usize = 3;
 const WHEEL_CELLS: usize = 6;
 
-/// Unchanged cells `n`/`p` leave to the left of the change they jump to.
+/// Maximum context cells `n`/`p` leave to the left of a change.
 const CHANGE_CONTEXT: usize = 3;
 
 /// Display rows for the TUI: rows[0] is the marker row (one marker per
@@ -1304,7 +1304,18 @@ impl App {
         let stops: Vec<usize> = display
             .changes
             .iter()
-            .map(|change| change.cells().start.saturating_sub(CHANGE_CONTEXT).min(max))
+            .map(|change| {
+                let (_, run) = change.runs().next().expect("a change has at least one run");
+                let cells = &display.places[run.steps.start].cells;
+                // Reserve the first changed column's full display width.
+                // Before the first render, the pane size is still unknown.
+                let context = if self.pane_width == 0 {
+                    CHANGE_CONTEXT
+                } else {
+                    CHANGE_CONTEXT.min(self.pane_width.saturating_sub(cells.len()))
+                };
+                cells.start.saturating_sub(context).min(max)
+            })
             .collect();
         if stops.is_empty() {
             return;
@@ -2809,6 +2820,53 @@ mod tests {
         assert_eq!(app.scroll_y, 2);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn n_p_keep_target_cells_visible_in_narrow_panes() {
+        let prefix = "p".repeat(10);
+        let tail = "z".repeat(50);
+        for (width, old, new, expected, color) in [
+            (3, "x", "y", "x", Color::Red),
+            (5, "x", "y", "x", Color::Red),
+            (4, "中", "文", "中", Color::Red),
+            (6, "中", "文", "中", Color::Red),
+            (6, "👩‍❤️‍👩", "👨‍👩‍👧", "👩‍❤️‍👩", Color::Red),
+            (9, "\r", "\u{7}", "U+000D", Color::Red),
+            (5, "x", "", "x", Color::Red),
+            (5, "", "y", "y", Color::Green),
+            (6, "", "中", "中", Color::Green),
+        ] {
+            let (mut app, a, b) = files_app(
+                &format!("{prefix}{old}{tail}\n"),
+                &format!("{prefix}{new}{tail}\n"),
+            );
+            let mut terminal = Terminal::new(TestBackend::new(width, 6)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            for jump in ['n', 'p'] {
+                // n visits the only change; p wraps to it from the left edge.
+                app.scroll_x = 0;
+                app.handle_key(key(KeyCode::Char(jump)));
+                let buf = terminal.draw(|frame| app.render(frame)).unwrap().buffer;
+                let row = row_text(buf, 2, 1..width - 1);
+                assert!(
+                    row.contains(expected),
+                    "{jump} must show {expected:?} at terminal width {width}, got {row:?}"
+                );
+                let first = expected.graphemes(true).next().unwrap();
+                let x = (1..width - 1)
+                    .find(|&x| buf[(x, 2)].symbol() == first)
+                    .unwrap();
+                assert_eq!(buf[(x, 2)].bg, color);
+                assert_eq!(
+                    buf[(x, 1)].symbol(),
+                    if color == Color::Red { "-" } else { "+" }
+                );
+                assert_column_backgrounds_align(buf);
+            }
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+        }
     }
 
     #[test]
