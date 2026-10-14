@@ -39,6 +39,9 @@ const OVERVIEW_MIN_PANE_HEIGHT: u16 = 8;
 const WHEEL_ROWS: usize = 3;
 const WHEEL_CELLS: usize = 6;
 
+/// Unchanged cells `n`/`p` leave to the left of the change they jump to.
+const CHANGE_CONTEXT: usize = 3;
+
 /// Display rows for the TUI: rows[0] is the marker row (one marker per
 /// grapheme column, `|` between groups, padded to the full content
 /// display width), rows[i+1] is file line i. All rows share the same
@@ -83,9 +86,6 @@ struct Display {
     columns: Vec<DisplayColumn>,
     /// Shared diff kind per display cell; `None` denotes a separator.
     kinds: Vec<Option<StepKind>>,
-    /// Actual end offsets, including the following separator if present.
-    /// Change navigation uses the same layout as the displayed columns.
-    group_end_offsets: Vec<usize>,
     /// Layout width shared by rows when cells are drawn independently.
     width: usize,
     /// Changes in display order.
@@ -225,7 +225,6 @@ fn build_display(grid: &DiffGrid) -> Display {
     let mut rows: Vec<String> = (0..grid.height).map(|_| String::new()).collect();
     let mut kinds = Vec::new();
     let mut columns = Vec::new();
-    let mut group_end_offsets = Vec::with_capacity(grid.groups.len());
     // Each group's run, or `None` for a match group.
     let mut runs: Vec<Option<Run>> = Vec::with_capacity(grid.groups.len());
     let mut places = Vec::with_capacity(grid.steps.len());
@@ -301,7 +300,6 @@ fn build_display(grid: &DiffGrid) -> Display {
                 row.push('|');
             }
         }
-        group_end_offsets.push(kinds.len());
     }
     let changes = change_groups(grid)
         .into_iter()
@@ -318,7 +316,6 @@ fn build_display(grid: &DiffGrid) -> Display {
         rows: out,
         columns,
         kinds,
-        group_end_offsets,
         width,
         changes,
         places,
@@ -1129,8 +1126,8 @@ impl App {
             // vim convention: g = top, G = bottom.
             KeyCode::Char('g') => self.scroll_y = 0,
             KeyCode::Char('G') => self.scroll_y = self.max_scroll_y(),
-            KeyCode::Char('n') => self.jump_group(1),
-            KeyCode::Char('p') => self.jump_group(-1),
+            KeyCode::Char('n') => self.jump_change(1),
+            KeyCode::Char('p') => self.jump_change(-1),
             KeyCode::Char('h') => self.scroll_x = self.scroll_x.saturating_sub(1),
             KeyCode::Char('l') => self.scroll_x = (self.scroll_x + 1).min(self.max_scroll_x()),
             KeyCode::Char('j') => self.scroll_y = (self.scroll_y + 1).min(self.max_scroll_y()),
@@ -1296,77 +1293,47 @@ impl App {
         }
     }
 
-    /// Jump to the next (dir=1) or previous (dir=-1) change group.
-    fn jump_group(&mut self, dir: i32) {
-        let Some(grid) = &self.grid else { return };
-        // Change groups: runs of non-Match steps (kind != Match).
-        let change_groups: Vec<usize> = grid
-            .groups
+    /// Scroll sideways to the next (`dir` > 0) or previous change,
+    /// counted from the pane's left edge. The vertical scroll stays put,
+    /// so jumping never hints at which lines changed.
+    fn jump_change(&mut self, dir: i32) {
+        let Some(display) = &self.display else { return };
+        let max = self.max_scroll_x();
+        // Where each change puts the pane's left edge. Changes near the
+        // end clamp to the same stop, and all of them are in view there.
+        let stops: Vec<usize> = display
+            .changes
             .iter()
-            .enumerate()
-            .filter(|(_, g)| grid.steps[g.start].kind != StepKind::Match)
-            .map(|(i, _)| i)
+            .map(|change| change.cells().start.saturating_sub(CHANGE_CONTEXT).min(max))
             .collect();
-        if change_groups.is_empty() {
+        if stops.is_empty() {
             return;
         }
-        // Anchor row of each change group: the first affected file row.
-        let ranges: Vec<std::ops::Range<usize>> = change_groups
-            .iter()
-            .map(|&i| grid.groups[i].clone())
-            .collect();
-        let rows: Vec<usize> = ranges
-            .iter()
-            .map(|g| first_affected_row(grid, g).unwrap_or(usize::MAX))
-            .collect();
-        // All grid reads above are done; below we only mutate scrolls.
         let target = if dir > 0 {
-            // Next change group after the current scroll row; at the
-            // bottom (nothing below) wrap around to the first one.
-            ranges
+            // Past the last change, wrap around to the first.
+            stops
                 .iter()
-                .zip(&rows)
-                .find(|(_, r)| **r > self.scroll_y)
-                .map(|(g, _)| g.clone())
-                .or_else(|| ranges.first().cloned())
+                .copied()
+                .find(|&x| x > self.scroll_x)
+                .or(stops.first().copied())
         } else {
-            // Previous change group before the current scroll row.
-            ranges
+            // Before the first change, go back to the left edge; from
+            // there, wrap around to the last change.
+            stops
                 .iter()
-                .zip(&rows)
+                .copied()
                 .rev()
-                .find(|(_, r)| **r < self.scroll_y)
-                .map(|(g, _)| g.clone())
-                .or_else(|| {
-                    if self.scroll_y == 0 && self.scroll_x == 0 {
-                        // At the very top: wrap to the last group.
-                        ranges.last().cloned()
-                    } else {
-                        // Already at the first change group: back to the top.
-                        None
-                    }
+                .find(|&x| x < self.scroll_x)
+                .or(if self.scroll_x == 0 {
+                    stops.last().copied()
+                } else {
+                    Some(0)
                 })
         };
-        let Some(group) = target else {
-            self.scroll_y = 0;
-            self.scroll_x = 0;
-            return;
-        };
-        let Some(grid) = &self.grid else { return };
-        if let (Some(row), Some(display)) = (first_affected_row(grid, &group), &self.display) {
-            let group_index = grid.groups.partition_point(|g| g.start < group.start);
-            self.scroll_y = row.min(self.max_scroll_y());
-            self.scroll_x = display.group_end_offsets[group_index].min(self.max_scroll_x());
+        if let Some(x) = target {
+            self.scroll_x = x;
         }
     }
-}
-
-/// The first file line where any cell in the group contains non-padding text.
-fn first_affected_row(grid: &DiffGrid, group: &std::ops::Range<usize>) -> Option<usize> {
-    grid.steps[group.clone()]
-        .iter()
-        .filter_map(|step| step.content.first_non_padding_row())
-        .min()
 }
 
 pub fn run_tui(cli: &crate::cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -1534,7 +1501,7 @@ mod tests {
         let grid = compute("e\u{301}\n", "e\u{308}\n");
         let display = build_display(&grid);
         assert_eq!(display.rows, ["-|+", "e\u{301}|e\u{308}"]);
-        assert_eq!(display.group_end_offsets, [2, 3]);
+        assert_eq!(display.changes[0].cells(), 0..3);
         let (mut app, a, b) = files_app("e\u{301}\n", "e\u{308}\n");
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
@@ -1668,7 +1635,8 @@ mod tests {
         let grid = compute("\rx", "\u{7}x");
         let display = build_display(&grid);
         assert_eq!(display.rows, ["-     |+     | ", "U+000D|U+0007|x"]);
-        assert_eq!(display.group_end_offsets, [7, 14, 15]);
+        assert_eq!(display.changes[0].cells(), 0..13);
+        assert_eq!(display.width, 15);
         let (mut app, a, b) = files_app("\rx", "\u{7}x");
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
@@ -1744,15 +1712,21 @@ mod tests {
             &format!("q\r\u{301}{suffix}\n"),
             &format!("q\r\u{308}{suffix}\n"),
         );
-        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-        assert_eq!(app.scroll_x, 4);
+        // The change starts at cell 2, within CHANGE_CONTEXT of the left
+        // edge, so jumping to it from further right scrolls back to 0.
+        app.scroll_x = 20;
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.scroll_x, 0);
         let mut terminal = Terminal::new(TestBackend::new(12, 6)).unwrap();
         let buf = terminal.draw(|frame| app.render(frame)).unwrap().buffer;
         assert_column_backgrounds_align(buf);
-        assert_eq!(buf[(1, 1)].symbol(), "+");
-        assert_eq!(buf[(1, 2)].symbol(), "◌\u{308}");
-        assert_eq!(buf[(1, 2)].bg, Color::Green);
-        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(buf[(3, 1)].symbol(), "-");
+        assert_eq!(buf[(3, 2)].symbol(), "◌\u{301}");
+        assert_eq!(buf[(3, 2)].bg, Color::Red);
+        assert_eq!(buf[(5, 1)].symbol(), "+");
+        assert_eq!(buf[(5, 2)].symbol(), "◌\u{308}");
+        assert_eq!(buf[(5, 2)].bg, Color::Green);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert_eq!(app.scroll_x, 0);
         let buf = draw_buffer(&mut app);
         assert_column_backgrounds_align(&buf);
@@ -2116,7 +2090,7 @@ mod tests {
         for row in &display.rows {
             assert_eq!(rendered_width(row), display.width);
         }
-        assert_eq!(display.width, *display.group_end_offsets.last().unwrap());
+        assert_eq!(display.width, 7);
     }
 
     #[test]
@@ -2245,17 +2219,23 @@ mod tests {
             &format!("{prefix}y{suffix}\n"),
         );
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-        assert_eq!(app.scroll_x, 19); // 16 prefix cells + |x|
+        // 16 prefix cells and a separator put the change at cell 17.
+        assert_eq!(app.scroll_x, 17 - CHANGE_CONTEXT);
         let mut terminal = Terminal::new(TestBackend::new(12, 6)).unwrap();
         let buf = terminal.draw(|frame| app.render(frame)).unwrap().buffer;
         assert_column_backgrounds_align(buf);
         assert_eq!(
-            app.scroll_x, 19,
+            app.scroll_x,
+            17 - CHANGE_CONTEXT,
             "trailing context must prevent scroll clamping"
         );
-        assert_eq!(buf[(1, 1)].symbol(), "+");
-        assert_eq!(buf[(1, 2)].symbol(), "y");
-        assert_eq!(buf[(1, 2)].bg, Color::Green);
+        assert_eq!(buf[(1, 2)].symbol(), "👩‍❤️‍👩");
+        assert_eq!(buf[(4, 1)].symbol(), "-");
+        assert_eq!(buf[(4, 2)].symbol(), "x");
+        assert_eq!(buf[(4, 2)].bg, Color::Red);
+        assert_eq!(buf[(6, 1)].symbol(), "+");
+        assert_eq!(buf[(6, 2)].symbol(), "y");
+        assert_eq!(buf[(6, 2)].bg, Color::Green);
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
         assert_eq!(app.scroll_x, 0);
         let _ = std::fs::remove_file(&a);
@@ -2816,29 +2796,102 @@ mod tests {
     }
 
     #[test]
-    fn n_p_jump_to_change_groups() {
+    fn n_p_scroll_only_sideways() {
         let (mut app, a, b) = files_app("foo\nbar baz\nquux\n", "foo\nbar qaz\nquux\n");
+        app.scroll_y = 2;
         app.handle_key(key(KeyCode::Char('n')));
-        // change group (del+ins) starts at display width 7 (4 steps × 1 cell + 3 separators)
-        assert_eq!(app.scroll_x, 7);
-        assert_eq!(app.scroll_y, 1); // first affected row is line 1 ("bar ...")
+        // The change (|b|q|) starts at cell 5, after "bar " and a separator.
+        assert_eq!(app.display.as_ref().unwrap().changes[0].cells(), 5..8);
+        assert_eq!(app.scroll_x, 5 - CHANGE_CONTEXT);
+        assert_eq!(app.scroll_y, 2, "jumping must not hint at changed lines");
         app.handle_key(key(KeyCode::Char('p')));
         assert_eq!(app.scroll_x, 0);
-        assert_eq!(app.scroll_y, 0);
+        assert_eq!(app.scroll_y, 2);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
 
     #[test]
-    fn group_end_offset_has_no_phantom_trailing_separator() {
+    fn n_p_visit_every_change_on_one_line_with_its_deletion_in_view() {
+        // Three changes on the same line, then enough text to scroll to
+        // each of them without clamping.
+        let gap = "A".repeat(10);
+        let tail = "z".repeat(100);
+        let (mut app, a, b) = files_app(
+            &format!("ppppp1{gap}2{gap}3{tail}\n"),
+            &format!("ppppp4{gap}5{gap}6{tail}\n"),
+        );
+        let _ = draw_buffer(&mut app);
+        let starts: Vec<usize> = app
+            .display
+            .as_ref()
+            .unwrap()
+            .changes
+            .iter()
+            .map(|c| c.cells().start)
+            .collect();
+        assert_eq!(starts.len(), 3);
+        // The deleted cell sits CHANGE_CONTEXT cells into the pane, with
+        // the inserted one two cells after it.
+        let left = G + 1 + CHANGE_CONTEXT as u16;
+        for (start, (old, new)) in starts.iter().zip([("1", "4"), ("2", "5"), ("3", "6")]) {
+            app.handle_key(key(KeyCode::Char('n')));
+            assert_eq!(app.scroll_x, start - CHANGE_CONTEXT);
+            let buf = draw_buffer(&mut app);
+            assert_eq!(buf[(left, 1)].symbol(), "-");
+            assert_eq!(buf[(left, 2)].symbol(), old);
+            assert_eq!(buf[(left, 2)].bg, Color::Red);
+            assert_eq!(buf[(left + 2, 1)].symbol(), "+");
+            assert_eq!(buf[(left + 2, 2)].symbol(), new);
+        }
+        // Past the last change, n wraps around to the first.
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.scroll_x, starts[0] - CHANGE_CONTEXT);
+        // p walks back, returns to the left edge, then wraps to the last.
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.scroll_x, starts[0] - CHANGE_CONTEXT);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.scroll_x, 0);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.scroll_x, starts[2] - CHANGE_CONTEXT);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn changes_near_the_end_share_the_last_stop() {
+        let prefix = "p".repeat(30);
+        let (mut app, a, b) = files_app(&format!("{prefix}xAAx\n"), &format!("{prefix}yAAy\n"));
+        let mut terminal = Terminal::new(TestBackend::new(16, 6)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let max = app.max_scroll_x();
+        assert!(max > 0);
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.scroll_x, max);
+        // Both changes are in view there, so n stays put instead of
+        // scrolling past the end.
+        let display = app.display.as_ref().unwrap();
+        assert_eq!(display.changes.len(), 2);
+        assert!(display.changes.iter().all(|c| c.cells().start >= max));
+        assert!(!app.handle_key(key(KeyCode::Char('n'))).changed);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.scroll_x, 0);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn layout_has_no_phantom_trailing_separator() {
         // Only the final column differs ("aa" → "ab"): steps Match,
         // Delete, Insert; the insert group ends at the last step, where
-        // build_rows draws no trailing `|`. Navigation offsets must not
-        // count a phantom separator after it (total width 3 steps × 1 +
-        // 2 real separators = 5; without the guard it would be 6).
+        // build_rows draws no trailing `|`. The layout must not count a
+        // phantom separator after it (total width 3 steps × 1 + 2 real
+        // separators = 5; without the guard it would be 6).
         let grid = compute("aa\n", "ab\n");
         let display = build_display(&grid);
-        assert_eq!(display.group_end_offsets, [2, 4, 5]);
+        assert_eq!(display.width, 5);
+        assert_eq!(display.changes[0].cells(), 2..5);
     }
 
     const OLD_CPP: &str =
