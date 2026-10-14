@@ -224,10 +224,11 @@ impl App {
             Span::styled("esc", theme.key),
             Span::styled(" done", theme.muted),
         ]);
-        let hints_width = hints.width() as u16;
-        if spans_width(&left) as u16 + hints_width + 3 <= area.width {
-            let x = area.right() - hints_width - 1;
-            buf.set_line(x, area.y, &hints, hints_width);
+        // Fit in usize: a long grapheme's code points can outgrow u16.
+        let hints_width = hints.width();
+        if spans_width(&left) + hints_width + 3 <= usize::from(area.width) {
+            let x = area.right() - hints_width as u16 - 1;
+            buf.set_line(x, area.y, &hints, hints_width as u16);
         }
     }
 

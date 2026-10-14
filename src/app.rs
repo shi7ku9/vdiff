@@ -649,10 +649,24 @@ impl App {
         }
     }
 
-    /// Remember a file's counts for the sidebar.
+    /// Remember a file's counts for the sidebar, from the diff on
+    /// screen.
     fn record_stats(&mut self, index: usize, stats: FileStats) {
         if let Some(slot) = self.file_stats.get_mut(index) {
             *slot = Some(stats);
+        }
+    }
+
+    /// Take a background count only for a file without one: a file
+    /// loaded since may have changed after the worker read it, and its
+    /// counts must match the diff that was shown.
+    fn fill_stats(&mut self, index: usize, stats: FileStats) -> bool {
+        match self.file_stats.get_mut(index) {
+            Some(slot @ None) => {
+                *slot = Some(stats);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1384,10 +1398,7 @@ pub fn run_tui_app(app: &mut App) -> io::Result<()> {
                 let mut counted = false;
                 loop {
                     match receiver.try_recv() {
-                        Ok((index, stats)) => {
-                            app.record_stats(index, stats);
-                            counted = true;
-                        }
+                        Ok((index, stats)) => counted |= app.fill_stats(index, stats),
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                             counts = None;
@@ -3285,6 +3296,36 @@ mod tests {
         let mut git = git_app(vec![("ab\n", "a\n"), ("x\n", "y\n")]);
         let buf = draw_buffer(&mut git);
         assert_eq!(row_text(&buf, 2, 0..24), format!("▌M  f0.txt{:>13} ", "-1"));
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn background_counts_do_not_replace_shown_ones() {
+        let mut app = git_app(vec![("foo\n", "bar\n"), ("x\n", "y\n")]);
+        let shown = app.file_stats[0];
+        assert!(shown.is_some());
+        assert!(!app.fill_stats(0, FileStats::Binary));
+        assert_eq!(app.file_stats[0], shown);
+        assert!(app.fill_stats(1, FileStats::Binary));
+        assert!(!app.fill_stats(1, FileStats::Failed));
+        assert_eq!(app.file_stats[1], Some(FileStats::Binary));
+        // Loading a file counts it again from the shown diff.
+        app.handle_key(key(KeyCode::Tab));
+        assert!(matches!(app.file_stats[1], Some(FileStats::Counted(_))));
+    }
+
+    #[test]
+    fn inspect_status_survives_huge_graphemes() {
+        // One grapheme with thousands of combining marks: its code
+        // points alone are far wider than u16.
+        let old = format!("a{}\n", "\u{301}".repeat(9352));
+        let (mut app, a, b) = files_app(&old, "b\n");
+        let _ = draw(&mut app);
+        app.handle_key(key(KeyCode::Char('i')));
+        let bar = row_text(&draw_buffer(&mut app), 23, 0..80);
+        assert!(bar.starts_with(" INSPECT "), "{bar:?}");
+        assert!(!bar.contains("esc done"), "{bar:?}");
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }

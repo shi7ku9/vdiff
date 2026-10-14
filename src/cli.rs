@@ -27,7 +27,6 @@ pub enum Command {
         #[arg(long)]
         cached: bool,
         /// Revisions passed through to git diff, e.g. HEAD^, A..B, A...B
-        #[arg(allow_hyphen_values = true)]
         revs: Vec<String>,
     },
 }
@@ -70,7 +69,6 @@ enum RawCommand {
         #[arg(long)]
         cached: bool,
         /// Revisions passed through to git diff, e.g. HEAD^, A..B, A...B
-        #[arg(allow_hyphen_values = true)]
         revs: Vec<String>,
     },
 }
@@ -176,6 +174,24 @@ mod tests {
         let cli = Cli::parse_from(["vdiff", "a.txt", "b.txt", "--theme=light-colorblind"]);
         assert_eq!(cli.theme, Scheme::LightColorblind);
         assert!(Cli::try_parse_from(["vdiff", "--theme", "sepia", "a.txt", "b.txt"]).is_err());
+    }
+
+    #[test]
+    fn options_after_revisions_stay_options() {
+        let cli = Cli::parse_from(["vdiff", "git", "HEAD", "--theme", "light"]);
+        assert_eq!(cli.theme, Scheme::Light);
+        assert!(matches!(cli.command, Command::Git { revs, .. } if revs == vec!["HEAD"]));
+        let cli = Cli::parse_from([
+            "vdiff",
+            "git",
+            "A..B",
+            "--theme=light-colorblind",
+            "--cached",
+        ]);
+        assert_eq!(cli.theme, Scheme::LightColorblind);
+        assert!(matches!(cli.command, Command::Git { cached: true, revs } if revs == vec!["A..B"]));
+        // Unknown options are errors, not revisions handed to git.
+        assert!(Cli::try_parse_from(["vdiff", "git", "HEAD", "--output=x"]).is_err());
     }
 
     #[test]
