@@ -1,3 +1,4 @@
+use crate::theme::Scheme;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -12,6 +13,8 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub struct Cli {
     pub command: Command,
+    /// Colors for the TUI.
+    pub theme: Scheme,
 }
 
 #[derive(Debug, Subcommand)]
@@ -44,6 +47,15 @@ struct RawCli {
     file1: Option<PathBuf>,
     #[arg(value_name = "FILE2")]
     file2: Option<PathBuf>,
+    /// TUI colors: dark or light terminal, red/green or orange/blue
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        env = "VDIFF_THEME",
+        default_value_t = Scheme::Dark
+    )]
+    theme: Scheme,
     #[command(subcommand)]
     command: Option<RawCommand>,
 }
@@ -68,6 +80,7 @@ impl From<RawCli> for Cli {
         match raw.command {
             Some(RawCommand::Git { cached, revs }) => Cli {
                 command: Command::Git { cached, revs },
+                theme: raw.theme,
             },
             // Bare `vdiff` (no args) falls through to files mode with
             // empty paths; `run_plain` then prints a usage hint
@@ -77,6 +90,7 @@ impl From<RawCli> for Cli {
                     file1: raw.file1.unwrap_or_default(),
                     file2: raw.file2.unwrap_or_default(),
                 },
+                theme: raw.theme,
             },
         }
     }
@@ -147,6 +161,21 @@ mod tests {
         assert!(
             matches!(cli.command, Command::Git { cached: false, revs } if revs == vec!["xx...xx"])
         );
+    }
+
+    #[test]
+    fn parses_theme_in_either_mode() {
+        let cli = Cli::parse_from(["vdiff", "a.txt", "b.txt"]);
+        assert_eq!(cli.theme, Scheme::Dark);
+        let cli = Cli::parse_from(["vdiff", "--theme", "light", "a.txt", "b.txt"]);
+        assert_eq!(cli.theme, Scheme::Light);
+        assert!(matches!(cli.command, Command::Files { .. }));
+        let cli = Cli::parse_from(["vdiff", "git", "--theme", "dark-colorblind", "HEAD^"]);
+        assert_eq!(cli.theme, Scheme::DarkColorblind);
+        assert!(matches!(cli.command, Command::Git { revs, .. } if revs == vec!["HEAD^"]));
+        let cli = Cli::parse_from(["vdiff", "a.txt", "b.txt", "--theme=light-colorblind"]);
+        assert_eq!(cli.theme, Scheme::LightColorblind);
+        assert!(Cli::try_parse_from(["vdiff", "--theme", "sepia", "a.txt", "b.txt"]).is_err());
     }
 
     #[test]

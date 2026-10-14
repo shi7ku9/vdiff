@@ -134,7 +134,11 @@ edges.
 
 [src/theme.rs](../src/theme.rs) holds every style the TUI draws, by role:
 the tab, cell, and fill styles per change kind, separators, muted text,
-badges, and the sidebar selection. The theme is chosen by color depth:
+badges, and the sidebar selection. A theme is built from a scheme and a
+color depth. The scheme comes from `--theme` or `VDIFF_THEME`: `dark` (the
+default) and `light` use red and green, while `dark-colorblind` and
+`light-colorblind` use orange and blue from the Okabe–Ito palette with a
+neutral accent. The color depth is detected:
 
 - 24-bit color when `COLORTERM` is `truecolor` or `24bit`, or in Windows
   Terminal (`WT_SESSION`).

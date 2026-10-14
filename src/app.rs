@@ -1289,7 +1289,7 @@ fn first_affected_row(grid: &DiffGrid, group: &std::ops::Range<usize>) -> Option
 
 pub fn run_tui(cli: &crate::cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
     let source = DiffSource::from_cli(cli)?;
-    let mut app = App::new(source, Theme::detect());
+    let mut app = App::new(source, Theme::detect(cli.theme));
     run_tui_app(&mut app)?;
     Ok(())
 }
@@ -1376,7 +1376,7 @@ pub fn slice_by_width(s: &str, start: usize, max_width: usize) -> (String, usize
 mod tests {
     use super::*;
     use crate::diff::compute;
-    use crate::theme::ColorDepth;
+    use crate::theme::{ColorDepth, Scheme};
     use ratatui::style::{Color, Modifier};
     use unicode_width::UnicodeWidthStr;
 
@@ -1732,7 +1732,7 @@ mod tests {
     const G: u16 = 3;
 
     fn ansi16() -> Theme {
-        Theme::new(ColorDepth::Ansi16)
+        Theme::new(ColorDepth::Ansi16, Scheme::Dark)
     }
 
     fn files_app(old: &str, new: &str) -> (App, std::path::PathBuf, std::path::PathBuf) {
@@ -2771,7 +2771,7 @@ mod tests {
 
     #[test]
     fn true_color_separates_tabs_cells_and_fill() {
-        let theme = Theme::new(ColorDepth::TrueColor);
+        let theme = Theme::new(ColorDepth::TrueColor, Scheme::Dark);
         let (mut app, a, b) = files_app_with("foo\nbar baz\n", "foo\nbar qaz\n", theme.clone());
         let buf = draw_buffer(&mut app);
         // The gutter takes x=0..=3. Marker row y=1, file rows y=2..=3,
@@ -2936,7 +2936,7 @@ mod tests {
 
     #[test]
     fn overview_ticks_outside_the_view_are_dim() {
-        let theme = Theme::new(ColorDepth::TrueColor);
+        let theme = Theme::new(ColorDepth::TrueColor, Scheme::Dark);
         let rest = "a".repeat(199);
         let (mut app, a, b) =
             files_app_with(&format!("x{rest}\n"), &format!("y{rest}\n"), theme.clone());
@@ -3133,7 +3133,7 @@ mod tests {
         let (mut app, a, b) = files_app_with(
             "foo\nbar baz\n",
             "foo\nbar qaz\n",
-            Theme::new(ColorDepth::NoColor),
+            Theme::new(ColorDepth::NoColor, Scheme::Dark),
         );
         let buf = draw_buffer(&mut app);
         for y in 0..24 {
