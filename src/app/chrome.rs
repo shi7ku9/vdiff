@@ -301,6 +301,13 @@ impl App {
             ));
         }
         sections.push((
+            "Mouse",
+            vec![
+                ("wheel", "scroll, sideways with Shift"),
+                ("click", "pick a file or an overview spot"),
+            ],
+        ));
+        sections.push((
             "General",
             vec![("?", "show / hide this help"), ("q", "quit")],
         ));

@@ -11,7 +11,10 @@ mod chrome;
 use crate::diff::{self, DiffGrid, StepKind};
 use crate::git::{self, ChangedFile, GitShell, RevSpec};
 use crate::theme::Theme;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -31,6 +34,10 @@ const GUTTER_MIN_AREA_WIDTH: u16 = 20;
 
 /// Panes shorter than this leave out the overview bar.
 const OVERVIEW_MIN_PANE_HEIGHT: u16 = 8;
+
+/// Rows and cells one mouse-wheel step scrolls.
+const WHEEL_ROWS: usize = 3;
+const WHEEL_CELLS: usize = 6;
 
 /// Display rows for the TUI: rows[0] is the marker row (one marker per
 /// grapheme column, `|` between groups, padded to the full content
@@ -428,6 +435,16 @@ pub struct App {
     frame_width: u16,
     /// First sidebar entry on screen.
     sidebar_offset: usize,
+    /// Where the last frame drew the parts the mouse can act on.
+    areas: Areas,
+}
+
+/// Where the last frame put the parts the mouse can act on.
+#[derive(Clone, Copy, Debug, Default)]
+struct Areas {
+    /// The sidebar's file list, title row included.
+    sidebar: Option<Rect>,
+    overview: Option<Rect>,
 }
 
 impl App {
@@ -459,6 +476,7 @@ impl App {
             pane_height: 0,
             frame_width: 0,
             sidebar_offset: 0,
+            areas: Areas::default(),
         };
         app.reload();
         app
@@ -617,6 +635,10 @@ impl App {
         let gutter = Rect {
             height: pane.height,
             ..gutter
+        };
+        self.areas = Areas {
+            sidebar: sidebar.map(|(list, _)| list),
+            overview,
         };
         // Record the pane size before rendering the status bar so the
         // scroll clamps are correct on the very first frame (and not
@@ -963,6 +985,79 @@ impl App {
         }
     }
 
+    /// Handle one mouse event; returns whether the screen must redraw.
+    /// The wheel scrolls the diff (sideways with Shift) or, over the
+    /// sidebar, moves the selection. A click picks a file in the
+    /// sidebar, and a click or drag on the overview bar moves the view
+    /// there.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let at = |area: Option<Rect>| {
+            area.filter(|area| area.contains((mouse.column, mouse.row).into()))
+        };
+        if self.help {
+            // Any click closes the help popup.
+            let click = matches!(mouse.kind, MouseEventKind::Down(_));
+            self.help = !click;
+            return click;
+        }
+        let before = (self.scroll_y, self.scroll_x, self.selection);
+        let sideways = mouse.modifiers.contains(KeyModifiers::SHIFT);
+        match mouse.kind {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                if at(self.areas.sidebar).is_some() =>
+            {
+                let down = mouse.kind == MouseEventKind::ScrollDown;
+                self.move_selection(if down { 1 } else { -1 });
+            }
+            MouseEventKind::ScrollDown if sideways => self.scroll_right(WHEEL_CELLS),
+            MouseEventKind::ScrollUp if sideways => self.scroll_left(WHEEL_CELLS),
+            MouseEventKind::ScrollDown => {
+                self.scroll_y = (self.scroll_y + WHEEL_ROWS).min(self.max_scroll_y());
+            }
+            MouseEventKind::ScrollUp => self.scroll_y = self.scroll_y.saturating_sub(WHEEL_ROWS),
+            MouseEventKind::ScrollRight => self.scroll_right(WHEEL_CELLS),
+            MouseEventKind::ScrollLeft => self.scroll_left(WHEEL_CELLS),
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(bar) = at(self.areas.overview) {
+                    self.center_view_on(bar, mouse.column);
+                } else if let Some(list) = at(self.areas.sidebar)
+                    && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && mouse.row > list.y
+                {
+                    let index = self.sidebar_offset + usize::from(mouse.row - list.y - 1);
+                    if index < self.entries().len() && index != self.selection {
+                        self.selection = index;
+                        self.reload();
+                    }
+                }
+            }
+            _ => {}
+        }
+        before != (self.scroll_y, self.scroll_x, self.selection)
+    }
+
+    fn scroll_right(&mut self, cells: usize) {
+        self.scroll_x = (self.scroll_x + cells).min(self.max_scroll_x());
+    }
+
+    fn scroll_left(&mut self, cells: usize) {
+        self.scroll_x = self.scroll_x.saturating_sub(cells);
+    }
+
+    /// Scroll so the display cell under overview-bar column `column`
+    /// sits in the middle of the pane.
+    fn center_view_on(&mut self, bar: Rect, column: u16) {
+        let Some(display) = &self.display else {
+            return;
+        };
+        let cell = usize::from(column - bar.x);
+        let width = usize::from(bar.width);
+        let target = (2 * cell + 1) * display.width / (2 * width);
+        self.scroll_x = target
+            .saturating_sub(self.pane_width / 2)
+            .min(self.max_scroll_x());
+    }
+
     fn move_selection(&mut self, delta: i32) {
         let len = self.entries().len();
         if len == 0 {
@@ -1060,7 +1155,15 @@ pub fn run_tui(cli: &crate::cli::Cli) -> Result<(), Box<dyn std::error::Error>> 
 /// instead of unconditionally on every event.
 pub fn run_tui_app(app: &mut App) -> io::Result<()> {
     let mut terminal = ratatui::init();
+    // ratatui's panic hook restores the terminal but leaves mouse
+    // capture on; switch it off first.
+    let restore = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
+        restore(info);
+    }));
     let result = (|| {
+        crossterm::execute!(io::stdout(), EnableMouseCapture)?;
         terminal.draw(|frame| app.render(frame))?;
         loop {
             match event::read()? {
@@ -1073,6 +1176,11 @@ pub fn run_tui_app(app: &mut App) -> io::Result<()> {
                         terminal.draw(|frame| app.render(frame))?;
                     }
                 }
+                Event::Mouse(mouse) => {
+                    if app.handle_mouse(mouse) {
+                        terminal.draw(|frame| app.render(frame))?;
+                    }
+                }
                 Event::Resize(_, _) => {
                     terminal.draw(|frame| app.render(frame))?;
                 }
@@ -1081,6 +1189,7 @@ pub fn run_tui_app(app: &mut App) -> io::Result<()> {
         }
         Ok(())
     })();
+    let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -2706,6 +2815,83 @@ mod tests {
         assert_eq!(app.pane_height, 22);
         let row = row_text(&buf, 22, 0..80);
         assert!(!row.contains('━') && !row.contains('─'), "{row:?}");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_the_diff() {
+        let line = "a".repeat(200);
+        let text = format!("{line}\n").repeat(40);
+        let (mut app, a, b) = files_app(&text, &text.replacen('a', "b", 1));
+        let _ = draw(&mut app);
+        assert!(app.handle_mouse(mouse(MouseEventKind::ScrollDown, 40, 10)));
+        assert_eq!(app.scroll_y, WHEEL_ROWS);
+        assert!(app.handle_mouse(mouse(MouseEventKind::ScrollUp, 40, 10)));
+        assert_eq!(app.scroll_y, 0);
+        assert!(!app.handle_mouse(mouse(MouseEventKind::ScrollUp, 40, 10)));
+        let mut sideways = mouse(MouseEventKind::ScrollDown, 40, 10);
+        sideways.modifiers = KeyModifiers::SHIFT;
+        assert!(app.handle_mouse(sideways));
+        assert_eq!((app.scroll_y, app.scroll_x), (0, WHEEL_CELLS));
+        assert!(app.handle_mouse(mouse(MouseEventKind::ScrollRight, 40, 10)));
+        assert_eq!(app.scroll_x, 2 * WHEEL_CELLS);
+        assert!(app.handle_mouse(mouse(MouseEventKind::ScrollLeft, 40, 10)));
+        assert_eq!(app.scroll_x, WHEEL_CELLS);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn mouse_picks_files_in_the_sidebar() {
+        let mut app = git_app(vec![("a\n", "b\n"), ("c\n", "d\n"), ("e\n", "f\n")]);
+        let _ = draw(&mut app);
+        // The wheel over the list moves the selection.
+        assert!(app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5)));
+        assert_eq!(app.selection, 1);
+        // Entries start below the title row at y=1.
+        assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 4)));
+        assert_eq!(app.selection, 2);
+        assert!(!app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 1)));
+        assert!(!app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 9)));
+        assert_eq!(app.selection, 2);
+    }
+
+    #[test]
+    fn mouse_on_the_overview_bar_moves_the_view() {
+        let rest = "a".repeat(199);
+        let (mut app, a, b) = files_app(&format!("x{rest}\n"), &format!("y{rest}\n"));
+        let _ = draw(&mut app);
+        // The bar spans x=4..79 on y=22; its last cell is the far right.
+        let click = MouseEventKind::Down(MouseButton::Left);
+        assert!(app.handle_mouse(mouse(click, 78, 22)));
+        assert_eq!(app.scroll_x, app.max_scroll_x());
+        assert!(app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 41, 22)));
+        // Cell 37 of 75 covers display cell 101: centered in 75 cells.
+        assert_eq!(app.scroll_x, 101 - 37);
+        assert!(app.handle_mouse(mouse(click, 4, 22)));
+        assert_eq!(app.scroll_x, 0);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn a_click_closes_the_help_popup() {
+        let (mut app, a, b) = files_app("a\n", "b\n");
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(!app.handle_mouse(mouse(MouseEventKind::ScrollDown, 40, 10)));
+        assert!(app.help);
+        assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 10)));
+        assert!(!app.help);
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }

@@ -102,6 +102,11 @@ When stdout is not a terminal, `vdiff` prints plain text instead of opening the 
 | `?` | show or hide the key help (`Esc` or `q` also closes it) |
 | `q` / `Ctrl-C` | quit |
 
+The mouse works too: the wheel scrolls the diff (sideways with Shift held) or,
+over the sidebar, moves the file selection; clicking a file opens it, and
+clicking or dragging on the overview bar moves the view there. While vdiff
+holds the mouse, most terminals still select text with Shift held.
+
 ## Documentation
 
 - [Development](docs/development.md): Rust and Nix setup, direnv, Git hooks, and CI checks.
