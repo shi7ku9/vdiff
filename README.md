@@ -104,7 +104,7 @@ When stdout is not a terminal, `vdiff` prints plain text instead of opening the 
 | `j` / `k` | scroll the diff vertically (marker row stays pinned) |
 | `h` / `l` | scroll horizontally; complete characters and emoji are never split |
 | `Tab` / `Shift-Tab` | move the file selection (git mode; the diff updates live) |
-| `n` / `p` | jump to the next / previous change group |
+| `n` / `p` | scroll sideways to the next / previous change (the vertical position stays) |
 | `g` / `G` | scroll to top / bottom |
 | `e` | toggle the file sidebar (git mode; starts hidden below 80 columns) |
 | `i` | inspect cells: a cursor shows its cell's grapheme, code points, width, and column in each file (`h`/`j`/`k`/`l` move it, `Esc` ends) |

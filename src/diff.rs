@@ -107,15 +107,6 @@ impl Column {
             }
         })
     }
-
-    pub(crate) fn first_non_padding_row(&self) -> Option<usize> {
-        self.data
-            .rows
-            .iter()
-            .enumerate()
-            .find(|(index, _)| self.data.cell(*index).chars().any(|c| c != ' '))
-            .map(|(_, row)| *row)
-    }
 }
 
 impl From<Vec<String>> for Column {

@@ -83,6 +83,16 @@ fill continues from the end of the file down to the bottom of the diff pane.
 The tint marks the column as a whole; the TUI does not mark which lines
 changed.
 
+`n` and `p` scroll sideways to the next or previous change, counted from the
+pane's left edge, and leave the vertical scroll alone so that jumping does
+not point at changed lines either. A change usually lands three cells from
+the left edge, after a little of the unchanged text before it, so its delete
+run is in view. Narrow panes reduce this context to leave room for the first
+complete displayed cell. Changes that would scroll past the end of the diff
+share the last stop.
+Past the last change, `n` wraps to the first; before the first, `p` returns
+to the left edge, then wraps to the last.
+
 ### Line numbers
 
 A gutter left of the diff numbers the file rows: a blank cell, the numbers
